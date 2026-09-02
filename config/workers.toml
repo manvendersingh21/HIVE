@@ -1,0 +1,14 @@
+# Worker machine definitions.
+#
+# Add one [[workers]] block per machine. `host` and `user` should match an
+# entry usable from `~/.ssh/config` (or a plain hostname/IP + SSH username).
+# `tags` is optional and can be used for placement decisions (e.g. ["gpu"]).
+#
+# Example:
+# [[workers]]
+# name = "worker-1"
+# host = "192.168.1.101"
+# user = "your_username"
+# tags = ["gpu"]
+
+workers = []

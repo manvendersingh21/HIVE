@@ -1,0 +1,22 @@
+[package]
+name = "hive-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight worker daemon — receives tasks, executes in tmux, reports status"
+
+[[bin]]
+name = "hive-worker"
+path = "src/main.rs"
+
+[dependencies]
+hive-common = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+tmux_interface = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "hive-web"
+version = "0.1.0"
+edition = "2021"
+description = "Web terminal server — browser-based access to tmux sessions via WebSocket"
+
+[[bin]]
+name = "hive-web"
+path = "src/main.rs"
+
+[dependencies]
+hive-common = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+openssh = { workspace = true }
+chrono = { workspace = true }

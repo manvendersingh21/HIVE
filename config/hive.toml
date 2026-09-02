@@ -1,0 +1,53 @@
+[master]
+listen_addr = "0.0.0.0:9090"
+
+[llm.local]
+provider = "ollama"
+model = "qwen2.5:14b-instruct-q4_K_M"
+base_url = "http://localhost:11434"
+max_context = 8192
+
+[llm.gemini]
+model = "gemini-2.5-flash"
+# API key loaded from GEMINI_API_KEY env var
+
+[llm.claude]
+model = "claude-sonnet-4-20250514"
+# API key loaded from ANTHROPIC_API_KEY env var
+
+[llm.codex]
+model = "gpt-4.1"
+# API key loaded from OPENAI_API_KEY env var
+
+[web]
+listen_addr = "0.0.0.0:8080"
+auth_username = "hive"
+# auth_password loaded from HIVE_WEB_PASSWORD env var
+
+[database]
+path = "~/.hive/hive.db"
+
+[skills]
+directory = "~/.hive/skills"
+
+[finetune]
+auto_collect = true  # Automatically log successful interactions
+
+[memory]
+auto_index = true                    # Auto-index conversations on completion
+embedding_model = "nomic-embed-text" # Lightweight embedding model via Ollama
+chunk_size = 512                     # Tokens per RAG chunk
+chunk_overlap = 64                   # Overlap between chunks
+max_context_tokens = 2048            # Max tokens of retrieved context to inject
+
+[memory.knowledge_graph]
+max_entities_per_conversation = 20   # Limit extraction to avoid noise
+entity_dedup_threshold = 0.85        # Cosine similarity threshold for merging duplicate entities
+
+[watchdog]
+enabled = true
+poll_interval_secs = 5
+capture_lines = 50
+max_consecutive_safe = 10
+reduced_poll_interval_secs = 15
+llm_analysis = true

@@ -1,0 +1,17 @@
+[package]
+name = "hive-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types, protocols, and configuration for the Hive agentic system"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+schemars = { workspace = true, features = ["chrono"] }
+toml = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
