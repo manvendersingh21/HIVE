@@ -1,126 +1,68 @@
 # Hive — Current Status
 
-**As of 2026-09-01.** This is a verified audit of what exists on disk, not a summary of what
-was claimed. Every item below was checked against the actual files.
+**Updated 2026-09-01, verified against a live build.** This audit reflects what was actually
+compiled, tested, and run — not what a session claimed.
 
 ---
 
-## Answer to "is Phase 1 completed?"
+## Phase 1: ✅ Complete and verified
 
-**No.** The previous build session reported Phase 1 complete and the workspace "fully
-scaffolded", then the session was interrupted before that claim could be checked. It doesn't
-hold up: **the workspace does not compile**, for two independent reasons, and it was never
-built or tested even once.
+Previously this document reported Phase 1 as ~70% done and non-compiling — the workspace had
+two build-breaking gaps and had never once been built. Both are now fixed, and every claim
+below was checked by actually running the command.
 
-The type layer — which is genuinely the bulk of Phase 1's value — *is* done and is good work.
-What's missing is the last mile that makes it a running program.
+```
+$ cargo build --workspace
+   Finished `dev` profile [unoptimized + debuginfo] target(s)   # clean, zero warnings
 
----
+$ cargo test --workspace
+running 18 tests
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
-## What is actually done ✅
+$ cargo run --bin hive -- task -d "check disk space"
+Summary: Task received: check disk space
+Provider: Gemini Flash
+Complexity: MEDIUM
+No sessions created (worker delegation not implemented yet).
 
-### `hive-common` — the shared foundation (1,424 lines, fully written)
+$ HIVE_WORKER_ADDR=127.0.0.1:19091 cargo run --bin hive-worker &
+$ curl http://127.0.0.1:19091/health
+ok
 
-| File | Lines | Contents |
-|:---|---:|:---|
-| `protocol.rs` | 681 | `TaskAssignment` + builder, `TaskCommand` + builder, `AiProvider`, `AiContext`, `TaskPriority`, `TaskStatus` + `running`/`completed`/`failed` constructors, `TaskState` (7 variants incl. `WaitingForDecision`, `PausedByWatchdog`), `Complexity` + `from_llm_output` + `recommended_provider`, `WorkerInfo` + `ssh_target`, `WorkerStatus`, `Severity`, `SafetyCategory` (8 variants), `SafetyAnalysis`, `Incident`, `HumanDecision`, `IncidentReviewState`, `AgentResponse`, `SessionInfo`. **8 unit tests.** All types derive `JsonSchema` for LLM tool calling. |
-| `config.rs` | 576 | `HiveConfig` and every sub-config (`master`, `llm`, `web`, `database`, `skills`, `finetune`, `memory`, `watchdog`), `WorkersConfig`, TOML loading, `~` expansion for the DB path, and secret resolution from env vars with sensible fallbacks. **7 unit tests.** |
-| `error.rs` | 167 | `HiveError` with 28 variants across config / LLM / SSH / task / tmux / DB / memory / skill / safety domains, `HiveResult<T>`, `From` impls for `io`, `serde_json`, `rusqlite`, `reqwest`, `toml`. **3 unit tests.** |
-
-### `hive-core` — skeleton in place, one piece real
-
-- All 8 modules declared and present: `agent`, `llm`, `workers`, `tools`, `skills`, `memory`, `watchdog`, `finetune`
-- `workers/mod.rs` — `WorkerPool::new`, `select_worker` (least-loaded online), `online_count`. **Real logic.**
-- `agent/mod.rs` — `MasterAgent` struct wiring all four subsystems, `handle_request` skeleton that
-  retrieves context → classifies complexity → picks a provider, then stops at a `TODO`
-- `agent/planner.rs` — `TaskPlan` and `SubTask` types defined
-- `llm/mod.rs` — `LlmRouter` struct; `classify_complexity` returns a hardcoded `Medium`,
-  `local_complete` returns an empty string
-- `memory`, `skills`, `tools`, `watchdog`, `finetune` — empty structs with `new()` and a `// TODO` comment
-
-### `hive-worker`
-
-- axum server, `HIVE_WORKER_ADDR` (default `0.0.0.0:9091`), tracing configured
-- Routes registered: `GET /health`, `POST /task`, `GET /status/{task_id}`
-- `receive_task` deserializes a real `TaskAssignment` and returns a `TaskStatus::running` —
-  but **creates no tmux session and runs no commands**
-- `task_status` returns a hardcoded `Running` for any id
-
-### `hive-web`
-
-- axum server, `HIVE_WEB_ADDR` (default `0.0.0.0:8080`), tracing configured
-- `GET /api/health` → `"ok"`; `GET /api/sessions` → hardcoded `"[]"`
-- `ServeDir` fallback pointed at `static/` — the WebSocket route is commented out
-
-### Workspace
-
-- Root `Cargo.toml` with 5 members and every dependency centralized in `[workspace.dependencies]`
-  (tokio, serde, axum, tower-http, rusqlite, openssh, tmux_interface, ractor, clap, schemars, …)
-
-### Knowledge graph
-
-- `graphify-out/` — 209 nodes, 412 edges, 19 communities, with `GRAPH_REPORT.md`,
-  interactive `graph.html`, and `graph.json`
-
----
-
-## What is broken or missing ❌
-
-### 1. `hive-cli` has no source file — build-breaking
-
-`hive-cli/Cargo.toml` declares:
-
-```toml
-[[bin]]
-name = "hive"
-path = "src/main.rs"
+$ HIVE_WEB_ADDR=127.0.0.1:19093 cargo run --bin hive-web &
+$ curl http://127.0.0.1:19093/api/health
+ok
 ```
 
-`hive-cli/src/` exists but is **empty**. `main.rs` was never written. Because `hive-cli` is a
-workspace member, `cargo build --workspace` fails outright.
+### What changed to get here
 
-### 2. `hive-common` is missing two of its own dependencies — build-breaking
+| Fix | Detail |
+|:---|:---|
+| Rust toolchain | Installed via rustup — `rustc 1.98.0`, `cargo 1.98.0`. None was present before. |
+| `hive-common` deps | Added `rusqlite` and `reqwest` (used by `error.rs`'s `From` impls but never declared), `tracing` (used by `protocol.rs`'s `Complexity::from_llm_output`, also never declared), and the `schemars` `"chrono"` feature (needed for `DateTime<Utc>` to derive `JsonSchema` — three structs in `protocol.rs` use it). |
+| `hive-cli/src/main.rs` | Was completely absent. Wrote the full `clap` command tree: `chat`, `task`, `sessions`, `attach`, `workers list`, `skills list`, `finetune export`, `serve`. `chat` and `task` build a real `MasterAgent` from `hive-core` and call `handle_request` — they're not print stubs, they exercise the actual (still-stubbed) agent loop. Commands for unbuilt subsystems (sessions, attach, skills, finetune, serve) print an honest "not implemented, see Phase N" message rather than fake output. |
+| `config/hive.toml`, `config/workers.toml` | Written from the plan's templates. `workers.toml` ships with an empty `workers = []` list and inline comments rather than fake placeholder hosts — `hive workers list` reports "No workers configured" truthfully until real machines are added. |
+| Unused-import warnings | `hive-core/src/agent/mod.rs`, `llm/mod.rs`, `workers/mod.rs` each had imports for types not yet used by their stub logic. Trimmed to a warning-free build; Phase 2/3 will re-add them as the real logic lands. |
+| Git | Repo initialized, working baseline committed. `graphify-out/`'s machine-local sidecar files (`.graphify_python`, `.graphify_root`, and the transient extraction JSONs) are gitignored; the durable outputs (`GRAPH_REPORT.md`, `graph.html`, `graph.json`, `manifest.json`) are tracked. |
 
-`hive-common/src/error.rs` contains:
+### What's still a stub (by design — this is Phase 2+, not a Phase 1 gap)
 
-```rust
-impl From<rusqlite::Error> for HiveError { … }
-impl From<reqwest::Error>  for HiveError { … }
-```
+- `LlmRouter::classify_complexity` always returns `Medium`; `local_complete` returns `""`
+- `MasterAgent::handle_request` plans nothing and delegates nothing — it classifies, then stops
+- `WorkerPool` has real selection logic but no SSH/delegation; every worker boots `Offline`
+- `hive-worker`'s `/task` route accepts a `TaskAssignment` and immediately claims `Running`
+  without creating a tmux session or executing anything
+- `hive-web`'s `/api/sessions` returns a hardcoded `"[]"`; no WebSocket terminal exists;
+  `static/` is empty
+- `memory`, `skills`, `tools`, `watchdog`, `finetune` are still empty structs with `new()`
 
-but `hive-common/Cargo.toml` declares only `serde`, `serde_json`, `thiserror`, `chrono`,
-`uuid`, `schemars`, and `toml`. Neither `rusqlite` nor `reqwest` is there, so both `impl`
-blocks reference crates that don't exist in scope — an unresolved-crate error, not a warning.
-**`hive-common` is the base of every other crate, so nothing in the workspace compiles.**
-
-### 3. No configuration files
-
-`config/` is an empty directory. Both `config/hive.toml` and `config/workers.toml` are
-specified in the plan, and `HiveConfig::from_project_root()` / `WorkersConfig::from_project_root()`
-are written to read exactly those paths — but neither file was ever created. Nothing can be
-configured or started.
-
-### 4. Nothing has ever been compiled or run
-
-There is **no Rust toolchain on this machine** — `rustc`, `cargo`, and `rustup` are all absent,
-and `~/.cargo` does not exist. So `cargo build` and `cargo test --workspace` have never been
-executed. The 18 unit tests in `hive-common` are written but **unverified** — they have never
-passed, because they have never run.
-
-### 5. Minor — unused imports
-
-`hive-core/src/agent/mod.rs` imports `TaskAssignment`, `TaskCommand`, and `warn`;
-`hive-core/src/workers/mod.rs` imports `TaskAssignment` and `TaskStatus`. None are used yet.
-Warnings only, but they'll be noisy on the first successful build.
-
-### 6. Not blocking Phase 1, but worth noting
-
-- `hive-web/static/` is empty — no `index.html`, no `terminal.html`, no `xterm.js` (Phase 5)
-- The repo is **not a git repository** — no version control, no history, no way to roll back
+None of this blocks calling Phase 1 done — Phase 1's job was a workspace that builds, tests,
+and runs, with types the rest of the system can build against. That's now true and verified.
+See [`ROADMAP.md`](ROADMAP.md) for what each of those stubs turns into in Phases 2–10.
 
 ---
 
-## Phase 1 completion: item by item
+## Full deliverable checklist
 
 | Deliverable | State |
 |:---|:---|
@@ -131,27 +73,21 @@ Warnings only, but they'll be noisy on the first successful build.
 | `hive-core` module skeleton | ✅ |
 | `hive-worker` entry point | ✅ |
 | `hive-web` entry point | ✅ |
-| `hive-cli` entry point | ❌ file absent |
-| `hive-common` deps match its code | ❌ two missing |
-| `config/hive.toml` | ❌ absent |
-| `config/workers.toml` | ❌ absent |
-| `cargo build --workspace` passes | ❌ never run, would fail |
-| `cargo test --workspace` passes | ❌ never run |
+| `hive-cli` entry point | ✅ |
+| `hive-common` deps match its code | ✅ |
+| `config/hive.toml` | ✅ |
+| `config/workers.toml` | ✅ |
+| `cargo build --workspace` passes | ✅ verified, zero warnings |
+| `cargo test --workspace` passes | ✅ verified, 18/18 |
+| All three binaries start and respond | ✅ verified over HTTP |
+| Git repository with a committed baseline | ✅ |
 
-**~70% complete. 7 of 13 deliverables done, and the remaining 6 are the ones that turn it
-from a pile of types into something that runs.**
+**13/13. Phase 1 is done.**
 
 ---
 
-## To close out Phase 1
+## Next: Phase 2 — LLM Router & Agent Loop
 
-1. Install the Rust toolchain (`rustup`) — nothing can be verified without it
-2. Add `rusqlite` and `reqwest` to `hive-common/Cargo.toml`
-3. Write `hive-cli/src/main.rs` with the clap command tree (stub handlers are fine for now)
-4. Write `config/hive.toml` and `config/workers.toml` from the plan's templates
-5. Run `cargo build --workspace`, fix whatever the first real compile surfaces
-6. Run `cargo test --workspace` and confirm all 18 tests pass
-7. `git init` and commit the working baseline
-
-Then Phase 2 (LLM router + agent loop) can start against a foundation that's known-good
-rather than assumed-good.
+See [`ROADMAP.md`](ROADMAP.md#phase-2--llm-router--agent-loop). Starting point is
+`hive-core/src/llm/mod.rs` (`LlmRouter::classify_complexity`, `local_complete`) and wiring a
+real Ollama client so `MasterAgent::handle_request` does more than classify and stop.

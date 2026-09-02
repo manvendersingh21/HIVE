@@ -10,12 +10,12 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 
 | # | Phase | Effort | Depends on | Status |
 |:---:|:---|:---:|:---|:---|
-| 1 | Scaffold, `hive-common` types, workspace | 1 day | — | 🟡 ~70%, does not compile |
+| 1 | Scaffold, `hive-common` types, workspace | 1 day | — | ✅ done, build+test verified |
 | 2 | LLM router + agent loop | 2–3 days | 1 | ⬜ stubs only |
 | 3 | Worker pool, SSH delegation, tmux creation | 2 days | 2 | ⬜ selection logic only |
 | 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ⬜ routes only |
 | 5 | `hive-web` — web terminal | 2–3 days | 3 | ⬜ health route only |
-| 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🔴 crate has no source file |
+| 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 command tree wired, most subcommands are stubs |
 | 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
 | 9 | Memory — projects, KG, RAG | 2–3 days | 2 | ⬜ empty struct |
@@ -27,7 +27,7 @@ Legend: ✅ done · 🟡 partial · 🔴 broken · ⬜ not started
 ---
 
 ## Phase 1 — Project Scaffold & Core Types
-*Plan section: "Phase 1: Project Scaffold & Core Agent Loop"* · **Status: 🟡 partial**
+*Plan section: "Phase 1: Project Scaffold & Core Agent Loop"* · **Status: ✅ done**
 
 The foundation every other phase compiles against.
 
@@ -37,10 +37,10 @@ The foundation every other phase compiles against.
 - [x] `hive-common/src/config.rs` — `HiveConfig`, `WorkersConfig`, env-var secret resolution
 - [x] `hive-core` module tree (`agent`, `llm`, `workers`, `tools`, `skills`, `memory`, `watchdog`, `finetune`)
 - [x] `hive-worker` and `hive-web` binary entry points with axum routes registered
-- [ ] **`hive-cli/src/main.rs`** — missing entirely; the workspace cannot build without it
-- [ ] **`hive-common` dependency fix** — `error.rs` uses `rusqlite` and `reqwest`, neither is declared
-- [ ] **`config/hive.toml`** and **`config/workers.toml`** — the `config/` directory is empty
-- [ ] **`cargo build --workspace` and `cargo test --workspace` actually pass** — never once run
+- [x] **`hive-cli/src/main.rs`** — full `clap` command tree, `chat`/`task` build a real `MasterAgent`
+- [x] **`hive-common` dependency fix** — added `rusqlite`, `reqwest`, `tracing`, and the `schemars` `"chrono"` feature
+- [x] **`config/hive.toml`** and **`config/workers.toml`** — written from the plan's templates
+- [x] **`cargo build --workspace` and `cargo test --workspace` pass** — verified: clean build, 18/18 tests, all 3 binaries run and respond over HTTP
 
 **Definition of done:** `cargo test --workspace` is green and `hive --help` prints.
 

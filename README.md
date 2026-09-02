@@ -71,20 +71,20 @@ Full architecture diagrams, data model, and code sketches live in
 
 ## Status
 
-**Phase 1 is roughly 70% done and does not currently compile.** See
-[`docs/STATUS.md`](docs/STATUS.md) for the full audit and
+**Phase 1 is complete and verified** — `cargo build --workspace` and `cargo test --workspace`
+both pass cleanly, and all three binaries (`hive`, `hive-worker`, `hive-web`) start and respond
+over HTTP. See [`docs/STATUS.md`](docs/STATUS.md) for the full audit and
 [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases.
 
 Short version:
 
-- ✅ Workspace + all 5 crate manifests
-- ✅ `hive-common` protocol, error, and config types — fully written, with unit tests
+- ✅ Workspace + all 5 crate manifests, `cargo build --workspace` clean with zero warnings
+- ✅ `hive-common` protocol, error, and config types — fully written, 18/18 unit tests passing
 - ✅ `hive-core` module skeleton; `WorkerPool` selection logic is real
-- ✅ `hive-worker` and `hive-web` axum servers with routes wired
-- ❌ `hive-cli/src/main.rs` does not exist — the workspace build fails
-- ❌ `hive-common` is missing two dependencies its own code uses — that crate does not compile
-- ❌ `config/hive.toml` and `config/workers.toml` were never created
-- ❌ Nothing has ever been compiled or tested (no Rust toolchain installed on this machine)
+- ✅ `hive-worker` and `hive-web` axum servers — routes wired, verified live over HTTP
+- ✅ `hive-cli/src/main.rs` — full command tree; `chat`/`task` drive a real `MasterAgent`
+- ✅ `config/hive.toml` and `config/workers.toml` in place
+- ⬜ Everything past the type layer is still a stub — that's Phases 2–10, see the roadmap
 
 ---
 
