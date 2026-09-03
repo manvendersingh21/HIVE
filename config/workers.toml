@@ -16,3 +16,13 @@ name = "archlinux-worker"
 host = "hive-worker-2"
 user = "manubaba"
 tags = ["arch", "docker"]
+
+# Temple University shared GPU node, reached through the cis-linux2 bastion.
+# Tagged `shared` and `slurm` deliberately: 30+ people use this box and it runs
+# a batch scheduler, so heavy or long work belongs in an sbatch job rather than
+# a tmux session started behind the scheduler's back.
+[[workers]]
+name = "cis-a6000"
+host = "cis-a6000"
+user = "tur38767"
+tags = ["gpu", "cuda", "slurm", "shared"]

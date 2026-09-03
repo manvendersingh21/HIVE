@@ -184,3 +184,48 @@ the incident note in [`ROADMAP.md`](ROADMAP.md#phase-4--worker-daemon) — that
 mistake stopped a host's unrelated services during testing. `validate_pgid`
 refuses `<= 1` and the daemon's own group, and `pause` checks the pgid is on the
 target session's tty.
+
+
+---
+
+## Fleet
+
+| Machine | Role | Reached via |
+|:---|:---|:---|
+| `manus-mac-mini` | master — agent UI, terminal, machine graph | launchd, tailnet `100.121.248.111:8090` |
+| `archlinux-worker` | worker — 4 cores, 11.6 GB, docker, ollama | SSH `hive-worker-2` over the tailnet |
+| `cis-a6000` | worker — 2× RTX A6000 (48 GB each), 32 cores, 251 GB | SSH through the `cis-linux2` bastion |
+
+### `cis-a6000` is shared university infrastructure
+
+It is a Temple CIS node with ~30 concurrent users, 171 days of uptime, SLURM
+(`sbatch`/`srun`), and no sudo. Two consequences worth keeping in mind:
+
+* **Heavy or long GPU work belongs in a SLURM job**, not a tmux session started
+  behind the scheduler's back. Hive's default path is direct SSH+tmux, which is
+  right for short interactive commands and wrong for anything that should be
+  queued. The machine graph records `batch-scheduler` as a capability so a
+  future placement policy can act on it; nothing enforces it today.
+* **No daemon can be installed.** `hive-worker` needs no root, but a long-lived
+  listener on a shared academic box is a conversation to have with its admins
+  rather than something to just start.
+
+### SSH through the bastion
+
+```
+Host cis-linux2 cis-linux2.temple.edu
+  HostName cis-linux2.temple.edu
+  User tur38767
+  IdentityFile ~/.ssh/hive_worker_ed25519
+
+Host cis-a6000 cis-a6000.tu.temple.edu
+  HostName cis-a6000.tu.temple.edu
+  User tur38767
+  ProxyJump cis-linux2
+  IdentityFile ~/.ssh/hive_worker_ed25519
+```
+
+The bastion block **must also match the FQDN**. `ProxyJump cis-linux2` expands to
+the resolved `HostName`, so a block matching only the short alias never applies
+its `IdentityFile` to the jump connection, and the hop falls back to password
+auth and fails under `BatchMode`.

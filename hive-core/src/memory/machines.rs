@@ -40,6 +40,16 @@ pub struct MachineFacts {
     pub memory_gb: f64,
     pub disk_free_gb: f64,
     pub gpu: Option<String>,
+    /// Number of GPUs, so a multi-GPU host is distinguishable from a single.
+    #[serde(default)]
+    pub gpu_count: u32,
+    /// Batch scheduler present (e.g. `slurm`), if any.
+    ///
+    /// A node running a scheduler is shared infrastructure: heavy work belongs
+    /// in a queued job, not in a tmux session started behind the scheduler's
+    /// back. Recorded so placement can respect that.
+    #[serde(default)]
+    pub scheduler: Option<String>,
     /// Tools found on `PATH`, from [`PROBED_TOOLS`].
     pub tools: Vec<String>,
     /// Operator-assigned tags from `workers.toml`.
@@ -64,6 +74,8 @@ pub const PROBED_TOOLS: &[&str] = &[
     "ffmpeg",
     "gh",
     "nvidia-smi",
+    // CUDA toolchain and batch scheduler: both change where work should go.
+    "nvcc", "sbatch", "srun",
 ];
 
 /// Capabilities inferred from what's installed. These are what a planner
@@ -80,6 +92,9 @@ fn capabilities_for(tools: &[String]) -> Vec<&'static str> {
     }
     if has("nvidia-smi") {
         caps.push("gpu-compute");
+    }
+    if has("sbatch") || has("srun") {
+        caps.push("batch-scheduler");
     }
     if has("docker") {
         caps.push("containers");
@@ -127,7 +142,12 @@ else
   echo "cores=$(nproc 2>/dev/null)"
   echo "memory_gb=$(awk '/MemTotal/ {{printf "%.2f", $2/1048576}}' /proc/meminfo 2>/dev/null)"
   echo "disk_free_gb=$(df -BG / 2>/dev/null | awk 'NR==2 {{gsub(/G/,"",$4); print $4}}')"
-  echo "gpu=$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+  # Report the whole set, not just the first card: a two-GPU box and a
+  # one-GPU box of the same model are very different placement targets.
+  # `sort | uniq -c` rather than awk, whose braces collide with format!.
+  echo "gpu=$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | sort | uniq -c | sed 's/^ *//;s/$/ each/' | paste -sd'; ' -)"
+  echo "gpu_count=$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"
+  echo "scheduler=$(command -v sbatch >/dev/null 2>&1 && echo slurm)"
 fi
 {tool_checks}
 # Every probe line is best-effort, and `command -v` for a missing tool exits
@@ -164,7 +184,9 @@ fn parse_probe(name: &str, host: &str, tags: Vec<String>, raw: &str) -> MachineF
             "cores" => facts.cpu_cores = value.parse().unwrap_or(0),
             "memory_gb" => facts.memory_gb = value.parse().unwrap_or(0.0),
             "disk_free_gb" => facts.disk_free_gb = value.parse().unwrap_or(0.0),
-            "gpu" => facts.gpu = Some(value.to_string()),
+            "gpu" => facts.gpu = Some(value.trim().to_string()),
+            "gpu_count" => facts.gpu_count = value.parse().unwrap_or(0),
+            "scheduler" => facts.scheduler = Some(value.to_string()),
             "tool" => facts.tools.push(value.to_string()),
             _ => {}
         }
@@ -287,6 +309,8 @@ pub fn project_into_graph(kg: &KnowledgeGraph, facts: &MachineFacts) -> anyhow::
             "memory_gb": facts.memory_gb,
             "disk_free_gb": facts.disk_free_gb,
             "gpu": facts.gpu,
+            "gpu_count": facts.gpu_count,
+            "scheduler": facts.scheduler,
             "tags": facts.tags,
             "probed_at": facts.probed_at,
         }),
@@ -435,7 +459,10 @@ pub fn describe_for_prompt(kg: &KnowledgeGraph) -> anyhow::Result<String> {
             m.attr_f64("cpu_cores").unwrap_or(0.0) as u32,
             m.attr_f64("memory_gb").unwrap_or(0.0),
             m.attr_f64("disk_free_gb").unwrap_or(0.0),
-            m.attr_str("gpu").map(|g| format!(", GPU: {g}")).unwrap_or_default(),
+            m.attr_str("gpu")
+                .filter(|g| !g.trim().is_empty())
+                .map(|g| format!(", GPU: {}", g.trim()))
+                .unwrap_or_default(),
             if caps.is_empty() { "none detected".into() } else { caps.join(", ") },
             if tools.is_empty() { "none detected".into() } else { tools.join(", ") },
         ));
@@ -486,6 +513,22 @@ mod tests {
         assert_eq!(f.arch, "arm64");
         assert_eq!(f.cpu_cores, 0);
         assert_eq!(f.os, "macos");
+    }
+
+    #[test]
+    fn a_scheduler_node_is_flagged_as_such() {
+        let caps = capabilities_for(&["sbatch".into(), "srun".into(), "nvidia-smi".into()]);
+        assert!(caps.contains(&"batch-scheduler"), "shared cluster nodes must be identifiable");
+        assert!(caps.contains(&"gpu-compute"));
+    }
+
+    #[test]
+    fn probe_reads_multiple_gpus_and_a_scheduler() {
+        let raw = "gpu=2x NVIDIA RTX A6000 (49140 MiB each) \ngpu_count=2\nscheduler=slurm\n";
+        let f = parse_probe("cis-a6000", "cis-a6000", vec![], raw);
+        assert_eq!(f.gpu_count, 2);
+        assert_eq!(f.scheduler.as_deref(), Some("slurm"));
+        assert!(f.gpu.unwrap().contains("A6000"));
     }
 
     #[test]
