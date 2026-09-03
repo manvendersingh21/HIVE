@@ -1,0 +1,154 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<title>Hive · terminal</title>
+<link rel="stylesheet" href="/js/xterm.css">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; overscroll-behavior: none; }
+  body {
+    background: #0f1115; color: #e6e8ee; display: flex; flex-direction: column;
+    font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    border-bottom: 1px solid #1e242e; flex: none;
+  }
+  a.back { color: #8b93a7; text-decoration: none; font-size: 18px; line-height: 1; }
+  a.back:hover { color: #e6e8ee; }
+  .name {
+    font-family: ui-monospace, SFMono-Regular, monospace; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .status { margin-left: auto; font-size: 12px; color: #8b93a7; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #3d4756; }
+  .dot.on { background: #35d07f; }
+  .dot.off { background: #ff6b6b; }
+  #term { flex: 1; min-height: 0; padding: 6px 4px 0 10px; }
+  /* Phones have no Esc, Tab, Ctrl or arrows — claude and codex need all four. */
+  #keys {
+    flex: none; display: flex; gap: 6px; padding: 8px 10px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    border-top: 1px solid #1e242e; overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+  #keys button {
+    flex: none; min-width: 44px; padding: 9px 12px; font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    background: #1b212b; border: 1px solid #2c333f; border-radius: 8px;
+    color: #c9cfdb; cursor: pointer;
+  }
+  #keys button:active, #keys button.armed { background: #f5a623; color: #17181c; border-color: #f5a623; }
+  @media (hover: hover) and (pointer: fine) { #keys { display: none; } }
+</style>
+
+<header>
+  <a class="back" href="/">←</a>
+  <span class="name" id="name"></span>
+  <span class="status"><span class="dot" id="dot"></span><span id="state">connecting</span></span>
+</header>
+<div id="term"></div>
+<div id="keys">
+  <button data-send="\x1b">esc</button>
+  <button data-send="\t">tab</button>
+  <button id="ctrl">ctrl</button>
+  <button data-send="\x1b[A">↑</button>
+  <button data-send="\x1b[B">↓</button>
+  <button data-send="\x1b[D">←</button>
+  <button data-send="\x1b[C">→</button>
+  <button data-send="\r">⏎</button>
+  <button data-send="\x03">^C</button>
+  <button data-send="\x02d">detach</button>
+</div>
+
+<script src="/js/xterm.js"></script>
+<script src="/js/xterm-addon-fit.js"></script>
+<script>
+  const name = decodeURIComponent(location.pathname.replace(/^\/terminal\//, ''));
+  document.getElementById('name').textContent = name;
+  document.title = `${name} · Hive`;
+
+  const term = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontSize: window.innerWidth < 700 ? 12 : 14,
+    scrollback: 5000,
+    theme: {
+      background: '#0f1115', foreground: '#e6e8ee', cursor: '#f5a623',
+      black: '#0f1115', red: '#ff6b6b', green: '#35d07f', yellow: '#f5a623',
+      blue: '#5aa9ff', magenta: '#c17fff', cyan: '#4fd6d2', white: '#e6e8ee'
+    }
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+  fit.fit();
+
+  const enc = new TextEncoder();
+  const setState = (text, cls) => {
+    document.getElementById('state').textContent = text;
+    document.getElementById('dot').className = 'dot ' + (cls || '');
+  };
+
+  let ws, reconnectDelay = 500;
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const { cols, rows } = term;
+    ws = new WebSocket(`${proto}://${location.host}/ws/${encodeURIComponent(name)}?cols=${cols}&rows=${rows}`);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => { setState('live', 'on'); reconnectDelay = 500; sendResize(); term.focus(); };
+    ws.onmessage = e => term.write(new Uint8Array(e.data));
+    ws.onclose = () => {
+      setState('reconnecting', 'off');
+      // The tmux session outlives the socket, so reattaching restores the view.
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+    };
+    ws.onerror = () => ws.close();
+  }
+
+  const send = data => { if (ws && ws.readyState === 1) ws.send(enc.encode(data)); };
+  const sendResize = () => {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+    }
+  };
+
+  term.onData(send);
+
+  let resizeTimer;
+  const onResize = () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { fit.fit(); sendResize(); }, 120);
+  };
+  window.addEventListener('resize', onResize);
+  window.visualViewport?.addEventListener('resize', onResize);
+
+  // Mobile key bar. `ctrl` is sticky: tap it, then tap a letter.
+  let ctrlArmed = false;
+  const ctrlBtn = document.getElementById('ctrl');
+  ctrlBtn.addEventListener('click', () => {
+    ctrlArmed = !ctrlArmed;
+    ctrlBtn.classList.toggle('armed', ctrlArmed);
+    term.focus();
+  });
+  document.querySelectorAll('#keys button[data-send]').forEach(b => {
+    b.addEventListener('click', () => {
+      send(JSON.parse(`"${b.dataset.send}"`));
+      term.focus();
+    });
+  });
+  term.attachCustomKeyEventHandler(e => {
+    if (ctrlArmed && e.type === 'keydown' && /^[a-zA-Z]$/.test(e.key)) {
+      send(String.fromCharCode(e.key.toLowerCase().charCodeAt(0) - 96));
+      ctrlArmed = false;
+      ctrlBtn.classList.remove('armed');
+      return false;
+    }
+    return true;
+  });
+
+  connect();
+</script>

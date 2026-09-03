@@ -14,7 +14,7 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | 2 | LLM router + agent loop | 2–3 days | 1 | ✅ done, build+test verified |
 | 3 | Worker pool, SSH delegation, tmux creation | 2 days | 2 | ✅ done, live-verified against a real worker (redesigned: direct SSH+tmux, no daemon — see below) |
 | 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ⬜ routes only, superseded by Phase 3's direct-SSH design (see note) |
-| 5 | `hive-web` — web terminal | 2–3 days | 3 | ⬜ health route only |
+| 5 | `hive-web` — web terminal | 2–3 days | 3 | ✅ done, live-verified on the `lawfinder` worker |
 | 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 command tree wired, most subcommands are stubs |
 | 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
@@ -131,15 +131,26 @@ otherwise it may not be worth building out.
 ---
 
 ## Phase 5 — Web Terminal
-*Plan section: "Phase 4: Web Terminal (Phone/Laptop Access)"* · **Status: ⬜**
+*Plan section: "Phase 4: Web Terminal (Phone/Laptop Access)"* · **Status: ✅ done**
+
+Deployed on the `lawfinder` worker and reachable from any tailnet device — see
+[`DEPLOY-WEB.md`](DEPLOY-WEB.md).
 
 - [x] axum server with `/api/health`
-- [ ] `GET /api/sessions` — real aggregation (returns a hardcoded `"[]"` today)
-- [ ] `terminal.rs` — `WebSocket ↔ SSH ↔ tmux attach` bidirectional bridge
-- [ ] `auth.rs` — basic auth middleware using `HIVE_WEB_PASSWORD`
-- [ ] `static/index.html` — session picker dashboard
-- [ ] `static/terminal.html` + bundled `xterm.js` — the terminal page (`static/` is empty today)
-- [ ] Incident review UI (shared with Phase 10)
+- [x] `GET /api/sessions` — real `tmux list-sessions` aggregation
+- [x] `POST /api/sessions` / `DELETE /api/sessions/{name}` — create (shell/claude/codex) and kill
+- [x] `terminal.rs` — `WebSocket ↔ PTY ↔ tmux attach` bidirectional bridge, with resize
+- [x] `auth.rs` — password middleware using `HIVE_WEB_PASSWORD`, constant-time compare
+- [x] `static/index.html` — session picker dashboard, auto-refreshing
+- [x] `static/terminal.html` + vendored `xterm.js` — terminal page with a mobile key bar
+      (esc/tab/ctrl/arrows/^C/detach), auto-reconnect, and viewport-aware resize
+- [ ] Incident review UI (shared with Phase 10) — deferred with the rest of Phase 10
+
+**Deliberately not done: the SSH transport.** The plan called for
+`WebSocket ↔ SSH ↔ tmux`. `hive-web` runs *on* the worker, so the hop is local
+and the SSH leg would be a loopback connection to itself. Running one instance
+per worker is the simpler shape; a master-side aggregator that fans out over SSH
+is only worth building when there are enough workers to justify a single pane.
 
 ---
 

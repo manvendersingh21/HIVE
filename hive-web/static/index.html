@@ -1,0 +1,142 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Hive · sessions</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0f1115; color: #e6e8ee; padding-bottom: env(safe-area-inset-bottom);
+    font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; background: #0f1115ee;
+    backdrop-filter: blur(8px); border-bottom: 1px solid #1e242e;
+    display: flex; align-items: center; gap: 12px; padding: 14px 18px;
+  }
+  h1 { margin: 0; font-size: 17px; letter-spacing: -0.01em; }
+  .host { color: #8b93a7; font-size: 12px; font-family: ui-monospace, SFMono-Regular, monospace; }
+  .spacer { flex: 1; }
+  main { max-width: 720px; margin: 0 auto; padding: 18px; }
+  .new {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px;
+    background: #161a21; border: 1px solid #262c38; border-radius: 12px; padding: 14px;
+  }
+  input, select {
+    flex: 1 1 130px; min-width: 0; padding: 9px 11px; font-size: 16px;
+    background: #0f1115; border: 1px solid #2c333f; border-radius: 8px; color: #e6e8ee;
+  }
+  input:focus, select:focus { outline: 2px solid #f5a623; outline-offset: -1px; }
+  button {
+    padding: 9px 15px; border: 0; border-radius: 8px; cursor: pointer;
+    background: #f5a623; color: #17181c; font-weight: 650; font-size: 14px;
+  }
+  button:hover { background: #ffb733; }
+  button.ghost {
+    background: transparent; border: 1px solid #2c333f; color: #8b93a7; font-weight: 500;
+  }
+  button.ghost:hover { border-color: #3d4756; color: #e6e8ee; background: transparent; }
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+  li {
+    display: flex; align-items: center; gap: 12px; padding: 14px 16px;
+    background: #161a21; border: 1px solid #262c38; border-radius: 12px;
+  }
+  li:hover { border-color: #39424f; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #3d4756; flex: none; }
+  .dot.on { background: #35d07f; box-shadow: 0 0 0 3px #35d07f22; }
+  .meta { flex: 1; min-width: 0; }
+  .name {
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 15px;
+    font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .sub { color: #8b93a7; font-size: 12px; }
+  .sub b { color: #f5a623; font-weight: 600; }
+  a.open {
+    text-decoration: none; padding: 8px 14px; border-radius: 8px; font-size: 14px;
+    background: #f5a623; color: #17181c; font-weight: 650;
+  }
+  .empty { text-align: center; color: #8b93a7; padding: 48px 20px; font-size: 14px; }
+  .err { color: #ff8080; font-size: 13px; min-height: 18px; margin-bottom: 10px; }
+</style>
+
+<header>
+  <h1>🐝 Hive</h1>
+  <span class="host" id="host"></span>
+  <span class="spacer"></span>
+  <button class="ghost" onclick="fetch('/logout',{method:'POST'}).then(()=>location.href='/login')">
+    Sign out
+  </button>
+</header>
+
+<main>
+  <div class="new">
+    <input id="name" placeholder="session name" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <select id="kind">
+      <option value="claude">claude</option>
+      <option value="codex">codex</option>
+      <option value="shell">shell</option>
+    </select>
+    <button onclick="create()">Start</button>
+  </div>
+  <div class="err" id="err"></div>
+  <ul id="list"></ul>
+</main>
+
+<script>
+  const $ = id => document.getElementById(id);
+  $('host').textContent = location.hostname;
+
+  const ago = ts => {
+    const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s / 60) + 'm';
+    if (s < 86400) return Math.floor(s / 3600) + 'h';
+    return Math.floor(s / 86400) + 'd';
+  };
+
+  const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  async function refresh() {
+    let r;
+    try { r = await fetch('/api/sessions'); } catch { return; }
+    if (r.status === 401) return location.href = '/login';
+    const list = await r.json();
+    $('list').innerHTML = list.length ? list.map(s => `
+      <li>
+        <span class="dot ${s.attached ? 'on' : ''}"></span>
+        <span class="meta">
+          <div class="name">${esc(s.name)}</div>
+          <div class="sub">
+            <b>${esc(s.window_name || s.current_command)}</b> · ${s.windows} win · up ${ago(s.created)}
+            ${s.attached ? ' · attached' : ''}
+          </div>
+        </span>
+        <a class="open" href="/terminal/${encodeURIComponent(s.name)}">Open</a>
+        <button class="ghost" onclick="kill('${esc(s.name)}')">Kill</button>
+      </li>`).join('')
+      : '<div class="empty">No sessions yet. Start one above.</div>';
+  }
+
+  async function create() {
+    const name = $('name').value.trim();
+    if (!name) return;
+    $('err').textContent = '';
+    const r = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, kind: $('kind').value })
+    });
+    if (r.ok) { $('name').value = ''; refresh(); }
+    else $('err').textContent = await r.text();
+  }
+
+  async function kill(name) {
+    if (!confirm(`Kill session "${name}"? Anything running in it stops.`)) return;
+    await fetch('/api/sessions/' + encodeURIComponent(name), { method: 'DELETE' });
+    refresh();
+  }
+
+  $('name').addEventListener('keydown', e => { if (e.key === 'Enter') create(); });
+  refresh();
+  setInterval(refresh, 4000);
+</script>

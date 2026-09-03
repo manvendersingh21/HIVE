@@ -50,6 +50,9 @@ openssh = "0.11"
 # tmux
 tmux_interface = "0.3"
 
+# PTY (web terminal <-> tmux attach bridge)
+portable-pty = "0.8"
+
 # Actor framework
 ractor = "0.14"
 
