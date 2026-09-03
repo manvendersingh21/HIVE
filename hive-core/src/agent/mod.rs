@@ -502,6 +502,19 @@ impl MasterAgent {
             count += 1;
         }
 
+        // Drop machines that are no longer part of the fleet. Without this a
+        // worker removed from `workers.toml` lingers in the graph forever,
+        // permanently "offline" — and the graph exists to answer where work
+        // should run, so a decommissioned host is worse than absent: it invites
+        // the planner to keep proposing it.
+        let known: Vec<String> = std::iter::once(self.master_name.clone())
+            .chain(self.workers.workers.iter().map(|w| w.info.name.clone()))
+            .collect();
+        let pruned = machines::prune_unknown(&self.memory.graph, &known)?;
+        if !pruned.is_empty() {
+            info!(retired = ?pruned, "removed machines no longer in the fleet");
+        }
+
         info!(machines = count, "machine knowledge graph refreshed");
         Ok(count)
     }

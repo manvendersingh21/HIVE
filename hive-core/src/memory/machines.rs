@@ -331,6 +331,22 @@ pub fn project_into_graph(kg: &KnowledgeGraph, facts: &MachineFacts) -> anyhow::
     Ok(())
 }
 
+/// Remove machines from the graph that are not in `known`.
+///
+/// Returns the names dropped. Called after a refresh, so the graph tracks the
+/// configured fleet rather than accumulating every host ever probed.
+pub fn prune_unknown(kg: &KnowledgeGraph, known: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for machine in kg.entities_of_kind("machine")? {
+        if !known.iter().any(|k| k == &machine.name) {
+            if kg.remove_entity(&machine.id)? {
+                removed.push(machine.name);
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Machines that have every one of `capabilities`, best first.
 ///
 /// "Best" is free memory then core count — a starting heuristic, and the point
@@ -573,6 +589,21 @@ mod tests {
         let tools: Vec<String> = kg.neighbors("machine:m", "has_tool").unwrap()
             .into_iter().map(|t| t.name).collect();
         assert_eq!(tools, vec!["claude"], "a real probe still prunes removed tools");
+    }
+
+    #[test]
+    fn pruning_drops_decommissioned_machines_only() {
+        let kg = KnowledgeGraph::in_memory().unwrap();
+        project_into_graph(&kg, &facts("keep-me", &["claude"], 8.0, true)).unwrap();
+        project_into_graph(&kg, &facts("retired", &["claude"], 8.0, false)).unwrap();
+
+        let dropped = prune_unknown(&kg, &["keep-me".to_string()]).unwrap();
+        assert_eq!(dropped, vec!["retired"]);
+        assert!(kg.entity("machine:retired").unwrap().is_none());
+        assert!(kg.entity("machine:keep-me").unwrap().is_some());
+
+        // Idempotent: a second pass finds nothing left to drop.
+        assert!(prune_unknown(&kg, &["keep-me".to_string()]).unwrap().is_empty());
     }
 
     #[test]

@@ -1,3 +1,9 @@
+> **Azure is retired.** The `lawfinder` worker (Azure VM, `100.93.65.98`) is no longer
+> part of the fleet. Sections below that describe deployments on it are kept as a
+> record of how a worker is set up — the same steps apply to any Linux worker — but
+> nothing runs there now. The current fleet is the Mac Mini master plus
+> `archlinux-worker` (`hive-worker-2`).
+
 # Deploying `hive-web`
 
 Live deployment: the `lawfinder` Azure VM (Ubuntu 24.04), reachable on the tailnet

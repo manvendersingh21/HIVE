@@ -432,3 +432,28 @@ worker sat at `Offline` forever and the master would never place remote work —
 "no worker is online" with the worker sitting there perfectly reachable. `refresh_health`
 now takes `&self` (status is an `AtomicU8`, like `active_tasks`) and runs on a 60s timer
 alongside the machine-graph refresh, bounded so one wedged host cannot stall the fleet.
+
+
+---
+
+## Azure retired
+
+The `lawfinder` Azure VM is no longer part of the fleet. `workers.toml` lists only
+`archlinux-worker` (`hive-worker-2`, Arch, 4 cores, 11.6 GB), and the master prunes
+machines that are no longer configured, so the knowledge graph dropped
+`lawfinder-worker` on the next refresh.
+
+Historical results recorded in this document that were verified on that machine —
+Phase 3's SSH delegation, Phase 4's worker daemon, Phase 5's web terminal — still
+stand as records of what was tested and when. They are not claims about what is
+running today. What runs today:
+
+| | host | state |
+|:---|:---|:---|
+| Master (`hive-web`: agent UI, terminal, machine graph) | Mac Mini, launchd | live |
+| Worker | `archlinux-worker` via SSH+tmux | live |
+| `hive-worker` daemon | — | not deployed anywhere |
+
+The `hive-worker` daemon has no host at present: the Arch box has no Rust toolchain,
+so nothing has been built there. Direct SSH+tmux delegation (the default path) works
+without it.

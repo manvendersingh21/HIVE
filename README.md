@@ -99,8 +99,8 @@ Short version:
   than a hardcoded branch, and the same graph renders into the planner's prompt
 - ✅ `hive-web` is a real web terminal: tmux session dashboard, create/kill sessions running
   `claude`, `codex` or a plain shell, and a `WebSocket ↔ PTY ↔ tmux attach` bridge rendering
-  into xterm.js — password-gated, mobile key bar, auto-reconnect. Deployed on the `lawfinder`
-  worker and reachable from any device on the tailnet (see `docs/DEPLOY-WEB.md`)
+  into xterm.js — password-gated, mobile key bar, auto-reconnect. Deployed on the master and reachable from any device on the tailnet
+  (see `docs/DEPLOY-WEB.md`)
 - ✅ `hive-worker` is a real daemon: accepts a `TaskAssignment`, runs its commands in a tmux
   session honoring `working_dir`/`env_vars`/`timeout_secs`/`wait_for_completion`, tracks true
   per-task state, captures exit codes, pushes status back to the master, and exposes
@@ -108,7 +108,8 @@ Short version:
   Bearer-token authenticated — it refuses to start without one
 - ✅ `hive-cli/src/main.rs` — full command tree; `chat`/`task` drive a real `MasterAgent`;
   `workers list` and worker health checks reflect real config/real SSH reachability
-- ✅ `config/hive.toml` and `config/workers.toml` in place — one real worker configured
+- ✅ `config/hive.toml` and `config/workers.toml` in place — `archlinux-worker` configured
+  (the Azure `lawfinder` worker was retired; Hive no longer uses Azure)
 - ⚠️ Watchdog supervision only lasts as long as the CLI process does — `hive task` exits right
   after delegating, so anything delegated through it runs unsupervised almost immediately
   after; `hive chat` supervises for its session. No persistent daemon yet. See `docs/STATUS.md`.

@@ -154,6 +154,17 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    /// Delete an entity and every edge touching it.
+    ///
+    /// Edges cascade via `ON DELETE CASCADE`, so retiring a machine also drops
+    /// its `has_tool` / `runs_os` relations rather than leaving them dangling.
+    /// Returns whether anything was removed.
+    pub fn remove_entity(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+        Ok(removed > 0)
+    }
+
     pub fn entity(&self, id: &str) -> anyhow::Result<Option<Entity>> {
         let conn = self.conn.lock().unwrap();
         let row = conn
@@ -326,6 +337,23 @@ mod tests {
         }
         kg.clear_relation("machine:a", "has_tool").unwrap();
         assert!(kg.neighbors("machine:a", "has_tool").unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_an_entity_takes_its_edges_with_it() {
+        let kg = graph();
+        kg.upsert_entity(&Entity::new("machine", "retired", json!({}))).unwrap();
+        kg.upsert_entity(&Entity::new("tool", "claude", json!({}))).unwrap();
+        kg.add_edge("machine:retired", "has_tool", "tool:claude").unwrap();
+
+        assert!(kg.remove_entity("machine:retired").unwrap());
+        assert!(kg.entity("machine:retired").unwrap().is_none());
+        // The edge must not survive its endpoint.
+        assert!(kg.sources_of("has_tool", "tool:claude").unwrap().is_empty());
+        // The tool itself is shared, so it stays.
+        assert!(kg.entity("tool:claude").unwrap().is_some());
+        // Removing something absent is not an error.
+        assert!(!kg.remove_entity("machine:retired").unwrap());
     }
 
     #[test]
