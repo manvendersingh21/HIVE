@@ -17,9 +17,26 @@ test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 running 3 tests    (hive-core — planner JSON extraction)
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
-$ cargo run --bin hive -- task -d "check disk space"    # no Ollama running
+$ cargo run --bin hive -- task -d "check disk space"    # before Ollama was installed
 Error: Failed to reach Ollama at http://localhost:11434/api/chat: error sending request
 for url (http://localhost:11434/api/chat) (is `ollama serve` running?)
+
+$ brew install ollama tmux && brew services start ollama
+$ ollama pull qwen2.5:14b-instruct-q4_K_M   # 9.0 GB
+
+$ cargo run --bin hive -- task -d "check disk space on this machine"
+Summary: Check the disk space on the local machine
+
+$ df -h
+exit_code: 0
+stdout:
+Filesystem        Size    Used   Avail Capacity ...
+/dev/disk3s1s1   228Gi    16Gi    79Gi    17%    ...
+...
+
+Provider: local (Ollama)
+Complexity: SIMPLE
+No sessions created (worker delegation not implemented yet).
 
 $ HIVE_WORKER_ADDR=127.0.0.1:19091 cargo run --bin hive-worker &
 $ curl http://127.0.0.1:19091/health
@@ -30,12 +47,10 @@ $ curl http://127.0.0.1:19093/api/health
 ok
 ```
 
-`cargo run --bin hive -- task ...` was not verified against a live Ollama instance in this
-session — no Ollama install was available in the build environment. The error above was
-checked directly instead: it fails honestly and clearly, rather than returning the old
-hardcoded `Medium` placeholder. Anyone running this with `ollama serve` up (per the
-Prerequisites in the README) gets a real classification, plan, and (for local subtasks) real
-command execution.
+Both paths are now verified live: before Ollama was installed, the router failed honestly
+(no fake `Medium` placeholder); after installing Ollama + pulling the model, a real request
+was classified `SIMPLE`, planned into a concrete `df -h` command by the local model, executed
+through `ShellTool`, and returned with real output in the summary.
 
 ### What Phase 2 built
 
