@@ -11,6 +11,7 @@ mod auth;
 mod chat;
 mod sessions;
 mod terminal;
+mod workers;
 
 use std::net::SocketAddr;
 
@@ -37,6 +38,7 @@ use tracing::{info, warn};
 struct AppState {
     auth: auth::Auth,
     agent: chat::AgentHandle,
+    workers: workers::WorkerIngest,
 }
 
 impl FromRef<AppState> for auth::Auth {
@@ -48,6 +50,12 @@ impl FromRef<AppState> for auth::Auth {
 impl FromRef<AppState> for chat::AgentHandle {
     fn from_ref(s: &AppState) -> Self {
         s.agent.clone()
+    }
+}
+
+impl FromRef<AppState> for workers::WorkerIngest {
+    fn from_ref(s: &AppState) -> Self {
+        s.workers.clone()
     }
 }
 
@@ -156,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         auth: auth::Auth::new(password),
         agent: build_agent(&master_name).await,
+        workers: workers::WorkerIngest::from_env(),
     };
 
     let app = Router::new()
@@ -174,6 +183,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/machines", get(chat::machine_graph))
         .route("/api/machines/refresh", post(chat::refresh_machines))
         .route("/api/machines/prompt", get(chat::machines_prompt))
+        .route("/api/worker/status", post(workers::ingest))
+        .route("/api/worker/tasks", get(workers::list))
         .route("/ws/{name}", get(ws_handler))
         .layer(middleware::from_fn_with_state(
             state.auth.clone(),

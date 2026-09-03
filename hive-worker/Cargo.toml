@@ -19,4 +19,6 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 tmux_interface = { workspace = true }
 chrono = { workspace = true }
+reqwest = { workspace = true }
+libc = { workspace = true }
 uuid = { workspace = true }

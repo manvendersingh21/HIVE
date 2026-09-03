@@ -50,6 +50,9 @@ openssh = "0.11"
 # tmux
 tmux_interface = "0.3"
 
+# Process-group signalling (worker pause/resume) — killpg, not shelling out
+libc = "0.2"
+
 # PTY (web terminal <-> tmux attach bridge)
 portable-pty = "0.8"
 

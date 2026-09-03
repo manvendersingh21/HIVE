@@ -833,6 +833,8 @@ dependencies = [
  "axum",
  "chrono",
  "hive-common",
+ "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "tmux_interface",

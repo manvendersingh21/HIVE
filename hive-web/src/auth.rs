@@ -120,8 +120,11 @@ pub async fn require_auth(
     next: Next,
 ) -> Result<Response, Response> {
     let path = req.uri().path();
+    // Worker callbacks carry a bearer token, not a browser cookie — they are
+    // authenticated in `workers::ingest` instead of by this middleware.
     let is_open = path == "/login"
         || path == "/api/health"
+        || path == "/api/worker/status"
         || path.starts_with("/assets/")
         || path.ends_with(".css")
         || path.ends_with(".js");

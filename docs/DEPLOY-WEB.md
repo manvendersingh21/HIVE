@@ -126,3 +126,55 @@ pending map, so replaying an approval returns 404 rather than re-running it.
 Only local execution is gated this way. Delegated remote steps are supervised
 live by the same watchdog once their tmux session starts, which is a stronger
 guarantee than a pre-flight check — it keeps watching after the command begins.
+
+---
+
+## The worker daemon (`hive-worker`)
+
+Deployed on `lawfinder` as systemd `hive-worker`, listening on the Tailscale
+address `100.93.65.98:9091`.
+
+| Path | Purpose |
+|:---|:---|
+| `/etc/systemd/system/hive-worker.service` | unit, enabled |
+| `~/.config/hive/worker.env` | bind addr, worker name, master URL, token (mode 600) |
+| `/tmp/hive-task-<task_id>.log` | per-task combined output |
+
+### Authentication is mandatory
+
+`POST /task` executes arbitrary shell as `azureuser`. The daemon **refuses to
+start** without `HIVE_WORKER_TOKEN` (minimum 16 characters); every endpoint
+except `/health` requires `Authorization: Bearer <token>`. `/health` stays open
+so reachability probes need no credential.
+
+`HIVE_WORKER_ALLOW_UNAUTHENTICATED=1` overrides the refusal. Use it only on a
+loopback bind — on a routable address it is a remote code execution endpoint.
+
+The master's `HIVE_WORKER_TOKEN` must match: it is what `hive-worker` sends on
+status callbacks, and what `POST /api/worker/status` checks.
+
+### Endpoints
+
+| Method | Path | Purpose |
+|:---|:---|:---|
+| GET | `/health` | liveness, worker name, whether callbacks are configured |
+| POST | `/task` | accept a `TaskAssignment`; returns `202` immediately |
+| GET | `/tasks` | every task this daemon has accepted, newest first |
+| GET | `/status/{id}` | real state, exit code, and output; `404` if unknown |
+| POST | `/task/{id}/pause` | SIGSTOP the task's process group |
+| POST | `/task/{id}/resume` | SIGCONT it |
+| POST | `/task/{id}/kill` | end the session; state becomes `cancelled` |
+
+### Signalling safety
+
+Pause targets the tty's **foreground process group**, not the pane's shell —
+commands arrive via `send-keys` and run as a job in their own group, so
+signalling the shell would freeze the wrong thing. The pgid is recorded at pause
+time because bash reclaims the terminal once a job stops.
+
+Signals go through `libc::killpg`, never a `kill` subprocess: a negative argument
+to `kill` is overloaded, and `-1` means *every process the user can signal*. See
+the incident note in [`ROADMAP.md`](ROADMAP.md#phase-4--worker-daemon) — that
+mistake stopped a host's unrelated services during testing. `validate_pgid`
+refuses `<= 1` and the daemon's own group, and `pause` checks the pgid is on the
+target session's tty.

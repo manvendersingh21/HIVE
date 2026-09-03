@@ -72,8 +72,8 @@ Full architecture diagrams, data model, and code sketches live in
 
 ## Status
 
-**Phases 1–3 and 5 are complete and live-verified** — `cargo build --workspace` and
-`cargo test --workspace` both pass cleanly (55 passed, 1 opt-in live test), and `hive task`/
+**Phases 1–5 are complete and live-verified** — `cargo build --workspace` and
+`cargo test --workspace` both pass cleanly (79 passed, 1 opt-in live test), and `hive task`/
 `hive chat` classify, plan, and execute real commands — locally, or delegated over real SSH to a
 worker running inside a supervised tmux session. See [`docs/STATUS.md`](docs/STATUS.md) for the
 full audit and [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases.
@@ -101,8 +101,11 @@ Short version:
   `claude`, `codex` or a plain shell, and a `WebSocket ↔ PTY ↔ tmux attach` bridge rendering
   into xterm.js — password-gated, mobile key bar, auto-reconnect. Deployed on the `lawfinder`
   worker and reachable from any device on the tailnet (see `docs/DEPLOY-WEB.md`)
-- ✅ `hive-worker` axum server — routes wired, verified live over HTTP (now bypassed by the
-  direct-SSH delegation path above — see `docs/ROADMAP.md`'s Phase 4 note)
+- ✅ `hive-worker` is a real daemon: accepts a `TaskAssignment`, runs its commands in a tmux
+  session honoring `working_dir`/`env_vars`/`timeout_secs`/`wait_for_completion`, tracks true
+  per-task state, captures exit codes, pushes status back to the master, and exposes
+  `pause`/`resume`/`kill` (a real SIGSTOP/SIGCONT, so paused work can actually resume).
+  Bearer-token authenticated — it refuses to start without one
 - ✅ `hive-cli/src/main.rs` — full command tree; `chat`/`task` drive a real `MasterAgent`;
   `workers list` and worker health checks reflect real config/real SSH reachability
 - ✅ `config/hive.toml` and `config/workers.toml` in place — one real worker configured

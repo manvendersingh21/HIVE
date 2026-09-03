@@ -13,7 +13,7 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | 1 | Scaffold, `hive-common` types, workspace | 1 day | — | ✅ done, build+test verified |
 | 2 | LLM router + agent loop | 2–3 days | 1 | ✅ done, build+test verified |
 | 3 | Worker pool, SSH delegation, tmux creation | 2 days | 2 | ✅ done, live-verified against a real worker (redesigned: direct SSH+tmux, no daemon — see below) |
-| 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ⬜ routes only, superseded by Phase 3's direct-SSH design (see note) |
+| 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ✅ done, live-verified on `lawfinder` |
 | 5 | `hive-web` — web terminal + agent UI | 2–3 days | 3 | ✅ done, live on the master and the `lawfinder` worker |
 | 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 command tree wired, most subcommands are stubs |
 | 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
@@ -112,21 +112,57 @@ installing them on every worker.
 ---
 
 ## Phase 4 — Worker Daemon
-*Plan section: "Phase 3", `hive-worker/src/main.rs`* · **Status: ⬜ — superseded by Phase 3's design**
+*Plan section: "Phase 3", `hive-worker/src/`* · **Status: ✅ done, live-verified**
 
-Phase 3 shipped direct SSH+tmux delegation instead of POSTing to this daemon (see its note
-above). The routes below still exist and still respond (verified in Phase 1), but nothing calls
-them anymore. Revisit this phase only if a use case actually needs a persistent per-worker agent
-(e.g. accepting tasks without an open SSH session, or running as an unprivileged service) —
-otherwise it may not be worth building out.
+Direct SSH+tmux delegation (Phase 3) remains the default path. This daemon covers
+what that path structurally cannot: accepting work with no SSH session held open by
+the master, and exposing `pause`/`resume`/`kill` as endpoints any supervisor can call
+without an interactive connection. Sessions it creates are shaped exactly like the SSH
+path's — same `bash -l`, same `__HIVE_DONE__<code>` sentinel, same log file — so both
+are attachable and readable the same way.
 
 - [x] axum server with `/health`, `POST /task`, `GET /status/{task_id}`
-- [ ] `executor.rs` — create the tmux session, `send-keys` each command, honor `working_dir`,
-      `env_vars`, `timeout_secs`, `wait_for_completion`
-- [ ] Real task registry so `/status/{id}` reports truth instead of a hardcoded `Running`
-- [ ] `reporter.rs` — push `TaskStatus` back to the master
-- [ ] Exit-code capture and output tailing via `tmux capture-pane`
-- [ ] `pause` / `resume` / `kill` endpoints (the watchdog in Phase 10 depends on these)
+- [x] `executor.rs` — creates the tmux session, `send-keys` per command, honors
+      `working_dir`, `env_vars`, `timeout_secs`, `wait_for_completion`
+- [x] `registry.rs` — real task registry; `/status/{id}` reports truth and 404s on
+      unknown ids instead of answering a hardcoded `Running`
+- [x] `reporter.rs` — pushes `TaskStatus` to the master on every state transition,
+      received at `POST /api/worker/status` on `hive-web`
+- [x] Exit-code capture from the sentinel, output from the log file with
+      `tmux capture-pane` as fallback
+- [x] `pause` / `resume` / `kill` endpoints
+- [x] Bearer-token auth — the daemon refuses to start without `HIVE_WORKER_TOKEN`
+
+**Pause is a real SIGSTOP, not `send-keys C-c`.** An interrupt ends the command and
+makes `resume` impossible; SIGSTOP freezes the work mid-flight so SIGCONT can genuinely
+continue it. Two subtleties, both found by testing rather than reasoning:
+
+- Commands arrive by `send-keys`, so the pane's shell runs them as a **job with its own
+  process group**. Signalling the pane's process stops the shell and leaves the work
+  running. The target is the tty's foreground process group (`tpgid`).
+- Once a job is stopped, bash **reclaims the terminal**, so `tpgid` then names the shell.
+  The pgid is recorded at pause time and reused for resume; a tty scan for stopped
+  groups is the fallback after a daemon restart.
+
+### Incident: `kill -STOP -1`
+
+The first implementation shelled out to `kill -STOP -<pgid>`. A negative argument there
+is overloaded — `-1` does not mean "process group 1", it means *every process the user
+can signal*. During live testing on `lawfinder` this stopped the host's Next.js server,
+VS Code server, user `systemd`, the pre-existing tmux server, and an unrelated multi-day
+`sci-legal-data` download pipeline. Everything was resumed with `SIGCONT` (nothing was
+killed, and the pipeline kept its 1d19h uptime), but it should never have been reachable.
+
+Fixed structurally, not by patching the symptom:
+
+- Signalling uses `libc::killpg` directly — no shell, no argument parsing to misread.
+- `validate_pgid` refuses `<= 1` (0 is the caller's own group, 1 is init, negatives
+  broadcast) and refuses the daemon's own process group.
+- `pause` additionally verifies the pgid is on the target session's tty before signalling.
+- Regression tests cover each refused case by name.
+
+Verified afterwards on the real worker: pausing a task stopped exactly 4 processes, all
+belonging to that task, with the host's other services untouched.
 
 ---
 
