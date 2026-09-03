@@ -122,6 +122,14 @@ pub struct SubTask {
     /// Expected behavior (for the watchdog, once Phase 10 lands).
     #[serde(default)]
     pub expected_behavior: Option<String>,
+    /// Capabilities the target machine must have, e.g. `gpu-compute`.
+    ///
+    /// This is what connects the machine knowledge graph to actual placement.
+    /// Without it every remote subtask asked for the same fixed capability, so
+    /// a GPU job and a `wc -l` were routed identically — the graph knew which
+    /// box had the A6000s and was never asked.
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
 }
 
 /// Decomposes user requests into a `TaskPlan` via the LLM router.
@@ -158,10 +166,16 @@ impl Planner {
                    \"description\": \"what this subtask does\",\n      \
                    \"requires_remote\": false,\n      \
                    \"commands\": [\"shell command\"],\n      \
-                   \"expected_behavior\": \"what success looks like, for safety monitoring\"\n    \
+                   \"expected_behavior\": \"what success looks like, for safety monitoring\",\n      \
+                   \"required_capabilities\": []\n    \
                  }}\n  \
                ]\n\
              }}\n\n\
+             Set required_capabilities only when the work genuinely needs them, choosing \
+             from: gpu-compute (CUDA/GPU work), local-inference (running a local LLM), \
+             containers (docker), build (compiling), database, batch-scheduler. Leave it \
+             empty for ordinary shell commands — an unnecessary requirement can leave a \
+             task unplaceable.\n\
              Use requires_remote=true only if the task must run on a separate worker \
              machine. When you do, write the command exactly as it should run ON that \
              machine — do NOT wrap it in ssh, and do not name the machine in the command. \
@@ -191,6 +205,7 @@ impl Planner {
                         requires_remote: false,
                         commands: vec![],
                         expected_behavior: None,
+                        required_capabilities: vec![],
                     }],
                     provider_used: response.provider,
                 })

@@ -250,7 +250,11 @@ impl MasterAgent {
         let mut steps = Vec::new();
         for subtask in &plan.subtasks {
             let target = if subtask.requires_remote {
-                match self.choose_worker(&["supervised-sessions"]) {
+                // Ask the graph for a machine that can actually do this work,
+                // rather than any machine at all.
+                let mut needed: Vec<&str> = vec!["supervised-sessions"];
+                needed.extend(subtask.required_capabilities.iter().map(String::as_str));
+                match self.choose_worker(&needed) {
                     Some(worker) => StepTarget::Remote {
                         worker: worker.info.name.clone(),
                     },

@@ -26,3 +26,13 @@ name = "cis-a6000"
 host = "cis-a6000"
 user = "tur38767"
 tags = ["gpu", "cuda", "slurm", "shared"]
+
+# Temple CIS login/bastion node. Tagged `login-node` on purpose: ~65 concurrent
+# users on 4 cores, and it is also the ProxyJump for cis-a6000 — overloading it
+# takes both Temple workers offline, not just this one. Suitable for short,
+# light commands; nothing sustained.
+[[workers]]
+name = "cis-linux2"
+host = "cis-linux2"
+user = "tur38767"
+tags = ["shared", "login-node", "bastion"]
