@@ -58,9 +58,15 @@ impl SshWorker {
     /// polls). A sentinel line is appended so callers can detect
     /// completion and capture the exit code from the log stream itself.
     pub async fn spawn_tmux(&self, session_name: &str, command: &str, log_path: &str) -> anyhow::Result<()> {
-        let inner = format!(
-            "( {command} ) > >(tee {log_path}) 2>&1; echo \"__HIVE_DONE__$?\" | tee -a {log_path}"
-        );
+        // A single synchronous pipe into one `tee`, not `> >(tee ...)`
+        // process substitution: process substitution runs its reader as a
+        // background job that the shell does NOT wait for before moving on
+        // to the next `;`-separated statement, so the sentinel line below
+        // can be written (or the file re-truncated) before the command's
+        // own output is flushed — a real race that dropped output in
+        // testing. Capturing `$?` inside the brace group, before the pipe,
+        // keeps the original command's exit code rather than tee's.
+        let inner = format!("{{ ( {command} ); echo \"__HIVE_DONE__$?\"; }} 2>&1 | tee {log_path}");
         let status = self
             .session
             .command("tmux")

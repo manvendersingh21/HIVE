@@ -10,7 +10,8 @@ index by the local model, so the agent remembers past decisions, commands, and e
 you come back to a project weeks later.
 
 A **safety watchdog** watches every running session continuously. If it sees something
-dangerous, it kills the task immediately and escalates to you for a human decision.
+dangerous, it pauses the task immediately (not kills — session state is preserved for
+review) and escalates to you for a human decision.
 
 ---
 

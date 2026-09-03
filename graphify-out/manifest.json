@@ -1,9 +1,9 @@
 {
   "Cargo.toml": {
-    "mtime": 1788314711.2534537,
-    "seen": 1788315461.5710552,
-    "ast_hash": "ae4c831f2656a5902f1a179c896a6faa",
-    "semantic_hash": "ae4c831f2656a5902f1a179c896a6faa"
+    "mtime": 1788394009.2742116,
+    "seen": 1788397447.844817,
+    "ast_hash": "11766fb33bb069137f68f051b2072501",
+    "semantic_hash": "11766fb33bb069137f68f051b2072501"
   },
   "hive-cli/Cargo.toml": {
     "mtime": 1788315094.2653065,
@@ -12,10 +12,10 @@
     "semantic_hash": "d465bcded34d378aff3a14a9157f07c6"
   },
   "hive-common/Cargo.toml": {
-    "mtime": 1788314716.572818,
-    "seen": 1788315461.5710568,
-    "ast_hash": "b9ce7a99f42ead6552e57ee2f343b273",
-    "semantic_hash": "b9ce7a99f42ead6552e57ee2f343b273"
+    "mtime": 1788317180.0257123,
+    "seen": 1788397447.844821,
+    "ast_hash": "e2db991702cbc72faf011e201255b60d",
+    "semantic_hash": "e2db991702cbc72faf011e201255b60d"
   },
   "hive-common/src/config.rs": {
     "mtime": 1788314879.5300705,
@@ -42,22 +42,22 @@
     "semantic_hash": "e0c675f06ad679f32dfed78829774f52"
   },
   "hive-core/Cargo.toml": {
-    "mtime": 1788314887.6171672,
-    "seen": 1788315461.571059,
-    "ast_hash": "022c9722248be3c788b97022e831e21b",
-    "semantic_hash": "022c9722248be3c788b97022e831e21b"
+    "mtime": 1788394011.3690276,
+    "seen": 1788397447.844824,
+    "ast_hash": "3de964f91b4cb92abfe5eb01173ecb89",
+    "semantic_hash": "3de964f91b4cb92abfe5eb01173ecb89"
   },
   "hive-core/src/agent/mod.rs": {
-    "mtime": 1788314995.660531,
-    "seen": 1788315461.57106,
-    "ast_hash": "2f06e86547c71604576ff50e05fdce7a",
-    "semantic_hash": "2f06e86547c71604576ff50e05fdce7a"
+    "mtime": 1788396159.2724512,
+    "seen": 1788397447.844825,
+    "ast_hash": "cb45240a1ceecf803b0849ae22405490",
+    "semantic_hash": "cb45240a1ceecf803b0849ae22405490"
   },
   "hive-core/src/agent/planner.rs": {
-    "mtime": 1788315002.0792842,
-    "seen": 1788315461.57106,
-    "ast_hash": "049131bc888d4a1e4e956bfffb5304f5",
-    "semantic_hash": "049131bc888d4a1e4e956bfffb5304f5"
+    "mtime": 1788394106.5422714,
+    "seen": 1788397447.844825,
+    "ast_hash": "fa5674b58fd038ca0067a17fe7bfb3d8",
+    "semantic_hash": "fa5674b58fd038ca0067a17fe7bfb3d8"
   },
   "hive-core/src/finetune/mod.rs": {
     "mtime": 1788315052.0195408,
@@ -72,10 +72,10 @@
     "semantic_hash": "c03cd483798d09e79a98a40aae365581"
   },
   "hive-core/src/llm/mod.rs": {
-    "mtime": 1788315014.3561661,
-    "seen": 1788315461.571062,
-    "ast_hash": "30ea53ba574d66fc96154cea8a9551f4",
-    "semantic_hash": "30ea53ba574d66fc96154cea8a9551f4"
+    "mtime": 1788394063.810747,
+    "seen": 1788397447.8448288,
+    "ast_hash": "7cde4ec10ba13941d09723ec98a65ebb",
+    "semantic_hash": "7cde4ec10ba13941d09723ec98a65ebb"
   },
   "hive-core/src/memory/mod.rs": {
     "mtime": 1788315041.1798913,
@@ -90,22 +90,22 @@
     "semantic_hash": "f9a87c2f7785456b9302a3a810cc9823"
   },
   "hive-core/src/tools/mod.rs": {
-    "mtime": 1788315028.1417847,
-    "seen": 1788315461.571063,
-    "ast_hash": "96f568fe44e13eed4684edf6cde8b0e0",
-    "semantic_hash": "96f568fe44e13eed4684edf6cde8b0e0"
+    "mtime": 1788394091.6491425,
+    "seen": 1788397447.844832,
+    "ast_hash": "f4cf63aa5127df8462f82977f8333923",
+    "semantic_hash": "f4cf63aa5127df8462f82977f8333923"
   },
   "hive-core/src/watchdog/mod.rs": {
-    "mtime": 1788315046.7765582,
-    "seen": 1788315461.571064,
-    "ast_hash": "c96993ac22512728b06c4a4fcf07b184",
-    "semantic_hash": "c96993ac22512728b06c4a4fcf07b184"
+    "mtime": 1788396039.9670522,
+    "seen": 1788397447.8448331,
+    "ast_hash": "e4bca7bcad2a02b4f2c787062c54faac",
+    "semantic_hash": "e4bca7bcad2a02b4f2c787062c54faac"
   },
   "hive-core/src/workers/mod.rs": {
-    "mtime": 1788315023.3040686,
-    "seen": 1788315461.571064,
-    "ast_hash": "56230fee093c72624eb2e7d7a21ad21a",
-    "semantic_hash": "56230fee093c72624eb2e7d7a21ad21a"
+    "mtime": 1788396359.7795677,
+    "seen": 1788397447.844835,
+    "ast_hash": "7df398e817125bffa0e39fb6dfa775a4",
+    "semantic_hash": "7df398e817125bffa0e39fb6dfa775a4"
   },
   "hive-web/Cargo.toml": {
     "mtime": 1788315077.7145584,
@@ -130,5 +130,89 @@
     "seen": 1788315461.5710661,
     "ast_hash": "e20bdce9ec05c0e8c283bb721c42a2b6",
     "semantic_hash": "e20bdce9ec05c0e8c283bb721c42a2b6"
+  },
+  "hive-cli/src/main.rs": {
+    "mtime": 1788396186.139406,
+    "seen": 1788397447.84482,
+    "ast_hash": "6aa86566239607db776ab86e0bccd807",
+    "semantic_hash": "6aa86566239607db776ab86e0bccd807"
+  },
+  "hive-core/src/llm/claude.rs": {
+    "mtime": 1788394038.0526235,
+    "seen": 1788397447.844827,
+    "ast_hash": "a5c80dfef12a94b02b1292e1df2ca8c4",
+    "semantic_hash": "a5c80dfef12a94b02b1292e1df2ca8c4"
+  },
+  "hive-core/src/llm/gemini.rs": {
+    "mtime": 1788394030.3775249,
+    "seen": 1788397447.844828,
+    "ast_hash": "b038cbecfc712d867a790b65df22c431",
+    "semantic_hash": "b038cbecfc712d867a790b65df22c431"
+  },
+  "hive-core/src/llm/local.rs": {
+    "mtime": 1788394021.1612265,
+    "seen": 1788397447.844828,
+    "ast_hash": "37f3557b25dc2bba5ef60332759ab54d",
+    "semantic_hash": "37f3557b25dc2bba5ef60332759ab54d"
+  },
+  "hive-core/src/llm/openai.rs": {
+    "mtime": 1788394045.8924103,
+    "seen": 1788397447.8448288,
+    "ast_hash": "a6067144beb63ea4915eec56c370f74a",
+    "semantic_hash": "a6067144beb63ea4915eec56c370f74a"
+  },
+  "hive-core/src/tools/file_ops.rs": {
+    "mtime": 1788394078.5597255,
+    "seen": 1788397447.844831,
+    "ast_hash": "2e95f8ddbba46e60d9abc1d5f4b1e048",
+    "semantic_hash": "2e95f8ddbba46e60d9abc1d5f4b1e048"
+  },
+  "hive-core/src/tools/git.rs": {
+    "mtime": 1788394084.251237,
+    "seen": 1788397447.844832,
+    "ast_hash": "030b81cac2cedfb2a1c589b7a3d5bbf2",
+    "semantic_hash": "030b81cac2cedfb2a1c589b7a3d5bbf2"
+  },
+  "hive-core/src/tools/shell.rs": {
+    "mtime": 1788394071.6243598,
+    "seen": 1788397447.8448331,
+    "ast_hash": "eb4ad76c89fb21cbbc25b4c2408c171b",
+    "semantic_hash": "eb4ad76c89fb21cbbc25b4c2408c171b"
+  },
+  "hive-core/src/watchdog/rules.rs": {
+    "mtime": 1788396206.047646,
+    "seen": 1788397447.844834,
+    "ast_hash": "d8ba656aefa0d40fe5797737f5b192e8",
+    "semantic_hash": "d8ba656aefa0d40fe5797737f5b192e8"
+  },
+  "hive-core/src/workers/ssh.rs": {
+    "mtime": 1788396769.8290255,
+    "seen": 1788397447.844835,
+    "ast_hash": "3d9156772fcd6136e86d1c39f2e9f1e5",
+    "semantic_hash": "3d9156772fcd6136e86d1c39f2e9f1e5"
+  },
+  "README.md": {
+    "mtime": 1788396537.9678893,
+    "seen": 1788397447.844838,
+    "ast_hash": "0de4f2faab6ccef77e70bdf503a55535",
+    "semantic_hash": "0de4f2faab6ccef77e70bdf503a55535"
+  },
+  "docs/ROADMAP.md": {
+    "mtime": 1788396521.285277,
+    "seen": 1788397447.8448389,
+    "ast_hash": "ae3cfaa9a0c7e92d522ae0485d45916e",
+    "semantic_hash": "ae3cfaa9a0c7e92d522ae0485d45916e"
+  },
+  "docs/STATUS.md": {
+    "mtime": 1788396470.8709884,
+    "seen": 1788397447.8448389,
+    "ast_hash": "a431f3acaf3633f39b91dbd9d9355b2a",
+    "semantic_hash": "a431f3acaf3633f39b91dbd9d9355b2a"
+  },
+  "docs/implementation-plan.md": {
+    "mtime": 1788316865.4539156,
+    "seen": 1788397447.84484,
+    "ast_hash": "1cc649140ef8a97df86ed56520978ecb",
+    "semantic_hash": "1cc649140ef8a97df86ed56520978ecb"
   }
 }
