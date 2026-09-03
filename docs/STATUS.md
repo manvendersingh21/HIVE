@@ -5,6 +5,111 @@ compiled, tested, and run — not what a session claimed.
 
 ---
 
+## Phase 3: ✅ Core delegation + safety supervision complete and live-verified
+
+This landed as a redesign, not the original plan's pseudocode: instead of a deployed
+`hive-worker` HTTP daemon receiving `POST /task`, the master drives `tmux` **directly over
+SSH**. A worker only needs `tmux` and an authorized SSH key — no `hive-worker` binary to
+build/deploy/keep updated. `hive-worker`'s HTTP routes still exist (Phase 1) but are now
+bypassed for this delegation path; see "Superseded" below.
+
+```
+$ cargo build --workspace          # clean, zero warnings
+$ cargo test --workspace           # 28 passed, 1 ignored (see below), 0 failed
+$ cargo run --bin hive -- workers list
+NAME              HOST           USER       TAGS
+lawfinder-worker  hive-worker-1  azureuser  []
+
+$ cargo run --bin hive -- task -d "Delegate to a remote worker machine: run the shell
+  command 'hostname && uptime && echo delegated-test-done' on the remote worker, not locally"
+...
+Session 'hive-06c431eb-...' on worker 'lawfinder-worker': running
+
+# Verified on the worker directly afterward:
+$ ssh hive-worker-1 cat /tmp/hive-06c431eb-....log
+lawfinder
+ 00:44:48 up 1 day, 20:52,  3 users,  load average: 1.00, 1.00, 1.04
+delegated-test-done
+__HIVE_DONE__0
+```
+
+### What Phase 3 built
+
+| Component | Detail |
+|:---|:---|
+| `hive-core/src/workers/ssh.rs` | `SshWorker` — real SSH via `openssh` (`process-mux`: a real `ControlMaster` per connection, `server_alive_interval`, `connect_timeout`). `spawn_tmux` starts a detached tmux session running the command, piping combined stdout/stderr through both the live pane *and* a remote log file (`> >(tee path) 2>&1`, not a plain pipe, so `$?` after the command is preserved for the completion sentinel). `tail` streams that log file line-by-line over its own SSH channel on the same pooled connection — chosen over polling `tmux capture-pane` specifically because polling can miss short bursts of output between checks. `send_keys`/`capture_pane` round out the toolkit. |
+| `hive-core/src/watchdog/rules.rs` | 9 built-in Tier-1 regex rules (`rm -rf /`, disk format/overwrite, `DROP TABLE`/`TRUNCATE`, force-push/hard-reset, `sudo`/`chmod 777`, `curl \| sh`, private-key/API-key patterns, fork bombs), each mapped to the `Severity`/`SafetyCategory` types Phase 1 already defined — those types turned out to already match this design closely. |
+| `hive-core/src/watchdog/mod.rs` | `Watchdog::scan_line` — Tier 1, run on every streamed line, zero LLM cost. `Watchdog::review` — Tier 2, periodic (`WatchdogConfig::poll_interval_secs`, backing off to `reduced_poll_interval_secs` after `max_consecutive_safe` clean checks — both config fields Phase 1 had already added), asks the LLM "does this still look like it's working toward the objective?" over the JSON-extraction pattern proven in the Phase 2 planner. Soft-fails to "inconclusive, safe" on any LLM/parse error — Tier 1 remains the hard stop so a flaky LLM response can't spuriously pause a session. `extra_rules` from `hive.toml` are compiled in alongside the built-ins. |
+| `WorkerPool::delegate` | SSHes in, starts the tmux session, registers a `SessionInfo` (shared `Arc<Mutex<HashMap>>`, safe to read from `active_sessions()` concurrently), and spawns a background supervisor task. Returns as soon as the session is confirmed *started* — does not block on the remote command finishing. |
+| `supervise` (in `workers/mod.rs`) | The background task: `tokio::select!` between the next tailed line (Tier 1 + sentinel detection) and a poll-interval tick (Tier 2). On a Tier-1 or Tier-2 hit: sends `tmux send-keys C-c` (pause, not kill — preserves state for review), marks the session `TaskState::PausedByWatchdog`, and logs a handover notification with the exact `ssh ... -t 'tmux attach -t ...'` command to take over. On the `__HIVE_DONE__<code>` sentinel: marks `Completed`/`Failed` by exit code. |
+| `WorkerPool::refresh_health` | Real SSH reachability probe replacing "every worker boots `Offline`" — `hive-cli`'s `build_agent` now calls it before every `hive task`/`hive chat`. |
+| `hive-cli` wiring | **Fixed a live Phase 1 bug in passing**: `build_agent` called `WorkerPool::new(vec![])` unconditionally — `config/workers.toml` was parsed elsewhere (`hive workers list`) but never actually fed into the pool the agent used, so delegation was structurally impossible even once the router supported `requires_remote`. Now loads `WorkersConfig::from_project_root` for real. |
+| `agent/mod.rs` | The `requires_remote` branch now calls `workers.delegate(...)` for real (previously just logged a note) and reports delegated sessions back in `AgentResponse.sessions`. |
+| `config/workers.toml` | One real worker configured — `host` points at an SSH config alias (`hive-worker-1`), not a raw IP, specifically so the actual hostname/IP never lands in this **public** GitHub repo. The alias (with `IdentityFile`, `ServerAliveInterval`/`CountMax`, `ControlMaster`/`ControlPersist`) lives only in the local, untracked `~/.ssh/config`. |
+
+### Live-verified, including a real pause
+
+Beyond the `hostname`/`uptime` run above, a `#[tokio::test]` marked `#[ignore]` (depends on a
+private host not available in CI or on a fresh checkout — run explicitly with
+`cargo test -p hive-core --lib -- --ignored live_delegation_pauses_on_tier1_match`) delegates a
+command whose output contains `rm -rf /` (an `echo`, never actually run) to the real worker and
+asserts the session reaches `TaskState::PausedByWatchdog` within 10s. **This passed live** in
+this session: the Tier-1 scan caught the line from real remote output, and the session was
+correctly marked paused. (The pause *signal* itself — `tmux send-keys C-c` — logged a benign
+"can't find pane" warning in this specific run, because the `echo` finished and closed its tmux
+session before the signal arrived; there was nothing left to interrupt. State tracking and
+detection are what the test asserts, and both worked.)
+
+Tier 2 (LLM review) is unit-tested (JSON extraction, `Watchdog::review`'s fallback path) and
+built entirely on the `LlmRouter::local_complete` path already live-verified in Phase 2, but
+was not separately exercised live end-to-end this session (Tier-1-only config was used for the
+live worker test, to isolate it from needing Ollama running at the same time).
+
+### Known limitation — the supervision window is only as long as the process stays alive
+
+`WorkerPool::delegate` spawns the supervisor as a `tokio::spawn` task inside the current
+process. The remote command runs independently on the worker regardless (it's a detached tmux
+session — verified above, the `hostname`/`uptime` test's log has full output and the completion
+sentinel even though the CLI exited almost immediately after printing the summary). But
+**watching** it — Tier-1/Tier-2 checks, the pause — only happens while something is still
+running that spawned task:
+
+- `hive task` is one-shot: the process exits right after printing, so anything delegated during
+  that call is supervised for a few hundred milliseconds at most before the task is aborted.
+- `hive chat` stays alive for the whole interactive session, so supervision continues to work
+  for anything delegated during that session — until you exit chat.
+- Nothing yet keeps the master running continuously across CLI invocations. `hive serve` today
+  just tells you to run `hive-web` directly (Phase 1 stub, unchanged). A persistent master
+  daemon is what would give every delegated session supervision for its full lifetime — that's
+  not built.
+
+If you use `hive task` to delegate something long-running today, treat it as fire-and-forget
+with **no** safety net once the CLI process exits, not as "the watchdog has it."
+
+### Also not yet done (by design — later phases, not a Phase 3 gap)
+
+- Remote agentic-CLI delegation (routing `AiProvider::Claude`/`Codex` to a supervised `claude`/
+  `codex` session instead of a plain shell command) — `claude`/`codex` are installed locally on
+  this machine but **not** on the configured worker, so this isn't demonstrated yet. The same
+  `SshWorker`/`supervise` machinery built here should cover it once a worker has those CLIs
+  installed and authenticated; a **local** (no-SSH, local tmux) supervised session for the
+  already-authenticated local `claude`/`codex` is the more natural next slice.
+- Full Phase 10 watchdog: no `Incident`/`IncidentReviewState` persistence, no `HumanDecision`
+  (resume/abort/modify-and-resume) handling, no ntfy.sh/webhook delivery — today's notification
+  is a `tracing::warn!` log line. `Severity`/`SafetyCategory`/`SafetyAnalysis`/`Incident` are
+  all still the Phase 1 types; only `SafetyAnalysis` is actually produced and used yet.
+- `WorkerPool::active_sessions()` isn't surfaced anywhere in the CLI yet (`hive sessions` still
+  prints its Phase 1 placeholder) or in `hive-web` (`/api/sessions` still returns `"[]"`).
+
+### Superseded from the original plan
+
+- `hive-worker`'s HTTP daemon (`POST /task`, tmux-via-daemon) — Phase 1 built its routes,
+  Phase 3/4 in the original plan meant to use them. This design instead drives tmux directly
+  over SSH from the master, no daemon required. The routes aren't removed (harmless, still
+  respond over HTTP per Phase 1's own verification), just unused by this delegation path.
+
+---
+
 ## Phase 2: ✅ Complete and verified
 
 ```

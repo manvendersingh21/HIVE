@@ -12,14 +12,14 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 |:---:|:---|:---:|:---|:---|
 | 1 | Scaffold, `hive-common` types, workspace | 1 day | — | ✅ done, build+test verified |
 | 2 | LLM router + agent loop | 2–3 days | 1 | ✅ done, build+test verified |
-| 3 | Worker pool, SSH delegation, tmux creation | 2 days | 2 | ⬜ selection logic only |
-| 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ⬜ routes only |
+| 3 | Worker pool, SSH delegation, tmux creation | 2 days | 2 | ✅ done, live-verified against a real worker (redesigned: direct SSH+tmux, no daemon — see below) |
+| 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ⬜ routes only, superseded by Phase 3's direct-SSH design (see note) |
 | 5 | `hive-web` — web terminal | 2–3 days | 3 | ⬜ health route only |
 | 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 command tree wired, most subcommands are stubs |
 | 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
 | 9 | Memory — projects, KG, RAG | 2–3 days | 2 | ⬜ empty struct |
-| 10 | Safety watchdog | 2–3 days | 3, 7 | ⬜ empty struct |
+| 10 | Safety watchdog | 2–3 days | 3, 7 | 🟡 Tier-1/Tier-2 detection + pause done (pulled into Phase 3), no incident log/notifier/UI |
 | | **Total** | **~16–22 days** | | |
 
 Legend: ✅ done · 🟡 partial · 🔴 broken · ⬜ not started
@@ -69,20 +69,56 @@ Remote (`requires_remote`) subtasks are only *noted*, not delegated — that's s
 ---
 
 ## Phase 3 — Worker Pool & SSH Delegation
-*Plan section: "Phase 3: Worker Management & SSH Delegation"* · **Status: ⬜**
+*Plan section: "Phase 3: Worker Management & SSH Delegation"* · **Status: ✅ done, live-verified**
+
+**Redesigned from the plan's pseudocode**: no `hive-worker` HTTP daemon in the loop. The master
+drives `tmux` directly over SSH (`openssh`, `process-mux` — a real `ControlMaster` per
+connection) and streams a remote log file rather than polling `tmux capture-pane`, specifically
+because polling can miss short-lived output between checks. Every delegated session is watched
+by a real (if partial — see Phase 10 note) safety layer, pulled forward because shipping
+unattended remote command execution with zero safety net isn't acceptable even as an interim
+state.
 
 - [x] `WorkerPool::select_worker` — least-loaded-online selection
 - [x] `WorkerPool::online_count`
-- [ ] `workers/ssh.rs` — `openssh` sessions with ControlMaster multiplexing
-- [ ] Health checks that actually flip `WorkerStatus` (everything boots as `Offline` today)
-- [ ] `WorkerPool::delegate` — create remote tmux session, POST the `TaskAssignment` to the daemon
-- [ ] `active_sessions()` — aggregate live sessions across all workers
-- [ ] Load `workers.toml` into a live pool at startup
+- [x] `workers/ssh.rs` — `openssh` sessions, `ControlMaster` pooling + `server_alive_interval`
+      keepalive, tmux session creation with dual-transport (live pane + piped log file) output,
+      remote log tailing, `send-keys`, `capture-pane`
+- [x] Health checks that actually flip `WorkerStatus` — `WorkerPool::refresh_health`, an SSH
+      reachability probe, called from `hive-cli` before every `task`/`chat`
+- [x] `WorkerPool::delegate` — creates the remote tmux session directly (no daemon to POST to)
+- [x] `active_sessions()` — aggregates live sessions (shared `Arc<Mutex<HashMap>>`, updated by
+      the background supervisor as sessions complete/fail/pause)
+- [x] Load `workers.toml` into a live pool at startup — **this was silently broken**:
+      `hive-cli/src/main.rs` called `WorkerPool::new(vec![])` unconditionally even though
+      `WorkersConfig` parsing already existed for `hive workers list`. Fixed.
+- [x] Tier-1 (regex) + Tier-2 (periodic LLM review) safety supervision, pulled forward from
+      Phase 10 — see `docs/STATUS.md` for what's real vs. still-stub in that pull-forward.
+
+**Known limitation, not yet solved:** the background supervisor is a `tokio::spawn` task tied to
+the current process. `hive task` exits right after delegation confirms started, so anything
+delegated through it is supervised for well under a second before the task is aborted — the
+remote command keeps running regardless (verified: full output + exit code land in the log even
+after the CLI exits), but nothing is watching it. `hive chat` supervises for its whole session.
+Continuous supervision across the master's full uptime needs a persistent daemon — that's not
+built (`hive serve` is still the Phase 1 stub). See `docs/STATUS.md` for detail.
+
+**Not yet done**: remote agentic-CLI delegation (routing `AiProvider::Claude`/`Codex` to a
+supervised `claude`/`codex` CLI session instead of a plain shell command) — the same machinery
+should cover it once a worker has those CLIs installed; a **local** (no SSH) supervised session
+for the already-authenticated local `claude`/`codex` is the more natural next slice than
+installing them on every worker.
 
 ---
 
 ## Phase 4 — Worker Daemon
-*Plan section: "Phase 3", `hive-worker/src/main.rs`* · **Status: ⬜**
+*Plan section: "Phase 3", `hive-worker/src/main.rs`* · **Status: ⬜ — superseded by Phase 3's design**
+
+Phase 3 shipped direct SSH+tmux delegation instead of POSTing to this daemon (see its note
+above). The routes below still exist and still respond (verified in Phase 1), but nothing calls
+them anymore. Revisit this phase only if a use case actually needs a persistent per-worker agent
+(e.g. accepting tasks without an open SSH session, or running as an unprivileged service) —
+otherwise it may not be worth building out.
 
 - [x] axum server with `/health`, `POST /task`, `GET /status/{task_id}`
 - [ ] `executor.rs` — create the tmux session, `send-keys` each command, honor `working_dir`,
@@ -168,21 +204,33 @@ The reason the agent still knows what you decided three weeks ago.
 ---
 
 ## Phase 10 — Safety Watchdog
-*Plan section: "Phase 10: Safety Watchdog — Continuous Monitoring & Human-in-the-Loop"* · **Status: ⬜**
+*Plan section: "Phase 10: Safety Watchdog — Continuous Monitoring & Human-in-the-Loop"* · **Status: 🟡 partial — core detection pulled forward into Phase 3**
 
-Polls every active session; kills first, asks you second.
+Polls every active session; pauses first, asks you second.
 
-- [ ] `watchdog/mod.rs` — `ractor` actor supervising all monitored sessions
-- [ ] Poll loop: `tmux capture-pane -p` over SSH every `poll_interval_secs` (5s, backing off to 15s
-      after `max_consecutive_safe` clean checks)
-- [ ] `watchdog/rules.rs` — fast regex rules (`rm -rf`, `DROP TABLE`, credential echo, `chmod 777`, …)
-      plus user-defined `extra_rules` from config
-- [ ] `watchdog/analyzer.rs` — LLM safety analysis producing `SafetyAnalysis`, checked against
-      the task's `expected_behavior`
-- [ ] Kill path: `send-keys C-c` → pause task → log `Incident` → notify
+**Pulled forward and done** (see `docs/STATUS.md` Phase 3 for the live-verified detail):
+- [x] `watchdog/rules.rs` — Tier-1 regex rules (`rm -rf`, disk format, `DROP TABLE`, force-push,
+      `sudo`/`chmod 777`, `curl | sh`, credential patterns, fork bombs), plus `extra_rules` from
+      config
+- [x] `watchdog/mod.rs` — `Watchdog::review`, Tier-2 periodic LLM safety analysis producing
+      `SafetyAnalysis`, checked against the task's `expected_behavior`, with `poll_interval_secs`
+      backing off to `reduced_poll_interval_secs` after `max_consecutive_safe` clean checks
+- [x] Pause path: `send-keys C-c` → mark `TaskState::PausedByWatchdog` → log a handover
+      notification with the reattach command (not a full `Incident` log — see below)
+- [x] Tail-based monitoring (not `tmux capture-pane -p` polling — a dedicated log-file tail, to
+      avoid missing short-lived output between polls)
+
+**Still not built:**
+- [ ] `watchdog/mod.rs` as a `ractor` actor supervising *all* sessions in one place (today: one
+      ad hoc `tokio::spawn` task per delegated session, no central supervisor)
+- [ ] Persisted `Incident` log / `IncidentReviewState` tracking (today: a `tracing::warn!` line,
+      nothing recorded)
 - [ ] `watchdog/notifier.rs` — ntfy.sh push, webhook (Slack/Discord), web dashboard
 - [ ] Incident review UI: resume / abort / resume-with-note / modify-and-resume
-      (`HumanDecision` variants already exist in `protocol.rs`)
+      (`HumanDecision` variants already exist in `protocol.rs`, nothing consumes them yet)
+- [ ] Continuous supervision independent of CLI process lifetime (needs the persistent master
+      daemon noted in Phase 3 — today, exiting `hive task`/`hive chat` ends supervision even
+      though the delegated remote command keeps running)
 
 ---
 

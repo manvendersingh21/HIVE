@@ -71,11 +71,11 @@ Full architecture diagrams, data model, and code sketches live in
 
 ## Status
 
-**Phases 1–2 are complete and verified** — `cargo build --workspace` and `cargo test --workspace`
-both pass cleanly (21/21 tests), all three binaries (`hive`, `hive-worker`, `hive-web`) start and
-respond over HTTP, and `hive task`/`hive chat` now classify, plan, and execute real local
-commands through a real LLM router. See [`docs/STATUS.md`](docs/STATUS.md) for the full audit
-and [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases.
+**Phases 1–3 are complete and live-verified** — `cargo build --workspace` and
+`cargo test --workspace` both pass cleanly (28 passed, 1 opt-in live test), and `hive task`/
+`hive chat` classify, plan, and execute real commands — locally, or delegated over real SSH to a
+worker running inside a supervised tmux session. See [`docs/STATUS.md`](docs/STATUS.md) for the
+full audit and [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases.
 
 Short version:
 
@@ -83,13 +83,21 @@ Short version:
 - ✅ `hive-common` protocol, error, and config types — fully written, 18/18 unit tests passing
 - ✅ `hive-core`: real `LlmRouter` (Ollama + Gemini/Claude/OpenAI clients, complexity routing
   with local fallback), an LLM-driven `Planner`, and a `Tool` registry (shell/file/git) that
-  `MasterAgent::handle_request` actually calls — 3 more unit tests covering plan parsing
-- ✅ `hive-worker` and `hive-web` axum servers — routes wired, verified live over HTTP
-- ✅ `hive-cli/src/main.rs` — full command tree; `chat`/`task` drive a real `MasterAgent`
-- ✅ `config/hive.toml` and `config/workers.toml` in place
-- ⚠️ No safety watchdog yet (Phase 10) — local commands the planner produces run unattended;
-  see the "Known limitation" note in `docs/STATUS.md`
-- ⬜ Worker delegation, web terminal, skills, memory, fine-tuning — Phases 3–10, see the roadmap
+  `MasterAgent::handle_request` actually calls for local subtasks
+- ✅ Remote subtasks delegate for real: SSH (`openssh`, connection-pooled) into a worker,
+  start a detached tmux session, stream its output live, and watch it with a Tier-1 regex +
+  Tier-2 LLM-review safety layer (pulled forward from Phase 10) that pauses — not kills — a
+  session that looks dangerous or off-track, logging the exact command to reattach and inspect
+- ✅ `hive-worker` and `hive-web` axum servers — routes wired, verified live over HTTP (now
+  bypassed by the direct-SSH delegation path above — see `docs/ROADMAP.md`'s Phase 4 note)
+- ✅ `hive-cli/src/main.rs` — full command tree; `chat`/`task` drive a real `MasterAgent`;
+  `workers list` and worker health checks reflect real config/real SSH reachability
+- ✅ `config/hive.toml` and `config/workers.toml` in place — one real worker configured
+- ⚠️ Watchdog supervision only lasts as long as the CLI process does — `hive task` exits right
+  after delegating, so anything delegated through it runs unsupervised almost immediately
+  after; `hive chat` supervises for its session. No persistent daemon yet. See `docs/STATUS.md`.
+- ⚠️ No safety watchdog for **local** commands — only delegated/remote ones are supervised
+- ⬜ Web terminal, skills, memory, fine-tuning, full incident review UI — see the roadmap
 
 ---
 

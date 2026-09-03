@@ -131,27 +131,44 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Build a `MasterAgent` from the project's config.
-fn build_agent(project_root: &Path) -> anyhow::Result<MasterAgent> {
+/// Build a `MasterAgent` from the project's config, with worker health
+/// checked live over SSH (so `select_worker`/delegation reflect reality
+/// instead of every worker booting `Offline`).
+async fn build_agent(project_root: &Path) -> anyhow::Result<MasterAgent> {
     let config = HiveConfig::from_project_root(project_root)?;
+    let workers_config = WorkersConfig::from_project_root(project_root).unwrap_or(WorkersConfig { workers: vec![] });
 
     let llm = LlmRouter::from_config(&config.llm);
-    let workers = WorkerPool::new(vec![]);
+    let mut workers = WorkerPool::new(workers_config.workers);
+    workers.refresh_health().await;
     let skills = SkillRegistry::new();
     let memory = MemorySystem::new();
 
-    Ok(MasterAgent::new(llm, workers, skills, memory))
+    Ok(MasterAgent::with_watchdog_config(
+        llm,
+        workers,
+        skills,
+        memory,
+        config.watchdog,
+    ))
 }
 
 async fn run_task(project_root: &Path, description: &str) -> anyhow::Result<()> {
-    let agent = build_agent(project_root)?;
+    let agent = build_agent(project_root).await?;
     let response = agent.handle_request(description, None).await?;
 
     println!("Summary: {}", response.summary);
     println!("Provider: {}", response.provider_used);
     println!("Complexity: {}", response.complexity);
     if response.sessions.is_empty() {
-        println!("No sessions created (worker delegation not implemented yet).");
+        println!("No sessions created (plan had no remote subtasks, or no worker was online).");
+    } else {
+        for session in &response.sessions {
+            println!(
+                "Session '{}' on worker '{}': {}",
+                session.session_name, session.worker_name, session.state
+            );
+        }
     }
     Ok(())
 }
@@ -159,7 +176,7 @@ async fn run_task(project_root: &Path, description: &str) -> anyhow::Result<()> 
 async fn run_chat(project_root: &Path) -> anyhow::Result<()> {
     use std::io::{self, Write};
 
-    let agent = build_agent(project_root)?;
+    let agent = build_agent(project_root).await?;
     println!("🐝 Hive Agent Ready. Type a task, or 'exit' to quit.");
 
     loop {

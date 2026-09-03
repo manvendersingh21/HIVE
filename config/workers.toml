@@ -11,4 +11,8 @@
 # user = "your_username"
 # tags = ["gpu"]
 
-workers = []
+[[workers]]
+name = "lawfinder-worker"
+host = "hive-worker-1"
+user = "azureuser"
+tags = []
