@@ -3,12 +3,14 @@
 pub mod planner;
 
 use hive_common::AgentResponse;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::llm::LlmRouter;
 use crate::memory::MemorySystem;
 use crate::skills::SkillRegistry;
+use crate::tools::ToolRegistry;
 use crate::workers::WorkerPool;
+use planner::Planner;
 
 /// The master agent — central intelligence of the Hive system.
 ///
@@ -23,6 +25,9 @@ pub struct MasterAgent {
     pub skills: SkillRegistry,
     /// Memory system for project-scoped conversation history.
     pub memory: MemorySystem,
+    /// Local tool registry (shell, file ops, git).
+    pub tools: ToolRegistry,
+    planner: Planner,
 }
 
 impl MasterAgent {
@@ -38,10 +43,19 @@ impl MasterAgent {
             workers,
             skills,
             memory,
+            tools: ToolRegistry::new(),
+            planner: Planner::new(),
         }
     }
 
-    /// Handle a user request: plan, classify, route, and delegate.
+    /// Handle a user request: plan, classify, route, and execute/delegate.
+    ///
+    /// Local subtasks run through the tool registry immediately. Subtasks
+    /// that request a remote worker are noted but not yet delegated — SSH
+    /// delegation and tmux session creation land in Phase 3/4. There is no
+    /// safety watchdog yet (Phase 10): commands the plan produces run
+    /// without confirmation, so treat this like any other unattended
+    /// automation until that lands.
     pub async fn handle_request(
         &self,
         user_input: &str,
@@ -59,22 +73,65 @@ impl MasterAgent {
 
         // 2. Classify task complexity
         let complexity = self.llm.classify_complexity(user_input).await?;
-        info!("Task complexity: {}", complexity);
-
-        // 3. Plan the task using the appropriate provider
         let provider = complexity.recommended_provider();
-        info!("Routing to provider: {}", provider);
+        info!("Task complexity: {complexity}, routing to {provider}");
 
-        // TODO: Full implementation — plan task, decompose into subtasks,
-        // delegate to workers, create tmux sessions, return response.
+        // 3. Plan: decompose into subtasks using the routed provider
+        let plan = self.planner.plan(&self.llm, user_input, complexity).await?;
+        info!(
+            "Plan: {} ({} subtask(s))",
+            plan.summary,
+            plan.subtasks.len()
+        );
 
-        let response = AgentResponse {
-            summary: format!("Task received: {}", user_input),
+        // 4. Execute local subtasks now; note remote ones for Phase 3 delegation
+        let mut notes = Vec::new();
+        for subtask in &plan.subtasks {
+            if subtask.requires_remote {
+                match self.workers.select_worker() {
+                    Some(worker) => notes.push(format!(
+                        "'{}' would delegate to worker '{}' — SSH delegation lands in Phase 3",
+                        subtask.description, worker.info.name
+                    )),
+                    None => notes.push(format!(
+                        "'{}' requested a remote worker but none are online",
+                        subtask.description
+                    )),
+                }
+                continue;
+            }
+
+            if subtask.commands.is_empty() {
+                notes.push(format!("'{}' — no commands to run", subtask.description));
+                continue;
+            }
+
+            for command in &subtask.commands {
+                match self.tools.run_shell(command).await {
+                    Ok(output) => {
+                        info!("Ran `{command}`");
+                        notes.push(format!("$ {command}\n{output}"));
+                    }
+                    Err(e) => {
+                        warn!("Command failed: `{command}`: {e}");
+                        notes.push(format!("$ {command}\nFAILED: {e}"));
+                    }
+                }
+            }
+        }
+
+        let summary = if notes.is_empty() {
+            plan.summary
+        } else {
+            format!("{}\n\n{}", plan.summary, notes.join("\n\n"))
+        };
+
+        // 5. Return summary with tmux session access info (empty until Phase 3/4)
+        Ok(AgentResponse {
+            summary,
             sessions: vec![],
             provider_used: provider,
             complexity,
-        };
-
-        Ok(response)
+        })
     }
 }

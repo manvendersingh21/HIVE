@@ -56,6 +56,9 @@ ractor = "0.14"
 # Regex (for watchdog rules)
 regex = "1"
 
+# Async trait methods on trait objects (Tool registry)
+async-trait = "0.1"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

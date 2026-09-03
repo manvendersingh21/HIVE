@@ -23,3 +23,4 @@ tmux_interface = { workspace = true }
 ractor = { workspace = true }
 regex = { workspace = true }
 toml = { workspace = true }
+async-trait = { workspace = true }

@@ -11,7 +11,7 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | # | Phase | Effort | Depends on | Status |
 |:---:|:---|:---:|:---|:---|
 | 1 | Scaffold, `hive-common` types, workspace | 1 day | — | ✅ done, build+test verified |
-| 2 | LLM router + agent loop | 2–3 days | 1 | ⬜ stubs only |
+| 2 | LLM router + agent loop | 2–3 days | 1 | ✅ done, build+test verified |
 | 3 | Worker pool, SSH delegation, tmux creation | 2 days | 2 | ⬜ selection logic only |
 | 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ⬜ routes only |
 | 5 | `hive-web` — web terminal | 2–3 days | 3 | ⬜ health route only |
@@ -47,19 +47,24 @@ The foundation every other phase compiles against.
 ---
 
 ## Phase 2 — LLM Router & Agent Loop
-*Plan section: "Phase 2: Master Agent — LLM Integration & Complexity Router"* · **Status: ⬜**
+*Plan section: "Phase 2: Master Agent — LLM Integration & Complexity Router"* · **Status: ✅ done**
 
 The brain. Local model classifies, then routes.
 
-- [ ] `llm/local.rs` — Ollama client (`/api/chat`, `/api/embeddings`)
-- [ ] `llm/gemini.rs`, `llm/claude.rs`, `llm/openai.rs` — cloud clients
-- [ ] `LlmRouter::classify_complexity` — real classification prompt replacing today's hardcoded `Medium`
-- [ ] `LlmRouter::route_and_execute` — dispatch by `Complexity` → `AiProvider`
-- [ ] `MasterAgent::handle_request` — full ReAct loop: plan → decompose → execute/delegate → summarize
-- [ ] `agent/planner.rs` — LLM-driven decomposition producing `TaskPlan` / `SubTask`
-- [ ] `tools/` — `shell.rs`, `file_ops.rs`, `git.rs` behind a `Tool` trait, schemas via `schemars`
+- [x] `llm/local.rs` — Ollama client (`/api/chat`, `/api/embeddings`)
+- [x] `llm/gemini.rs`, `llm/claude.rs`, `llm/openai.rs` — cloud clients (header-based auth, never a URL query key)
+- [x] `LlmRouter::classify_complexity` — real classification prompt replacing the old hardcoded `Medium`
+- [x] `LlmRouter::route_and_execute` — dispatch by `Complexity` → `AiProvider`, with fallback to the local model if a cloud provider isn't configured or fails
+- [x] `MasterAgent::handle_request` — full loop: plan → decompose → execute locally / note remote → summarize
+- [x] `agent/planner.rs` — LLM-driven decomposition producing `TaskPlan` / `SubTask`, with a safe no-op fallback when the LLM doesn't return parseable JSON
+- [x] `tools/` — `shell.rs`, `file_ops.rs`, `git.rs` behind a `Tool` trait, schemas via `schemars`
 
 Routing table: `Simple → Local` · `Medium → Gemini Flash` · `Complex → Claude` · `CodeHeavy → Codex`.
+
+**Known limitation carried forward:** local subtasks now execute real shell commands via
+`ToolRegistry`, with no confirmation gate and no safety watchdog yet (that's Phase 10). This
+is the project's intended design, not an oversight — see `docs/STATUS.md` for the full note.
+Remote (`requires_remote`) subtasks are only *noted*, not delegated — that's still Phase 3.
 
 ---
 

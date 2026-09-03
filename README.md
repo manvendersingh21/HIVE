@@ -71,20 +71,25 @@ Full architecture diagrams, data model, and code sketches live in
 
 ## Status
 
-**Phase 1 is complete and verified** — `cargo build --workspace` and `cargo test --workspace`
-both pass cleanly, and all three binaries (`hive`, `hive-worker`, `hive-web`) start and respond
-over HTTP. See [`docs/STATUS.md`](docs/STATUS.md) for the full audit and
-[`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases.
+**Phases 1–2 are complete and verified** — `cargo build --workspace` and `cargo test --workspace`
+both pass cleanly (21/21 tests), all three binaries (`hive`, `hive-worker`, `hive-web`) start and
+respond over HTTP, and `hive task`/`hive chat` now classify, plan, and execute real local
+commands through a real LLM router. See [`docs/STATUS.md`](docs/STATUS.md) for the full audit
+and [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases.
 
 Short version:
 
 - ✅ Workspace + all 5 crate manifests, `cargo build --workspace` clean with zero warnings
 - ✅ `hive-common` protocol, error, and config types — fully written, 18/18 unit tests passing
-- ✅ `hive-core` module skeleton; `WorkerPool` selection logic is real
+- ✅ `hive-core`: real `LlmRouter` (Ollama + Gemini/Claude/OpenAI clients, complexity routing
+  with local fallback), an LLM-driven `Planner`, and a `Tool` registry (shell/file/git) that
+  `MasterAgent::handle_request` actually calls — 3 more unit tests covering plan parsing
 - ✅ `hive-worker` and `hive-web` axum servers — routes wired, verified live over HTTP
 - ✅ `hive-cli/src/main.rs` — full command tree; `chat`/`task` drive a real `MasterAgent`
 - ✅ `config/hive.toml` and `config/workers.toml` in place
-- ⬜ Everything past the type layer is still a stub — that's Phases 2–10, see the roadmap
+- ⚠️ No safety watchdog yet (Phase 10) — local commands the planner produces run unattended;
+  see the "Known limitation" note in `docs/STATUS.md`
+- ⬜ Worker delegation, web terminal, skills, memory, fine-tuning — Phases 3–10, see the roadmap
 
 ---
 

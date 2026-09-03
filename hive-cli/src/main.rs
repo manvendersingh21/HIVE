@@ -135,10 +135,7 @@ async fn main() -> anyhow::Result<()> {
 fn build_agent(project_root: &Path) -> anyhow::Result<MasterAgent> {
     let config = HiveConfig::from_project_root(project_root)?;
 
-    let llm = LlmRouter::new(
-        config.llm.local.base_url.clone(),
-        config.llm.local.model.clone(),
-    );
+    let llm = LlmRouter::from_config(&config.llm);
     let workers = WorkerPool::new(vec![]);
     let skills = SkillRegistry::new();
     let memory = MemorySystem::new();
