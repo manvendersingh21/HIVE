@@ -3,7 +3,7 @@ listen_addr = "0.0.0.0:9090"
 
 [llm.local]
 provider = "ollama"
-model = "qwen2.5:14b-instruct-q4_K_M"
+model = "qwen3.5:9b"
 base_url = "http://localhost:11434"
 max_context = 8192
 

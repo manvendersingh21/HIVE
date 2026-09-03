@@ -202,7 +202,7 @@ pub async fn refresh_machines(State(h): State<AgentHandle>) -> Response {
         Ok(a) => a,
         Err(r) => return r,
     };
-    match agent.refresh_machine_graph(&h.master_name).await {
+    match agent.refresh_machine_graph().await {
         Ok(count) => Json(serde_json::json!({"machines": count})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

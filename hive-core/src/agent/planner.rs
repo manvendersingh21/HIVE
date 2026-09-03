@@ -26,6 +26,88 @@ fn default_provider() -> AiProvider {
     AiProvider::Local
 }
 
+/// What the planner is told about the machines it is planning for.
+///
+/// Without this the model has no idea whether it is writing commands for macOS
+/// or Linux, and guesses — which in practice means GNU-only flags
+/// (`ps --sort=`, `find -printf`, `stat -c`) that fail silently on the master.
+/// Measured on qwen2.5:14b, supplying this took wrong-OS commands from 3/12
+/// to 0/12. The text comes from the machine knowledge graph, so it stays
+/// accurate as the fleet changes.
+#[derive(Debug, Clone, Default)]
+pub struct FleetContext {
+    /// Name of the machine local subtasks run on.
+    pub local_machine: String,
+    /// OS family of that machine (`macos`, `ubuntu`, …), from the graph.
+    pub local_os: String,
+    /// Fleet description, as rendered by `memory::machines::describe_for_prompt`.
+    pub description: String,
+}
+
+impl FleetContext {
+    /// Empty context — used where no graph is available; the planner then
+    /// behaves as it did before the graph existed.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// The fleet listing, placed before the request so the model can choose a
+    /// machine.
+    fn header(&self) -> String {
+        if self.description.trim().is_empty() {
+            return String::new();
+        }
+        format!(
+            "{}\nCommands with requires_remote=false run on '{}'.\n\n",
+            self.description.trim(),
+            self.local_machine
+        )
+    }
+
+    /// The OS constraint, placed *after* the schema.
+    ///
+    /// Position, specificity, and worked examples all matter, and the effect
+    /// is large. Measured on qwen3.5:9b over 12 plans each:
+    ///
+    /// | prompt | broken commands |
+    /// |---|---|
+    /// | constraint at the top of the prompt | 3/12 |
+    /// | terse constraint at the end | 9/12 |
+    /// | forbid GNU flags at the end | 5/12 |
+    /// | forbid GNU flags **and show BSD equivalents** | 0/12 |
+    ///
+    /// Telling the model what not to write is not enough — it needs the
+    /// replacement it should reach for instead. Restating which machine local
+    /// commands land on also matters, since the fleet listing above may name
+    /// hosts running a different OS.
+    fn trailer(&self) -> String {
+        let os = self.local_os.to_ascii_lowercase();
+        if os.is_empty() {
+            return String::new();
+        }
+        let machine = &self.local_machine;
+        if os.contains("mac") || os.contains("darwin") {
+            format!(
+                "\nCRITICAL: requires_remote=false commands run on {machine}, which is \
+                 macOS (BSD userland), NOT Linux — even if a Linux machine appears above. \
+                 GNU-only flags such as `find -printf`, `ps --sort=`, `top -b`, `stat -c` \
+                 and `du --max-depth` DO NOT EXIST on macOS and will fail. Use BSD \
+                 equivalents, for example: `ps -A -o pid,rss,comm | sort -nrk2`, \
+                 `find ~ -type f -exec stat -f '%z %N' {{}} +`, `top -l 1 -o cpu`.\n"
+            )
+        } else {
+            format!(
+                "\nCRITICAL: requires_remote=false commands run on {machine}, which is \
+                 {os} (GNU/Linux userland), NOT macOS — even if a macOS machine appears \
+                 above. BSD-only flags such as `stat -f`, `sed -i ''`, `du -d` and \
+                 `top -l` DO NOT EXIST there and will fail. Use GNU equivalents, for \
+                 example: `ps -eo pid,rss,comm --sort=-rss`, `find ~ -type f -printf \
+                 '%s %p\\n'`, `top -b -n1`.\n"
+            )
+        }
+    }
+}
+
 /// A single subtask within a plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubTask {
@@ -59,10 +141,14 @@ impl Planner {
         llm: &LlmRouter,
         user_input: &str,
         complexity: Complexity,
+        fleet: &FleetContext,
     ) -> anyhow::Result<TaskPlan> {
+        let fleet_header = fleet.header();
+        let fleet_trailer = fleet.trailer();
         let prompt = format!(
             "You are a task planner for a distributed agent system. Decompose the \
              following request into a short JSON plan.\n\n\
+             {fleet_header}\
              Request: {user_input}\n\n\
              Respond with ONLY a JSON object of this exact shape, no prose, no markdown fences:\n\
              {{\n  \
@@ -79,7 +165,8 @@ impl Planner {
              Use requires_remote=true only if the task must run on a separate worker \
              machine. Keep commands minimal and only include ones you are confident are \
              correct and safe. If the request doesn't need any commands, use an empty \
-             commands array."
+             commands array.\n\
+             {fleet_trailer}"
         );
 
         let response = llm.route_and_execute(&prompt, complexity).await?;
@@ -152,6 +239,53 @@ mod tests {
         let plan = extract_plan(text).unwrap();
         assert_eq!(plan.summary, "s");
         assert!(plan.subtasks.is_empty());
+    }
+
+    fn ctx(os: &str) -> FleetContext {
+        FleetContext {
+            local_machine: "manus-mac-mini".into(),
+            local_os: os.into(),
+            description: "Known machines:\n- manus-mac-mini (online): macos-26.5.2, 10 cores."
+                .into(),
+        }
+    }
+
+    #[test]
+    fn header_lists_the_fleet_and_names_the_local_machine() {
+        let h = ctx("macos").header();
+        assert!(h.contains("macos-26.5.2"));
+        assert!(h.contains("run on 'manus-mac-mini'"));
+    }
+
+    #[test]
+    fn trailer_warns_about_the_right_userland_and_offers_replacements() {
+        let mac = ctx("macos").trailer();
+        assert!(mac.contains("BSD userland"));
+        assert!(mac.contains("manus-mac-mini"), "must name the machine commands land on");
+        assert!(mac.contains("find -printf"), "must enumerate the forbidden GNU flags");
+        assert!(mac.contains("stat -f"), "must offer the BSD replacement, not just a ban");
+
+        let linux = ctx("ubuntu").trailer();
+        assert!(linux.contains("GNU/Linux userland"));
+        assert!(linux.contains("stat -f"), "must name the forbidden BSD flag");
+        assert!(linux.contains("--sort=-rss"), "must offer the GNU replacement");
+    }
+
+    #[test]
+    fn empty_fleet_context_adds_nothing_to_the_prompt() {
+        // No graph, no fabricated machine facts — the planner should just see
+        // the request, exactly as it did before the graph existed.
+        assert_eq!(FleetContext::none().header(), "");
+        assert_eq!(FleetContext::none().trailer(), "");
+        assert_eq!(
+            FleetContext {
+                local_machine: "x".into(),
+                local_os: String::new(),
+                description: "   ".into()
+            }
+            .header(),
+            ""
+        );
     }
 
     #[test]

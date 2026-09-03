@@ -309,3 +309,58 @@ multiplexing), health checks that flip `WorkerStatus` off of `Offline`, and
 `WorkerPool::delegate` to actually create a remote tmux session and POST a `TaskAssignment` to
 the worker daemon. `MasterAgent::handle_request`'s remote-subtask branch (currently just a
 `notes.push(...)` in `hive-core/src/agent/mod.rs`) is where the real call plugs in.
+
+
+---
+
+## Local model selection (measured, not assumed)
+
+The master runs `qwen3.5:9b`. It was chosen by benchmarking candidates on the
+three jobs Hive actually gives the local model — complexity classification, JSON
+plan generation, and Tier-2 safety review — on the real hardware (Mac Mini M4,
+16 GB).
+
+| Model | Size | Plan latency | Gen | JSON valid |
+|:---|---:|---:|---:|---:|
+| qwen2.5:14b-q4_K_M (previous) | 9.0 GB | 14.9s | 11.4 tok/s | 3/3 |
+| **qwen3.5:9b (current)** | **6.6 GB** | **6.8s** | **17.5 tok/s** | **3/3** |
+| gemma4:12b-it-qat | 7.2 GB | 10.2s | 12.6 tok/s | 15/18 |
+| qwen3.5:4b | 3.4 GB | 5.9s | 28.0 tok/s | 3/3, weaker commands |
+
+Two findings mattered more than the ranking:
+
+**Thinking must be disabled.** Qwen3.x emits reasoning tokens by default. With
+them on, `qwen3.5:9b` scored **0/3** usable responses — the whole token budget
+went to reasoning and the answer came back empty — and plan latency was 18.1s.
+`OllamaClient` now always sends `think: false`; Ollama ignores it on models that
+do not think.
+
+**The prompt mattered more than the model.** The planner never said which OS its
+commands would run on, so models guessed and emitted GNU-only flags
+(`find -printf`, `ps --sort=`) that fail on macOS. Fixing that is worth more than
+any model swap, and *how* it is fixed matters just as much — measured on
+qwen3.5:9b, 12 plans per variant:
+
+| Prompt | Broken commands |
+|:---|---:|
+| No OS information (the old behavior) | 3–4 / 12 |
+| Terse constraint at the end | 9 / 12 |
+| Constraint at the top of the prompt | 3 / 12 |
+| Forbid GNU flags, at the end | 5 / 12 |
+| **Forbid GNU flags *and show BSD equivalents*, at the end** | **0 / 12** |
+
+Telling the model what not to write is not enough; it needs the replacement to
+reach for. `FleetContext` in `agent/planner.rs` renders both halves from the
+machine knowledge graph, so it stays correct as the fleet changes.
+
+With that in place the two models are equivalent on command quality — 6/7 vs
+5/6 working commands over the same live queries — so `qwen3.5:9b` wins on being
+2.4 GB smaller and ~2x faster. On a 16 GB Mac (~11 GB GPU-wired ceiling) that
+headroom is the scarce resource: the previous 9 GB model left the machine
+swapping at 14% free.
+
+**Bigger model, heavier quantization does not work here.** A 27B needs ~16 GB at
+Q4_K_M and ~12 GB at IQ3 — both over the ceiling — and only fits around IQ2,
+where degradation is 15–25% versus 3–5% at Q4_K_M. That lands worst on
+structured output, and when JSON breaks `Planner::plan` falls back to a no-op
+subtask. 16 GB is the binding constraint, not the model.

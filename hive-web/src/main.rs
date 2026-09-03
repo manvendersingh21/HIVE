@@ -82,8 +82,12 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
         return chat::AgentHandle::disabled();
     }
 
-    let mut workers = WorkerPool::new(workers_config.workers);
-    workers.refresh_health().await;
+    // Health checks and the machine probe both reach workers over SSH, and an
+    // SSH connect can stall well past its timeout (a half-open tunnel, a wedged
+    // ControlMaster). Neither is needed to answer a request, so nothing here
+    // blocks the listener — a stalled worker must not stop the master from
+    // serving.
+    let workers = WorkerPool::new(workers_config.workers);
 
     let memory = MemorySystem::open(config.database.resolved_path());
     let agent = MasterAgent::with_watchdog_config(
@@ -92,16 +96,30 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
         SkillRegistry::new(),
         memory,
         config.watchdog,
-    );
+    )
+    .with_master_name(master_name);
 
-    // Seed the machine graph at startup so the very first request can already
-    // reason about the fleet.
-    match agent.refresh_machine_graph(master_name).await {
-        Ok(n) => info!(machines = n, "machine knowledge graph seeded"),
-        Err(e) => warn!(error = %e, "could not seed machine knowledge graph"),
-    }
+    let agent = std::sync::Arc::new(agent);
 
-    chat::AgentHandle::enabled(std::sync::Arc::new(agent), master_name.to_string())
+    // Seed the graph in the background, bounded, so the first request has fleet
+    // facts without startup waiting on the network. Until it lands the planner
+    // simply gets no fleet block, which is how it behaved before the graph
+    // existed.
+    let seeding = std::sync::Arc::clone(&agent);
+    tokio::spawn(async move {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            seeding.refresh_machine_graph(),
+        )
+        .await
+        {
+            Ok(Ok(n)) => info!(machines = n, "machine knowledge graph seeded"),
+            Ok(Err(e)) => warn!(error = %e, "could not seed machine knowledge graph"),
+            Err(_) => warn!("machine graph seed timed out; fleet facts unavailable until refresh"),
+        }
+    });
+
+    chat::AgentHandle::enabled(agent, master_name.to_string())
 }
 
 #[tokio::main]

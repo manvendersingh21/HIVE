@@ -15,7 +15,7 @@ use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
 use crate::watchdog::Watchdog;
 use crate::workers::WorkerPool;
-use planner::Planner;
+use planner::{FleetContext, Planner};
 use run::{
     assess_command, Approvals, Decision, PlannedRun, PlannedStep, RunResult, StepOutcome,
     StepStatus, StepTarget,
@@ -38,6 +38,9 @@ pub struct MasterAgent {
     pub tools: ToolRegistry,
     /// Safety watchdog applied to delegated (remote) sessions.
     pub watchdog: Arc<Watchdog>,
+    /// How this machine is named in the machine knowledge graph. Local
+    /// subtasks run here, so the planner is told its OS by this name.
+    master_name: String,
     planner: Planner,
 }
 
@@ -74,8 +77,20 @@ impl MasterAgent {
             memory,
             tools: ToolRegistry::new(),
             watchdog: Arc::new(watchdog),
+            master_name: default_master_name(),
             planner: Planner::new(),
         }
+    }
+
+    /// Set the name this machine is known by in the graph.
+    pub fn with_master_name(mut self, name: impl Into<String>) -> Self {
+        self.master_name = name.into();
+        self
+    }
+
+    /// The name this machine is known by in the graph.
+    pub fn master_name(&self) -> &str {
+        &self.master_name
     }
 
     /// Handle a user request: plan, classify, route, and execute/delegate.
@@ -109,7 +124,10 @@ impl MasterAgent {
         info!("Task complexity: {complexity}, routing to {provider}");
 
         // 3. Plan: decompose into subtasks using the routed provider
-        let plan = self.planner.plan(&self.llm, user_input, complexity).await?;
+        let plan = self
+            .planner
+            .plan(&self.llm, user_input, complexity, &self.fleet_context())
+            .await?;
         info!(
             "Plan: {} ({} subtask(s))",
             plan.summary,
@@ -224,7 +242,10 @@ impl MasterAgent {
         let provider = complexity.recommended_provider();
         info!("Task complexity: {complexity}, routing to {provider}");
 
-        let plan = self.planner.plan(&self.llm, user_input, complexity).await?;
+        let plan = self
+            .planner
+            .plan(&self.llm, user_input, complexity, &self.fleet_context())
+            .await?;
 
         let mut steps = Vec::new();
         for subtask in &plan.subtasks {
@@ -413,6 +434,27 @@ impl MasterAgent {
 
     // ----------------------------------------------------------- machine graph
 
+    /// Render the machine graph for the planner prompt.
+    ///
+    /// A graph read that fails degrades to empty context rather than failing
+    /// the request — a planner without fleet facts is worse, not broken.
+    fn fleet_context(&self) -> FleetContext {
+        let local_os = self
+            .memory
+            .graph
+            .entity(&format!("machine:{}", self.master_name))
+            .ok()
+            .flatten()
+            .and_then(|m| m.attr_str("os").map(str::to_string))
+            .unwrap_or_default();
+
+        FleetContext {
+            local_machine: self.master_name.clone(),
+            local_os,
+            description: machines::describe_for_prompt(&self.memory.graph).unwrap_or_default(),
+        }
+    }
+
     /// Pick a worker that has every one of `capabilities`, consulting the
     /// machine knowledge graph.
     ///
@@ -440,8 +482,10 @@ impl MasterAgent {
     /// Workers are probed concurrently: an unreachable one costs a connect
     /// timeout, and serializing those would make startup scale with the number
     /// of offline machines.
-    pub async fn refresh_machine_graph(&self, master_name: &str) -> anyhow::Result<usize> {
-        let local = machines::probe_local(master_name).await;
+    pub async fn refresh_machine_graph(&self) -> anyhow::Result<usize> {
+        // Probing a worker requires SSH anyway, so refresh reachability while
+        // we are out there rather than making a second round of connections.
+        let local = machines::probe_local(&self.master_name).await;
         machines::project_into_graph(&self.memory.graph, &local)?;
 
         let probes = self.workers.workers.iter().map(|w| {
@@ -461,4 +505,16 @@ impl MasterAgent {
         info!(machines = count, "machine knowledge graph refreshed");
         Ok(count)
     }
+}
+
+/// Short hostname, used when the caller does not name the master explicitly.
+fn default_master_name() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "master".to_string())
 }

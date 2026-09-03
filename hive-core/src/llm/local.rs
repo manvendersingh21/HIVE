@@ -16,6 +16,20 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     stream: bool,
+    /// Suppress reasoning tokens on models that emit them.
+    ///
+    /// Qwen3.x and friends default to "thinking", spending hundreds of tokens
+    /// on visible reasoning before answering. Every job Hive gives the local
+    /// model — a one-word complexity label, a fixed-shape JSON plan, a JSON
+    /// safety verdict — has a known output shape, so that reasoning is pure
+    /// latency, and with a bounded token budget it can consume the whole
+    /// allowance and return an empty answer. Measured on qwen3.5:9b: 0/3
+    /// usable responses with thinking on, 3/3 with it off, and plan latency
+    /// dropped from 18.1s to 7.0s.
+    ///
+    /// Ollama ignores the field for models that do not think, so it is safe
+    /// to always send.
+    think: bool,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +87,7 @@ impl OllamaClient {
             model: &self.model,
             messages,
             stream: false,
+            think: false,
         };
 
         let resp = self.http.post(&url).json(&req).send().await.map_err(|e| {
