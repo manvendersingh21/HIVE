@@ -508,9 +508,12 @@ impl MasterAgent {
 }
 
 /// Short hostname, used when the caller does not name the master explicitly.
+///
+/// `uname -n` rather than `hostname`: Arch Linux ships no `hostname` binary, and
+/// a worker that cannot name itself lands in the machine graph unnamed.
 fn default_master_name() -> String {
-    std::process::Command::new("hostname")
-        .arg("-s")
+    std::process::Command::new("uname")
+        .arg("-n")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())

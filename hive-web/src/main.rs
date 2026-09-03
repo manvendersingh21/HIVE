@@ -234,8 +234,9 @@ async fn machines_page() -> Html<&'static str> {
 
 /// Short hostname, for naming the master in the machine graph.
 fn hostname_or(fallback: &str) -> String {
-    std::process::Command::new("hostname")
-        .arg("-s")
+    // `uname -n` is portable; Arch Linux has no `hostname` binary.
+    std::process::Command::new("uname")
+        .arg("-n")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())

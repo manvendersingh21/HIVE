@@ -157,8 +157,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn hostname() -> String {
-    std::process::Command::new("hostname")
-        .arg("-s")
+    // `uname -n` is portable; Arch Linux has no `hostname` binary.
+    std::process::Command::new("uname")
+        .arg("-n")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())

@@ -16,3 +16,9 @@ name = "lawfinder-worker"
 host = "hive-worker-1"
 user = "azureuser"
 tags = []
+
+[[workers]]
+name = "archlinux-worker"
+host = "hive-worker-2"
+user = "manubaba"
+tags = ["arch", "docker"]

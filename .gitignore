@@ -7,3 +7,8 @@ graphify-out/.graphify_detect.json
 graphify-out/.graphify_analysis.json
 graphify-out/.graphify_merged.json
 graphify-out/.graphify_labels.json
+
+# Secrets — never commit. This repo is public.
+.env
+.env.*
+!.env.example

@@ -344,29 +344,26 @@ async fn handle_incident(
     // spawned by `spawn_tmux` has only this one command to run — which
     // destroys the state a reviewer is being told to attach to, and can orphan
     // long-running children. Suspending freezes it intact.
-    let paused = match ssh.pause_session(session_name).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn!("Failed to suspend '{session_name}': {e}");
-            false
-        }
-    };
+    let outcome = ssh.pause_session(session_name).await;
 
     if let Some(info) = sessions.lock().await.get_mut(session_name) {
         info.state = TaskState::PausedByWatchdog;
     }
 
-    if paused {
-        warn!(
+    match outcome {
+        Ok(crate::workers::ssh::PauseOutcome::Suspended) => warn!(
             "Session '{session_name}' SUSPENDED for human review. To inspect and take over: \
              ssh {ssh_target} -t 'tmux attach -t {session_name}'  \
              (it is stopped; resume with: kill -CONT -<pgid>)"
-        );
-    } else {
-        warn!(
-            "Session '{session_name}' flagged but COULD NOT BE SUSPENDED — it is still \
-             running. Inspect immediately: ssh {ssh_target} -t 'tmux attach -t {session_name}'"
-        );
+        ),
+        Ok(crate::workers::ssh::PauseOutcome::AlreadyEnded) => warn!(
+            "Session '{session_name}' was flagged, but had already finished — nothing left \
+             to suspend. The output is still on the worker for review."
+        ),
+        Err(e) => warn!(
+            "Session '{session_name}' flagged and is STILL RUNNING — suspend failed: {e}. \
+             Inspect immediately: ssh {ssh_target} -t 'tmux attach -t {session_name}'"
+        ),
     }
 }
 

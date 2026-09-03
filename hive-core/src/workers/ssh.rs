@@ -14,6 +14,15 @@ use std::time::Duration;
 use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 
+/// What suspending a session actually achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseOutcome {
+    /// The session was live and is now stopped.
+    Suspended,
+    /// The session had already finished; there was nothing to stop.
+    AlreadyEnded,
+}
+
 /// Exact-match target for tmux commands that take a *pane*, such as
 /// `send-keys` and `capture-pane`.
 ///
@@ -86,7 +95,7 @@ impl SshWorker {
     /// *every process the user can signal* — that mistake once stopped a
     /// worker's unrelated services. So the pgid is required to be non-empty,
     /// all digits, and greater than 1 before it is used.
-    pub async fn pause_session(&self, session_name: &str) -> anyhow::Result<()> {
+    pub async fn pause_session(&self, session_name: &str) -> anyhow::Result<PauseOutcome> {
         let script = format!(
             r#"set -e
 pid=$(tmux display-message -p -t '={session_name}:' '#{{pane_pid}}' 2>/dev/null)
@@ -97,9 +106,29 @@ if [ "$pgid" -le 1 ]; then echo "refusing to signal pgid $pgid" >&2; exit 1; fi
 kill -STOP -"$pgid"
 echo "stopped $pgid""#
         );
+
+        // Distinguish "already finished" from "failed to stop a live session".
+        // Reporting a completed session as still-running-and-dangerous sends an
+        // operator to attach to something that no longer exists, and buries the
+        // cases where a genuinely live session escaped the pause.
+        if !self.session_exists(session_name).await {
+            return Ok(PauseOutcome::AlreadyEnded);
+        }
+
         let out = self.run(&script).await?;
         tracing::debug!(session = session_name, result = out.trim(), "session suspended");
-        Ok(())
+        Ok(PauseOutcome::Suspended)
+    }
+
+    /// Whether a tmux session is still alive on the worker.
+    pub async fn session_exists(&self, session_name: &str) -> bool {
+        self.session
+            .command("tmux")
+            .args(["has-session", "-t", &format!("={session_name}")])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     /// Resume a session suspended by [`SshWorker::pause_session`].

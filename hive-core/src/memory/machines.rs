@@ -113,7 +113,7 @@ fn probe_script() -> String {
 kernel_name=$(uname -s 2>/dev/null || echo unknown)
 echo "arch=$(uname -m 2>/dev/null)"
 echo "kernel=$(uname -r 2>/dev/null)"
-echo "hostname=$(hostname -s 2>/dev/null || hostname 2>/dev/null)"
+echo "hostname=$(uname -n 2>/dev/null)"
 if [ "$kernel_name" = "Darwin" ]; then
   echo "os=macos"
   echo "os_version=$(sw_vers -productVersion 2>/dev/null)"
@@ -241,8 +241,38 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Write one machine's facts into the graph, replacing what was there before.
+/// Write one machine's facts into the graph.
+///
+/// A **failed probe does not erase what we already knew.** An unreachable
+/// machine still has an OS, a core count and a set of installed tools; a probe
+/// that could not connect learned nothing about them, and overwriting them with
+/// zeros turns "temporarily offline" into "unknown machine". That is precisely
+/// backwards for a graph whose job is answering "which computer should run
+/// this?" — you want to know that the box currently down is the one with
+/// `claude` and the legal corpus on it.
+///
+/// So an unreachable probe updates only reachability and the probe timestamp,
+/// leaving specs and relations as last observed. A successful probe replaces
+/// everything, since it did observe it.
 pub fn project_into_graph(kg: &KnowledgeGraph, facts: &MachineFacts) -> anyhow::Result<()> {
+    if !facts.reachable {
+        if let Ok(Some(existing)) = kg.entity(&entity_id("machine", &facts.name)) {
+            let mut attrs = existing.attrs.clone();
+            if let Some(map) = attrs.as_object_mut() {
+                map.insert("reachable".into(), json!(false));
+                map.insert("probed_at".into(), json!(facts.probed_at));
+            }
+            kg.upsert_entity(&Entity {
+                attrs,
+                ..existing
+            })?;
+            debug!(machine = %facts.name, "unreachable; kept last known facts");
+            return Ok(());
+        }
+        // Never seen before and unreachable: record what little we have, so it
+        // at least appears in the fleet as a machine that exists and is down.
+    }
+
     let machine = Entity::new(
         "machine",
         &facts.name,
@@ -496,6 +526,53 @@ mod tests {
             tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
             vec!["claude"]
         );
+    }
+
+    #[test]
+    fn an_unreachable_probe_keeps_what_we_already_knew() {
+        let kg = KnowledgeGraph::in_memory().unwrap();
+        project_into_graph(&kg, &facts("lawfinder", &["claude", "codex", "psql"], 7.7, true)).unwrap();
+
+        // The box goes offline; the probe learns nothing.
+        let mut down = facts("lawfinder", &[], 0.0, false);
+        down.os = String::new();
+        down.arch = String::new();
+        down.cpu_cores = 0;
+        project_into_graph(&kg, &down).unwrap();
+
+        let m = kg.entity("machine:lawfinder").unwrap().expect("still present");
+        assert_eq!(m.attrs.get("reachable").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(m.attr_f64("memory_gb"), Some(7.7), "specs must survive");
+        assert_eq!(m.attr_f64("cpu_cores"), Some(2.0));
+        let tools: Vec<String> = kg
+            .neighbors("machine:lawfinder", "has_tool")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(tools.contains(&"claude".to_string()), "tools must survive: {tools:?}");
+    }
+
+    #[test]
+    fn a_machine_first_seen_while_down_is_still_recorded() {
+        let kg = KnowledgeGraph::in_memory().unwrap();
+        let mut down = facts("never-seen", &[], 0.0, false);
+        down.os = String::new();
+        project_into_graph(&kg, &down).unwrap();
+        let m = kg.entity("machine:never-seen").unwrap().expect("recorded");
+        assert_eq!(m.attrs.get("reachable").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn a_successful_reprobe_replaces_stale_facts() {
+        let kg = KnowledgeGraph::in_memory().unwrap();
+        project_into_graph(&kg, &facts("m", &["claude", "docker"], 8.0, true)).unwrap();
+        project_into_graph(&kg, &facts("m", &["claude"], 16.0, true)).unwrap();
+        let m = kg.entity("machine:m").unwrap().unwrap();
+        assert_eq!(m.attr_f64("memory_gb"), Some(16.0));
+        let tools: Vec<String> = kg.neighbors("machine:m", "has_tool").unwrap()
+            .into_iter().map(|t| t.name).collect();
+        assert_eq!(tools, vec!["claude"], "a real probe still prunes removed tools");
     }
 
     #[test]

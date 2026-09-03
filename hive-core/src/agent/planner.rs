@@ -163,7 +163,10 @@ impl Planner {
                ]\n\
              }}\n\n\
              Use requires_remote=true only if the task must run on a separate worker \
-             machine. Keep commands minimal and only include ones you are confident are \
+             machine. When you do, write the command exactly as it should run ON that \
+             machine — do NOT wrap it in ssh, and do not name the machine in the command. \
+             Hive opens the connection for you; an `ssh worker-name ...` command fails, \
+             because those names are Hive's, not DNS. Keep commands minimal and only include ones you are confident are \
              correct and safe. If the request doesn't need any commands, use an empty \
              commands array.\n\
              {fleet_trailer}"
