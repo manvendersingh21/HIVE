@@ -4,7 +4,7 @@
 pub mod ssh;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,9 @@ use crate::llm::LlmRouter;
 use crate::watchdog::Watchdog;
 use ssh::SshWorker;
 
+/// Ceiling on one worker health probe.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Pool of worker machines for task delegation.
 pub struct WorkerPool {
     /// Worker definitions loaded from config.
@@ -29,10 +32,51 @@ pub struct WorkerPool {
 pub struct WorkerNode {
     /// Static worker info from config.
     pub info: WorkerInfo,
-    /// Current status.
-    pub status: WorkerStatus,
+    /// Current status, held atomically so health can be refreshed through a
+    /// shared `&self`.
+    ///
+    /// The master owns its `WorkerPool` inside an `Arc<MasterAgent>` and hands
+    /// it to request handlers, so there is no `&mut` to take when a background
+    /// task wants to re-probe reachability. Encoded as a `u8` for the same
+    /// reason `active_tasks` is an `AtomicUsize`.
+    status: AtomicU8,
     /// Number of active tasks on this worker.
     pub active_tasks: AtomicUsize,
+}
+
+/// Encode/decode `WorkerStatus` for atomic storage.
+fn status_to_u8(status: WorkerStatus) -> u8 {
+    match status {
+        WorkerStatus::Online => 0,
+        WorkerStatus::Busy => 1,
+        WorkerStatus::Offline => 2,
+        WorkerStatus::Unhealthy => 3,
+    }
+}
+
+fn status_from_u8(value: u8) -> WorkerStatus {
+    match value {
+        0 => WorkerStatus::Online,
+        1 => WorkerStatus::Busy,
+        3 => WorkerStatus::Unhealthy,
+        // Anything unexpected is treated as offline: refusing to place work on
+        // a worker whose state we cannot read is the safe direction.
+        _ => WorkerStatus::Offline,
+    }
+}
+
+impl WorkerNode {
+    pub fn status(&self) -> WorkerStatus {
+        status_from_u8(self.status.load(Ordering::Relaxed))
+    }
+
+    pub fn set_status(&self, status: WorkerStatus) {
+        self.status.store(status_to_u8(status), Ordering::Relaxed);
+    }
+
+    pub fn is_online(&self) -> bool {
+        self.status() == WorkerStatus::Online
+    }
 }
 
 impl WorkerPool {
@@ -42,7 +86,7 @@ impl WorkerPool {
             .into_iter()
             .map(|info| WorkerNode {
                 info,
-                status: WorkerStatus::Offline,
+                status: AtomicU8::new(status_to_u8(WorkerStatus::Offline)),
                 active_tasks: AtomicUsize::new(0),
             })
             .collect();
@@ -57,7 +101,7 @@ impl WorkerPool {
     pub fn select_worker(&self) -> Option<&WorkerNode> {
         self.workers
             .iter()
-            .filter(|w| w.status == WorkerStatus::Online)
+            .filter(|w| w.is_online())
             .min_by_key(|w| w.active_tasks.load(Ordering::Relaxed))
     }
 
@@ -65,28 +109,46 @@ impl WorkerPool {
     pub fn online_count(&self) -> usize {
         self.workers
             .iter()
-            .filter(|w| w.status == WorkerStatus::Online)
+            .filter(|w| w.is_online())
             .count()
     }
 
     /// Probe every configured worker over SSH and flip its status between
     /// `Online`/`Offline` based on real reachability.
-    pub async fn refresh_health(&mut self) {
-        for worker in &mut self.workers {
+    /// Re-probe every worker's reachability.
+    ///
+    /// Takes `&self`, so a long-lived master can run this on a timer while
+    /// handlers are using the same pool. Each probe is bounded: SSH's own
+    /// `ConnectTimeout` does not cover every stall, and one wedged host must
+    /// not hold up the rest of the fleet.
+    pub async fn refresh_health(&self) {
+        for worker in &self.workers {
             let target = worker.info.ssh_target();
-            let reachable = match SshWorker::connect(&target).await {
-                Ok(ssh) => ssh.ping().await.is_ok(),
-                Err(e) => {
-                    warn!("Worker '{}' unreachable: {e}", worker.info.name);
-                    false
+            let probe = async {
+                match SshWorker::connect(&target).await {
+                    Ok(ssh) => ssh.ping().await.is_ok(),
+                    Err(e) => {
+                        warn!("Worker '{}' unreachable: {e}", worker.info.name);
+                        false
+                    }
                 }
             };
-            worker.status = if reachable {
+            let reachable = tokio::time::timeout(HEALTH_PROBE_TIMEOUT, probe)
+                .await
+                .unwrap_or_else(|_| {
+                    warn!("Worker '{}' health probe timed out", worker.info.name);
+                    false
+                });
+
+            let status = if reachable {
                 WorkerStatus::Online
             } else {
                 WorkerStatus::Offline
             };
-            info!("Worker '{}' health: {:?}", worker.info.name, worker.status);
+            if status != worker.status() {
+                info!("Worker '{}' health: {:?}", worker.info.name, status);
+            }
+            worker.set_status(status);
         }
     }
 
@@ -278,18 +340,34 @@ async fn handle_incident(
         analysis.reason
     );
 
-    if let Err(e) = ssh.send_keys(session_name, &["C-c"]).await {
-        warn!("Failed to send pause signal to '{session_name}': {e}");
-    }
+    // SIGSTOP, not C-c. Interrupting kills the session outright — the shell
+    // spawned by `spawn_tmux` has only this one command to run — which
+    // destroys the state a reviewer is being told to attach to, and can orphan
+    // long-running children. Suspending freezes it intact.
+    let paused = match ssh.pause_session(session_name).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Failed to suspend '{session_name}': {e}");
+            false
+        }
+    };
 
     if let Some(info) = sessions.lock().await.get_mut(session_name) {
         info.state = TaskState::PausedByWatchdog;
     }
 
-    warn!(
-        "Session '{session_name}' paused for human review. To inspect and take over: \
-         ssh {ssh_target} -t 'tmux attach -t {session_name}'"
-    );
+    if paused {
+        warn!(
+            "Session '{session_name}' SUSPENDED for human review. To inspect and take over: \
+             ssh {ssh_target} -t 'tmux attach -t {session_name}'  \
+             (it is stopped; resume with: kill -CONT -<pgid>)"
+        );
+    } else {
+        warn!(
+            "Session '{session_name}' flagged but COULD NOT BE SUSPENDED — it is still \
+             running. Inspect immediately: ssh {ssh_target} -t 'tmux attach -t {session_name}'"
+        );
+    }
 }
 
 #[cfg(test)]

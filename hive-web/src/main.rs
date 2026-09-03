@@ -34,6 +34,12 @@ use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
 /// Router state: the password gate plus the agent (absent on worker hosts).
+/// How often the master re-probes worker reachability and machine facts.
+///
+/// Short enough that a worker coming back is usable quickly, long enough that a
+/// fleet of unreachable hosts is not a steady stream of SSH timeouts.
+const WORKER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Clone)]
 struct AppState {
     auth: auth::Auth,
@@ -109,21 +115,33 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
 
     let agent = std::sync::Arc::new(agent);
 
-    // Seed the graph in the background, bounded, so the first request has fleet
-    // facts without startup waiting on the network. Until it lands the planner
-    // simply gets no fleet block, which is how it behaved before the graph
-    // existed.
-    let seeding = std::sync::Arc::clone(&agent);
+    // Health and the machine graph both reach workers over SSH, and both are
+    // refreshed on a timer rather than at startup: an SSH connect can stall
+    // well past its timeout, and neither is needed to bind the listener.
+    //
+    // The timer is not optional. Workers start `Offline` and only a health
+    // refresh moves them to `Online`, so without this loop the master would
+    // never place remote work at all — it would report "no worker is online"
+    // forever, with the worker sitting there perfectly reachable.
+    let background = std::sync::Arc::clone(&agent);
     tokio::spawn(async move {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            seeding.refresh_machine_graph(),
-        )
-        .await
-        {
-            Ok(Ok(n)) => info!(machines = n, "machine knowledge graph seeded"),
-            Ok(Err(e)) => warn!(error = %e, "could not seed machine knowledge graph"),
-            Err(_) => warn!("machine graph seed timed out; fleet facts unavailable until refresh"),
+        let mut first = true;
+        loop {
+            background.workers.refresh_health().await;
+
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                background.refresh_machine_graph(),
+            )
+            .await
+            {
+                Ok(Ok(n)) if first => info!(machines = n, "machine knowledge graph seeded"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(error = %e, "could not refresh machine knowledge graph"),
+                Err(_) => warn!("machine graph refresh timed out"),
+            }
+            first = false;
+            tokio::time::sleep(WORKER_REFRESH_INTERVAL).await;
         }
     });
 

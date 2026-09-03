@@ -55,10 +55,12 @@ private host not available in CI or on a fresh checkout — run explicitly with
 command whose output contains `rm -rf /` (an `echo`, never actually run) to the real worker and
 asserts the session reaches `TaskState::PausedByWatchdog` within 10s. **This passed live** in
 this session: the Tier-1 scan caught the line from real remote output, and the session was
-correctly marked paused. (The pause *signal* itself — `tmux send-keys C-c` — logged a benign
-"can't find pane" warning in this specific run, because the `echo` finished and closed its tmux
-session before the signal arrived; there was nothing left to interrupt. State tracking and
-detection are what the test asserts, and both worked.)
+correctly marked paused. (The pause *signal* itself — `tmux send-keys C-c` — logged a "can't find pane" warning, which
+this audit originally recorded as a benign race: the `echo` finishing before the signal arrived.
+**That reading was wrong.** `send_keys` passed a bare session name where tmux expects a
+target-pane, so the call failed every time and the watchdog could detect a dangerous session but
+never actually pause one. Found and fixed while closing the supervision caveat — see
+`workers::ssh::pane_target`.)
 
 Tier 2 (LLM review) is unit-tested (JSON extraction, `Watchdog::review`'s fallback path) and
 built entirely on the `LlmRouter::local_complete` path already live-verified in Phase 2, but
@@ -364,3 +366,69 @@ Q4_K_M and ~12 GB at IQ3 — both over the ceiling — and only fits around IQ2,
 where degradation is 15–25% versus 3–5% at Q4_K_M. That lands worst on
 structured output, and when JSON breaks `Planner::plan` falls back to a no-op
 subtask. 16 GB is the binding constraint, not the model.
+
+
+---
+
+## The two Phase 3 caveats, closed
+
+Both stemmed from `hive task` doing everything in-process and then exiting.
+
+### 1. Delegated work is now supervised for its whole life
+
+`WorkerPool::delegate` spawns its watchdog with `tokio::spawn` — on the *caller's*
+runtime. `hive task` exited moments later, aborting that task and leaving the remote
+tmux session running unwatched.
+
+`hive task` and `hive chat` now submit to the running master (`hive-web`, under
+launchd/systemd) whenever one is reachable, falling back to in-process with an
+explicit warning when it is not. The supervisor then lives in a daemon, not a
+short-lived CLI.
+
+Proven live, not asserted:
+
+```
+CLI exited: 21:42:06
+master log: 21:42:31  Session 'hive-20f2e4df…' finished with exit code 0
+```
+
+and, with a session engineered to trip Tier-1 twenty seconds after the CLI was gone:
+
+```
+CLI exited: 21:45:04
+master log: 21:45:24  WATCHDOG INCIDENT [CRITICAL] … 'rm-rf-root-or-wide' matched: rm -rf /
+```
+
+### 2. The CLI has the same safety gate as the web UI
+
+`hive task` ran whatever the planner produced. It now plans first, holds anything the
+watchdog's Tier-1 rules flag, and asks. `--yes` approves flagged commands (for
+non-interactive use), `--deny-flagged` refuses them, `--local` forces in-process.
+
+**No tty means deny.** A piped or scripted invocation cannot answer, and defaulting to
+"run it" would silently execute exactly the commands the watchdog objected to. Verified:
+`echo "" | hive task -d "…rm -rf …"` skipped the command and the canary file survived;
+`--yes` on the same request deleted it.
+
+### Two real bugs surfaced by testing this
+
+**The watchdog could never pause anything.** `SshWorker::send_keys` passed a bare session
+name where tmux expects a target-pane, so every pause attempt failed with
+`can't find pane`. This audit had previously recorded that warning as a benign race. It
+was not. Fixed with `workers::ssh::pane_target` (`=name:`).
+
+**`C-c` was a kill, not a pause.** With the target fixed, the interrupt landed — and ended
+the session, because the shell `spawn_tmux` starts has only that one command to run. A
+`sleep 300` child orphaned. That destroys the very state the operator is told to attach to.
+Pausing now sends SIGSTOP to the pane's foreground process group, so the session stays
+attachable and the process tree is intact. The remote snippet requires the pgid to be
+non-empty, all digits, and `> 1` — passing `-1` to `kill` means *every process the user can
+signal*, which is exactly how the Phase 4 incident happened.
+
+### Also fixed: workers were permanently offline
+
+Making `hive-web`'s startup non-blocking dropped its `refresh_health()` call, so every
+worker sat at `Offline` forever and the master would never place remote work — it reported
+"no worker is online" with the worker sitting there perfectly reachable. `refresh_health`
+now takes `&self` (status is an `AtomicU8`, like `active_tasks`) and runs on a 60s timer
+alongside the machine-graph refresh, bounded so one wedged host cannot stall the fleet.

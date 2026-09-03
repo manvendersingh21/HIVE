@@ -2,6 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
+mod approval;
+mod master;
+
+use approval::GatePolicy;
 use clap::{Parser, Subcommand};
 use hive_common::config::WorkersConfig;
 use hive_common::HiveConfig;
@@ -25,11 +29,28 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start interactive chat with the master agent.
-    Chat,
+    Chat {
+        /// Run in this process instead of using the master daemon.
+        #[arg(long)]
+        local: bool,
+    },
     /// Submit a task directly.
     Task {
         #[arg(short, long)]
         description: String,
+        /// Approve commands the safety watchdog flags, without asking.
+        /// For non-interactive use, where a prompt would hang.
+        #[arg(long)]
+        yes: bool,
+        /// Skip every flagged command instead of asking.
+        #[arg(long, conflicts_with = "yes")]
+        deny_flagged: bool,
+        /// Run in this process instead of submitting to the master.
+        ///
+        /// Anything delegated to a worker is then supervised only until this
+        /// process exits — which for `hive task` is almost immediately.
+        #[arg(long)]
+        local: bool,
     },
     /// List active sessions across all workers.
     Sessions,
@@ -92,8 +113,22 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Chat => run_chat(&cli.project_root).await,
-        Commands::Task { description } => run_task(&cli.project_root, &description).await,
+        Commands::Chat { local } => run_chat(&cli.project_root, local).await,
+        Commands::Task {
+            description,
+            yes,
+            deny_flagged,
+            local,
+        } => {
+            let policy = if yes {
+                GatePolicy::AssumeYes
+            } else if deny_flagged {
+                GatePolicy::DenyAll
+            } else {
+                GatePolicy::Prompt
+            };
+            run_task(&cli.project_root, &description, policy, local).await
+        }
         Commands::Sessions => {
             println!("No sessions yet — worker delegation is not implemented (Phase 3/4).");
             Ok(())
@@ -140,7 +175,7 @@ async fn build_agent(project_root: &Path) -> anyhow::Result<MasterAgent> {
         WorkersConfig::from_project_root(project_root).unwrap_or(WorkersConfig { workers: vec![] });
 
     let llm = LlmRouter::from_config(&config.llm);
-    let mut workers = WorkerPool::new(workers_config.workers);
+    let workers = WorkerPool::new(workers_config.workers);
     workers.refresh_health().await;
     let skills = SkillRegistry::new();
     let memory = MemorySystem::new();
@@ -154,31 +189,104 @@ async fn build_agent(project_root: &Path) -> anyhow::Result<MasterAgent> {
     ))
 }
 
-async fn run_task(project_root: &Path, description: &str) -> anyhow::Result<()> {
-    let agent = build_agent(project_root).await?;
-    let response = agent.handle_request(description, None).await?;
-
-    println!("Summary: {}", response.summary);
-    println!("Provider: {}", response.provider_used);
-    println!("Complexity: {}", response.complexity);
-    if response.sessions.is_empty() {
-        println!("No sessions created (plan had no remote subtasks, or no worker was online).");
-    } else {
-        for session in &response.sessions {
-            println!(
-                "Session '{}' on worker '{}': {}",
-                session.session_name, session.worker_name, session.state
-            );
+/// Submit a task, preferring the long-lived master.
+///
+/// Two problems are solved by routing through the master rather than doing the
+/// work here:
+///
+/// * **Supervision outlives the command.** `WorkerPool::delegate` spawns its
+///   watchdog as a task on the *caller's* runtime. In-process, `hive task`
+///   exits moments later and that supervisor is aborted, leaving the remote
+///   tmux session running unwatched. In the master — a daemon under
+///   launchd/systemd — it runs for the session's whole life.
+/// * **The safety gate applies either way.** Commands the watchdog's Tier-1
+///   rules flag stop and ask before running, the same as in the web UI.
+async fn run_task(
+    project_root: &Path,
+    description: &str,
+    policy: GatePolicy,
+    force_local: bool,
+) -> anyhow::Result<()> {
+    if !force_local {
+        let url = master::MasterClient::default_url();
+        if let Some(client) = master::MasterClient::connect(&url).await? {
+            println!("Submitting to the master at {url}\n");
+            return run_task_via_master(&client, description, policy).await;
         }
+        println!(
+            "No master reachable at {url} — running in this process.\n\
+             WARNING: anything delegated to a worker will be supervised only until this\n\
+             command exits, which is almost immediately. Start hive-web to get durable\n\
+             supervision, or pass --local to silence this.\n"
+        );
     }
+    run_task_locally(project_root, description, policy).await
+}
+
+async fn run_task_via_master(
+    client: &master::MasterClient,
+    description: &str,
+    policy: GatePolicy,
+) -> anyhow::Result<()> {
+    let reply = client.submit(description, None).await?;
+    approval::print_plan(&reply.run);
+    approval::print_outcomes(&reply.result);
+
+    if reply.result.is_complete() {
+        return Ok(());
+    }
+
+    let (approved, denied) = approval::decide(&reply.run, &reply.result, policy);
+    let reply = client.approve(&reply.result.run_id, approved, denied).await?;
+    approval::print_outcomes(&reply.result);
     Ok(())
 }
 
-async fn run_chat(project_root: &Path) -> anyhow::Result<()> {
+/// In-process fallback, used when no master is running.
+///
+/// Still gated: the plan is built first, flagged steps are held, and only what
+/// the user clears is executed.
+async fn run_task_locally(
+    project_root: &Path,
+    description: &str,
+    policy: GatePolicy,
+) -> anyhow::Result<()> {
+    let agent = build_agent(project_root).await?;
+    run_request_on_agent(&agent, description, policy).await
+}
+
+/// Interactive chat.
+///
+/// Prefers the master for the same reasons as `hive task`. A long chat session
+/// does supervise its own delegations while it is open, but it still ends when
+/// you type `exit` — the master does not.
+async fn run_chat(project_root: &Path, force_local: bool) -> anyhow::Result<()> {
     use std::io::{self, Write};
 
-    let agent = build_agent(project_root).await?;
-    println!("🐝 Hive Agent Ready. Type a task, or 'exit' to quit.");
+    let client = if force_local {
+        None
+    } else {
+        let url = master::MasterClient::default_url();
+        match master::MasterClient::connect(&url).await? {
+            Some(client) => {
+                println!("🐝 Hive — connected to the master at {url}.");
+                Some(client)
+            }
+            None => {
+                println!(
+                    "🐝 Hive — no master reachable; running in this process.\n\
+                     Delegated sessions lose their watchdog when you exit."
+                );
+                None
+            }
+        }
+    };
+
+    let agent = match &client {
+        Some(_) => None,
+        None => Some(build_agent(project_root).await?),
+    };
+    println!("Type a task, or 'exit' to quit.");
 
     loop {
         print!("> ");
@@ -196,18 +304,49 @@ async fn run_chat(project_root: &Path) -> anyhow::Result<()> {
             break;
         }
 
-        match agent.handle_request(input, None).await {
-            Ok(response) => {
-                println!("Summary: {}", response.summary);
-                println!(
-                    "Provider: {} ({})",
-                    response.provider_used, response.complexity
-                );
+        // Prompting is right here: a chat session is interactive by definition.
+        let outcome = match (&client, &agent) {
+            (Some(client), _) => run_task_via_master(client, input, GatePolicy::Prompt).await,
+            (None, Some(agent)) => {
+                run_request_on_agent(agent, input, GatePolicy::Prompt).await
             }
-            Err(e) => eprintln!("Error: {e}"),
+            (None, None) => unreachable!("one of client or agent is always built"),
+        };
+        if let Err(e) = outcome {
+            eprintln!("Error: {e}");
         }
     }
 
+    Ok(())
+}
+
+/// One gated request against an in-process agent.
+async fn run_request_on_agent(
+    agent: &MasterAgent,
+    description: &str,
+    policy: GatePolicy,
+) -> anyhow::Result<()> {
+    use hive_core::agent::run::Approvals;
+
+    let plan = agent.plan_run(description, None).await?;
+    approval::print_plan(&plan);
+
+    let result = agent.execute_run(&plan, &Approvals::none()).await;
+    approval::print_outcomes(&result);
+    if result.is_complete() {
+        return Ok(());
+    }
+
+    let (approved, denied) = approval::decide(&plan, &result, policy);
+    let mut approvals = Approvals::none();
+    for id in approved {
+        approvals.approve(id);
+    }
+    for id in denied {
+        approvals.deny(id);
+    }
+    let result = agent.execute_run(&plan, &approvals).await;
+    approval::print_outcomes(&result);
     Ok(())
 }
 

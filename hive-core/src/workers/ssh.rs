@@ -14,6 +14,23 @@ use std::time::Duration;
 use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 
+/// Exact-match target for tmux commands that take a *pane*, such as
+/// `send-keys` and `capture-pane`.
+///
+/// Two separate things are going on and both matter:
+///
+/// * A bare session name is not a valid target-pane. tmux answers
+///   `can't find pane: <name>` and exits non-zero. This silently broke the
+///   watchdog's pause: Tier-1 would correctly detect `rm -rf /` in a live
+///   session, then fail to send `C-c`, so a session flagged as dangerous kept
+///   running. It was mistaken for a benign race in Phase 3 ("the command
+///   already exited"), which is why it survived this long.
+/// * The `=` prefix stops tmux prefix-matching, so `hive-1` can never resolve
+///   to `hive-10`.
+fn pane_target(session_name: &str) -> String {
+    format!("={session_name}:")
+}
+
 /// A pooled SSH connection to one worker, with tmux helpers layered on top.
 pub struct SshWorker {
     session: Arc<Session>,
@@ -49,6 +66,63 @@ impl SshWorker {
         } else {
             anyhow::bail!("ping command exited non-zero")
         }
+    }
+
+    /// Suspend a session's foreground job with SIGSTOP.
+    ///
+    /// Replaces `send-keys C-c`, which was never a pause. A session created by
+    /// [`SshWorker::spawn_tmux`] runs `bash -c <command>` — its only job — so
+    /// interrupting the command leaves the shell with nothing to do, the
+    /// session exits, and long-running children can orphan. Verified: a C-c'd
+    /// session vanished and left a stray `sleep 300` behind. That is a kill
+    /// with extra steps, and it destroys exactly the state a human was meant
+    /// to attach to and review.
+    ///
+    /// SIGSTOP freezes the work in place instead: the session stays attachable,
+    /// the process tree is intact, and it can be resumed.
+    ///
+    /// The remote snippet is written defensively on purpose. Passing a negative
+    /// pgid to `kill` is how a process group is addressed, but `-1` there means
+    /// *every process the user can signal* — that mistake once stopped a
+    /// worker's unrelated services. So the pgid is required to be non-empty,
+    /// all digits, and greater than 1 before it is used.
+    pub async fn pause_session(&self, session_name: &str) -> anyhow::Result<()> {
+        let script = format!(
+            r#"set -e
+pid=$(tmux display-message -p -t '={session_name}:' '#{{pane_pid}}' 2>/dev/null)
+case "$pid" in ''|*[!0-9]*) echo "no pane pid" >&2; exit 1;; esac
+pgid=$(ps -o tpgid= -p "$pid" | tr -d ' ')
+case "$pgid" in ''|*[!0-9]*) echo "no foreground pgid" >&2; exit 1;; esac
+if [ "$pgid" -le 1 ]; then echo "refusing to signal pgid $pgid" >&2; exit 1; fi
+kill -STOP -"$pgid"
+echo "stopped $pgid""#
+        );
+        let out = self.run(&script).await?;
+        tracing::debug!(session = session_name, result = out.trim(), "session suspended");
+        Ok(())
+    }
+
+    /// Resume a session suspended by [`SshWorker::pause_session`].
+    ///
+    /// Finds the stopped process group on the pane's tty rather than trusting a
+    /// remembered id: once a job stops, the shell reclaims the terminal, so the
+    /// tty's *foreground* group is no longer the stopped work.
+    pub async fn resume_session(&self, session_name: &str) -> anyhow::Result<()> {
+        let script = format!(
+            r#"set -e
+tty=$(tmux display-message -p -t '={session_name}:' '#{{pane_tty}}' 2>/dev/null | sed 's|^/dev/||')
+[ -n "$tty" ] || {{ echo "no tty" >&2; exit 1; }}
+resumed=0
+for pgid in $(ps -t "$tty" -o pgid=,stat= | awk '$2 ~ /^T/ {{print $1}}' | sort -u); do
+  case "$pgid" in ''|*[!0-9]*) continue;; esac
+  if [ "$pgid" -gt 1 ]; then kill -CONT -"$pgid" && resumed=$((resumed+1)); fi
+done
+[ "$resumed" -gt 0 ] || {{ echo "nothing stopped" >&2; exit 1; }}
+echo "resumed $resumed""#
+        );
+        let out = self.run(&script).await?;
+        tracing::debug!(session = session_name, result = out.trim(), "session resumed");
+        Ok(())
     }
 
     /// Run a command and return its stdout. For short, synchronous queries
@@ -120,7 +194,7 @@ impl SshWorker {
     /// state for a human to inspect on reattach.
     pub async fn send_keys(&self, session_name: &str, keys: &[&str]) -> anyhow::Result<()> {
         let mut cmd = self.session.command("tmux");
-        cmd.args(["send-keys", "-t", session_name]);
+        cmd.args(["send-keys", "-t", &pane_target(session_name)]);
         cmd.args(keys.iter().copied());
         let status = cmd
             .status()
@@ -142,7 +216,7 @@ impl SshWorker {
                 "capture-pane",
                 "-p",
                 "-t",
-                session_name,
+                pane_target(session_name).as_str(),
                 "-S",
                 format!("-{lines}").as_str(),
             ])
@@ -190,5 +264,19 @@ impl LogTail {
     /// Read the next line, or `Ok(None)` if the remote tail process ended.
     pub async fn next_line(&mut self) -> anyhow::Result<Option<String>> {
         Ok(self.lines.next_line().await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_target_is_exact_and_valid_for_pane_scoped_commands() {
+        // The trailing colon is what makes this a target-pane rather than a
+        // session name; without it tmux rejects the command outright.
+        assert_eq!(pane_target("hive-1"), "=hive-1:");
+        // The `=` keeps `hive-1` from matching `hive-10`.
+        assert!(pane_target("hive-1").starts_with('='));
     }
 }

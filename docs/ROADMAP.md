@@ -15,11 +15,11 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | 3 | Worker pool, SSH delegation, tmux creation | 2 days | 2 | ✅ done, live-verified against a real worker (redesigned: direct SSH+tmux, no daemon — see below) |
 | 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ✅ done, live-verified on `lawfinder` |
 | 5 | `hive-web` — web terminal + agent UI | 2–3 days | 3 | ✅ done, live on the master and the `lawfinder` worker |
-| 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 command tree wired, most subcommands are stubs |
+| 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 `task`/`chat` route through the master and are gated; other subcommands still stubs |
 | 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
 | 9 | Memory — projects, KG, RAG | 2–3 days | 2 | 🟡 KG substrate + machine graph live; RAG, projects, history not started |
-| 10 | Safety watchdog | 2–3 days | 3, 7 | 🟡 Tier-1/Tier-2 on remote + Tier-1 approval gate on local exec; no incident log/notifier |
+| 10 | Safety watchdog | 2–3 days | 3, 7 | 🟡 Tier-1/Tier-2 remote (now suspends, not interrupts) + gate on local exec everywhere; no incident log/notifier |
 | | **Total** | **~16–22 days** | | |
 
 Legend: ✅ done · 🟡 partial · 🔴 broken · ⬜ not started

@@ -470,7 +470,7 @@ impl MasterAgent {
             .iter()
             .find_map(|m| {
                 self.workers.workers.iter().find(|w| {
-                    w.info.name == m.name && w.status == hive_common::WorkerStatus::Online
+                    w.info.name == m.name && w.is_online()
                 })
             })
             .or_else(|| self.workers.select_worker())
