@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hive_common::{SafetyAnalysis, SessionInfo, TaskAssignment, TaskState, WorkerInfo, WorkerStatus};
+use hive_common::{
+    SafetyAnalysis, SessionInfo, TaskAssignment, TaskState, WorkerInfo, WorkerStatus,
+};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -116,7 +118,8 @@ impl WorkerPool {
         }
         let log_path = format!("/tmp/{}.log", task.tmux_session_name);
 
-        ssh.spawn_tmux(&task.tmux_session_name, &command, &log_path).await?;
+        ssh.spawn_tmux(&task.tmux_session_name, &command, &log_path)
+            .await?;
         worker.active_tasks.fetch_add(1, Ordering::Relaxed);
 
         let session_info = SessionInfo {
@@ -199,7 +202,8 @@ async fn supervise(params: SuperviseParams) -> anyhow::Result<()> {
     let mut tail = ssh.tail(&log_path).await?;
     let config = watchdog.config().clone();
 
-    let mut poll_interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs.max(1)));
+    let mut poll_interval =
+        tokio::time::interval(Duration::from_secs(config.poll_interval_secs.max(1)));
     poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consecutive_safe: u32 = 0;
     let mut recent_lines: Vec<String> = Vec::new();
@@ -313,11 +317,14 @@ mod tests {
 
         // Tier-2 (LLM review) is disabled so this test only depends on the
         // SSH worker being reachable, not on a local Ollama instance.
-        let watchdog = Arc::new(Watchdog::from_config(hive_common::config::WatchdogConfig {
-            llm_analysis: false,
-            poll_interval_secs: 1,
-            ..Default::default()
-        }).unwrap());
+        let watchdog = Arc::new(
+            Watchdog::from_config(hive_common::config::WatchdogConfig {
+                llm_analysis: false,
+                poll_interval_secs: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
         let llm = Arc::new(LlmRouter::new(
             "http://localhost:11434".to_string(),
             "qwen2.5:14b-instruct-q4_K_M".to_string(),
@@ -342,7 +349,10 @@ mod tests {
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let sessions = pool.active_sessions().await;
-            if let Some(info) = sessions.iter().find(|s| s.session_name == session.session_name) {
+            if let Some(info) = sessions
+                .iter()
+                .find(|s| s.session_name == session.session_name)
+            {
                 if info.state == TaskState::PausedByWatchdog {
                     paused = true;
                     break;
@@ -350,6 +360,9 @@ mod tests {
             }
         }
 
-        assert!(paused, "expected the session to be paused by the Tier-1 watchdog");
+        assert!(
+            paused,
+            "expected the session to be paused by the Tier-1 watchdog"
+        );
     }
 }

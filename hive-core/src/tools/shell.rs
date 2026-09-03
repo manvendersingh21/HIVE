@@ -66,6 +66,8 @@ impl Tool for ShellTool {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let exit_code = output.status.code().unwrap_or(-1);
 
-        Ok(format!("exit_code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"))
+        Ok(format!(
+            "exit_code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ))
     }
 }

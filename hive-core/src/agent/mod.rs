@@ -1,6 +1,7 @@
 //! Master agent — ReAct-style reasoning loop for task planning and execution.
 
 pub mod planner;
+pub mod run;
 
 use std::sync::Arc;
 
@@ -9,12 +10,16 @@ use hive_common::{AgentResponse, TaskAssignment, TaskCommand};
 use tracing::{info, warn};
 
 use crate::llm::LlmRouter;
-use crate::memory::MemorySystem;
+use crate::memory::{machines, MemorySystem};
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
 use crate::watchdog::Watchdog;
 use crate::workers::WorkerPool;
 use planner::Planner;
+use run::{
+    assess_command, Approvals, Decision, PlannedRun, PlannedStep, RunResult, StepOutcome,
+    StepStatus, StepTarget,
+};
 
 /// The master agent — central intelligence of the Hive system.
 ///
@@ -40,7 +45,12 @@ impl MasterAgent {
     /// Create a new master agent with all subsystems, using the default
     /// watchdog configuration. See [`MasterAgent::with_watchdog_config`] to
     /// use a configured one (e.g. from `hive.toml`).
-    pub fn new(llm: LlmRouter, workers: WorkerPool, skills: SkillRegistry, memory: MemorySystem) -> Self {
+    pub fn new(
+        llm: LlmRouter,
+        workers: WorkerPool,
+        skills: SkillRegistry,
+        memory: MemorySystem,
+    ) -> Self {
         Self::with_watchdog_config(llm, workers, skills, memory, WatchdogConfig::default())
     }
 
@@ -144,7 +154,10 @@ impl MasterAgent {
                             }
                             Err(e) => {
                                 warn!("Delegation failed for '{}': {e}", subtask.description);
-                                notes.push(format!("'{}' delegation FAILED: {e}", subtask.description));
+                                notes.push(format!(
+                                    "'{}' delegation FAILED: {e}",
+                                    subtask.description
+                                ));
                             }
                         }
                     }
@@ -188,5 +201,264 @@ impl MasterAgent {
             provider_used: provider,
             complexity,
         })
+    }
+    // ---------------------------------------------------------------- planning
+
+    /// Phase one: classify, route, and plan — without running anything.
+    ///
+    /// Every command is checked against the watchdog's Tier-1 rules here, so
+    /// the caller can show which steps will need approval *before* the first
+    /// one executes. Pair with [`MasterAgent::execute_run`].
+    pub async fn plan_run(
+        &self,
+        user_input: &str,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<PlannedRun> {
+        info!("Planning run for: {}", user_input);
+
+        if let Some(pid) = project_id {
+            let _context = self.memory.retrieve_context(pid, user_input).await?;
+        }
+
+        let complexity = self.llm.classify_complexity(user_input).await?;
+        let provider = complexity.recommended_provider();
+        info!("Task complexity: {complexity}, routing to {provider}");
+
+        let plan = self.planner.plan(&self.llm, user_input, complexity).await?;
+
+        let mut steps = Vec::new();
+        for subtask in &plan.subtasks {
+            let target = if subtask.requires_remote {
+                match self.choose_worker(&["supervised-sessions"]) {
+                    Some(worker) => StepTarget::Remote {
+                        worker: worker.info.name.clone(),
+                    },
+                    // Named so the UI can say *which* worker was wanted even
+                    // when none is available.
+                    None => StepTarget::Remote {
+                        worker: String::new(),
+                    },
+                }
+            } else {
+                StepTarget::Local
+            };
+
+            for command in &subtask.commands {
+                steps.push(PlannedStep {
+                    id: steps.len(),
+                    description: subtask.description.clone(),
+                    command: command.clone(),
+                    // Remote commands are supervised live by the watchdog once
+                    // delegated; the pre-flight gate is for local execution,
+                    // which has no such supervision.
+                    risk: match target {
+                        StepTarget::Local => assess_command(&self.watchdog, command),
+                        StepTarget::Remote { .. } => None,
+                    },
+                    target: target.clone(),
+                });
+            }
+
+            if subtask.commands.is_empty() {
+                steps.push(PlannedStep {
+                    id: steps.len(),
+                    description: subtask.description.clone(),
+                    command: String::new(),
+                    target: target.clone(),
+                    risk: None,
+                });
+            }
+        }
+
+        Ok(PlannedRun {
+            id: format!("run-{}", uuid::Uuid::new_v4()),
+            user_input: user_input.to_string(),
+            summary: plan.summary,
+            complexity,
+            routed_provider: provider,
+            provider: plan.provider_used,
+            steps,
+        })
+    }
+
+    /// Phase two: execute the steps the caller has cleared.
+    ///
+    /// Gated steps without an explicit approval come back as
+    /// [`StepStatus::AwaitingApproval`] and are simply not run — call again
+    /// with an updated [`Approvals`] to continue.
+    pub async fn execute_run(&self, plan: &PlannedRun, approvals: &Approvals) -> RunResult {
+        let mut outcomes = Vec::new();
+        let mut sessions = Vec::new();
+        let mut awaiting = Vec::new();
+
+        for step in &plan.steps {
+            if step.command.is_empty() {
+                outcomes.push(StepOutcome {
+                    id: step.id,
+                    command: String::new(),
+                    status: StepStatus::Skipped,
+                    output: format!("{} — no commands to run", step.description),
+                });
+                continue;
+            }
+
+            if step.needs_approval() {
+                match approvals.decision(step.id) {
+                    Decision::Pending => {
+                        awaiting.push(step.id);
+                        outcomes.push(StepOutcome {
+                            id: step.id,
+                            command: step.command.clone(),
+                            status: StepStatus::AwaitingApproval,
+                            output: step
+                                .risk
+                                .as_ref()
+                                .map(|r| r.reason.clone())
+                                .unwrap_or_default(),
+                        });
+                        continue;
+                    }
+                    Decision::Denied => {
+                        outcomes.push(StepOutcome {
+                            id: step.id,
+                            command: step.command.clone(),
+                            status: StepStatus::Denied,
+                            output: "Rejected by the user; not run.".into(),
+                        });
+                        continue;
+                    }
+                    Decision::Approved => {
+                        warn!(command = %step.command, "running a Tier-1 flagged command on user approval");
+                    }
+                }
+            }
+
+            match &step.target {
+                StepTarget::Local => match self.tools.run_shell(&step.command).await {
+                    Ok(output) => outcomes.push(StepOutcome {
+                        id: step.id,
+                        command: step.command.clone(),
+                        status: StepStatus::Executed,
+                        output,
+                    }),
+                    Err(e) => outcomes.push(StepOutcome {
+                        id: step.id,
+                        command: step.command.clone(),
+                        status: StepStatus::Failed,
+                        output: e.to_string(),
+                    }),
+                },
+                StepTarget::Remote { worker } => {
+                    let selected = self
+                        .workers
+                        .workers
+                        .iter()
+                        .find(|w| &w.info.name == worker)
+                        .or_else(|| self.workers.select_worker());
+
+                    let Some(node) = selected else {
+                        outcomes.push(StepOutcome {
+                            id: step.id,
+                            command: step.command.clone(),
+                            status: StepStatus::Failed,
+                            output: "No worker is online to take this step.".into(),
+                        });
+                        continue;
+                    };
+
+                    let assignment = TaskAssignment::new(
+                        step.description.clone(),
+                        vec![TaskCommand::new(step.command.clone())],
+                        format!("hive-{}", uuid::Uuid::new_v4()),
+                    );
+
+                    match self
+                        .workers
+                        .delegate(node, assignment, self.llm.clone(), self.watchdog.clone())
+                        .await
+                    {
+                        Ok(session) => {
+                            outcomes.push(StepOutcome {
+                                id: step.id,
+                                command: step.command.clone(),
+                                status: StepStatus::Delegated,
+                                output: format!(
+                                    "Delegated to '{}' as tmux session '{}'.",
+                                    node.info.name, session.session_name
+                                ),
+                            });
+                            sessions.push(session);
+                        }
+                        Err(e) => outcomes.push(StepOutcome {
+                            id: step.id,
+                            command: step.command.clone(),
+                            status: StepStatus::Failed,
+                            output: format!("Delegation failed: {e}"),
+                        }),
+                    }
+                }
+            }
+        }
+
+        RunResult {
+            run_id: plan.id.clone(),
+            summary: plan.summary.clone(),
+            complexity: plan.complexity.clone(),
+            provider: plan.provider.clone(),
+            outcomes,
+            sessions,
+            awaiting_approval: awaiting,
+        }
+    }
+
+    // ----------------------------------------------------------- machine graph
+
+    /// Pick a worker that has every one of `capabilities`, consulting the
+    /// machine knowledge graph.
+    ///
+    /// With one worker this is barely more than `select_worker`. It exists
+    /// because the graph is where placement decisions are meant to live once
+    /// there is more than one machine to choose between — the query stays the
+    /// same, the answer gets more interesting.
+    pub fn choose_worker(&self, capabilities: &[&str]) -> Option<&crate::workers::WorkerNode> {
+        let ranked = machines::machines_with_capabilities(&self.memory.graph, capabilities)
+            .unwrap_or_default();
+
+        ranked
+            .iter()
+            .find_map(|m| {
+                self.workers.workers.iter().find(|w| {
+                    w.info.name == m.name && w.status == hive_common::WorkerStatus::Online
+                })
+            })
+            .or_else(|| self.workers.select_worker())
+    }
+
+    /// Re-probe every machine (the master and all configured workers) and
+    /// refresh the knowledge graph.
+    ///
+    /// Workers are probed concurrently: an unreachable one costs a connect
+    /// timeout, and serializing those would make startup scale with the number
+    /// of offline machines.
+    pub async fn refresh_machine_graph(&self, master_name: &str) -> anyhow::Result<usize> {
+        let local = machines::probe_local(master_name).await;
+        machines::project_into_graph(&self.memory.graph, &local)?;
+
+        let probes = self.workers.workers.iter().map(|w| {
+            let name = w.info.name.clone();
+            let target = w.info.ssh_target();
+            let tags = w.info.tags.clone();
+            async move { machines::probe_remote(&name, &target, tags).await }
+        });
+
+        let results = futures::future::join_all(probes).await;
+        let mut count = 1;
+        for facts in results {
+            machines::project_into_graph(&self.memory.graph, &facts)?;
+            count += 1;
+        }
+
+        info!(machines = count, "machine knowledge graph refreshed");
+        Ok(count)
     }
 }

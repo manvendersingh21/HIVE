@@ -51,13 +51,40 @@ impl SshWorker {
         }
     }
 
+    /// Run a command and return its stdout. For short, synchronous queries
+    /// (machine probes, capability checks) — not for long-running work, which
+    /// belongs in a supervised tmux session via [`SshWorker::spawn_tmux`].
+    pub async fn run(&self, command: &str) -> anyhow::Result<String> {
+        let output = self
+            .session
+            .command("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("remote command failed: {e}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "remote command exited {}: {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     /// Create a detached tmux session on the worker running `command`,
     /// piping its combined stdout/stderr into `log_path` on the remote
     /// filesystem so it can be tailed losslessly (rather than polling
     /// `tmux capture-pane`, which can miss short-lived output between
     /// polls). A sentinel line is appended so callers can detect
     /// completion and capture the exit code from the log stream itself.
-    pub async fn spawn_tmux(&self, session_name: &str, command: &str, log_path: &str) -> anyhow::Result<()> {
+    pub async fn spawn_tmux(
+        &self,
+        session_name: &str,
+        command: &str,
+        log_path: &str,
+    ) -> anyhow::Result<()> {
         // A single synchronous pipe into one `tee`, not `> >(tee ...)`
         // process substitution: process substitution runs its reader as a
         // background job that the shell does NOT wait for before moving on
@@ -70,7 +97,15 @@ impl SshWorker {
         let status = self
             .session
             .command("tmux")
-            .args(["new-session", "-d", "-s", session_name, "bash", "-c", inner.as_str()])
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session_name,
+                "bash",
+                "-c",
+                inner.as_str(),
+            ])
             .status()
             .await
             .map_err(|e| anyhow::anyhow!("failed to start tmux session '{session_name}': {e}"))?;
@@ -103,7 +138,14 @@ impl SshWorker {
         let output = self
             .session
             .command("tmux")
-            .args(["capture-pane", "-p", "-t", session_name, "-S", format!("-{lines}").as_str()])
+            .args([
+                "capture-pane",
+                "-p",
+                "-t",
+                session_name,
+                "-S",
+                format!("-{lines}").as_str(),
+            ])
             .output()
             .await
             .map_err(|e| anyhow::anyhow!("tmux capture-pane failed for '{session_name}': {e}"))?;

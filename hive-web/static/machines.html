@@ -1,0 +1,176 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Hive · machines</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115; --panel: #161a21; --line: #262c38; --line2: #39424f;
+    --text: #e6e8ee; --dim: #8b93a7; --accent: #f5a623; --ok: #35d07f; --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  header {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 14px; padding: 12px 18px;
+    background: #0f1115ee; backdrop-filter: blur(8px); border-bottom: 1px solid #1e242e;
+  }
+  h1 { margin: 0; font-size: 17px; }
+  nav { display: flex; gap: 4px; margin-left: auto; }
+  nav a { color: var(--dim); text-decoration: none; font-size: 13px; padding: 6px 11px; border-radius: 7px; }
+  nav a:hover { color: var(--text); background: var(--panel); }
+  nav a.on { color: var(--accent); background: var(--panel); }
+
+  main { max-width: 840px; margin: 0 auto; padding: 20px 18px 40px; }
+  .bar { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+  .bar p { margin: 0; color: var(--dim); font-size: 13.5px; flex: 1; }
+  button {
+    padding: 8px 15px; border: 1px solid var(--line2); border-radius: 8px; cursor: pointer;
+    background: transparent; color: var(--text); font-size: 13px; font-weight: 600;
+  }
+  button:hover { border-color: var(--text); }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .machine {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 13px; padding: 17px 19px; margin-bottom: 14px;
+  }
+  .m-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .m-name { font-size: 16px; font-weight: 650; font-family: ui-monospace, SFMono-Regular, monospace; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 3px #35d07f22; }
+  .dot.off { background: var(--bad); }
+  .m-host { color: var(--dim); font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, monospace; }
+  .specs { color: var(--dim); font-size: 13.5px; margin: 9px 0 13px; }
+  .rel { margin-bottom: 9px; }
+  .rel-name {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--dim); margin-bottom: 5px;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .chip {
+    font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line2); color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+  .chip.cap { border-color: var(--accent); color: var(--accent); }
+  .chip.os { border-color: #5aa9ff; color: #5aa9ff; }
+  .empty { color: var(--dim); text-align: center; padding: 50px 20px; }
+  .note {
+    margin-top: 26px; padding: 15px 17px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 11px; color: var(--dim); font-size: 13px;
+  }
+  .note b { color: var(--text); font-weight: 600; }
+  pre {
+    margin: 9px 0 0; padding: 12px; background: var(--bg); border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px;
+    white-space: pre-wrap; overflow-x: auto; color: var(--text);
+  }
+</style>
+
+<header>
+  <h1>🐝 Hive</h1>
+  <nav>
+    <a href="/">Agent</a>
+    <a href="/sessions">Sessions</a>
+    <a href="/machines" class="on">Machines</a>
+  </nav>
+</header>
+
+<main>
+  <div class="bar">
+    <p>The machine knowledge graph. The agent queries this to decide where work runs.</p>
+    <button id="refresh">Re-probe</button>
+  </div>
+  <div id="list"><div class="empty">Loading…</div></div>
+  <div class="note">
+    <b>Why a graph?</b> Machines, operating systems, tools and capabilities are stored as
+    entities and relations rather than a flat list, so placement becomes a query —
+    <i>“which machines have <span class="chip cap">agentic-cli</span> and the most free memory?”</i>
+    — instead of a hardcoded branch. Today there is one Linux worker and the answer is obvious;
+    the shape is what makes the second and third machine cheap to add.
+    <div id="prompt-preview"></div>
+  </div>
+</main>
+
+<script>
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  function chips(entities, cls) {
+    if (!entities.length) return '';
+    return `<div class="chips">${entities.map(e =>
+      `<span class="chip ${cls}">${esc(e.name)}</span>`).join('')}</div>`;
+  }
+
+  function render(snapshot) {
+    const byId = Object.fromEntries(snapshot.entities.map(e => [e.id, e]));
+    const machines = snapshot.entities.filter(e => e.kind === 'machine');
+    if (!machines.length) {
+      return `<div class="empty">No machines in the graph yet. Hit Re-probe.</div>`;
+    }
+
+    const related = (id, rel) => snapshot.edges
+      .filter(g => g.from === id && g.relation === rel)
+      .map(g => byId[g.to]).filter(Boolean);
+
+    return machines.map(m => {
+      const a = m.attrs || {};
+      const online = a.reachable;
+      const specs = [
+        a.arch, a.cpu_cores ? `${a.cpu_cores} cores` : null,
+        a.memory_gb ? `${Number(a.memory_gb).toFixed(1)} GB RAM` : null,
+        a.disk_free_gb ? `${Math.round(a.disk_free_gb)} GB free` : null,
+        a.gpu || null,
+        a.kernel ? `kernel ${a.kernel}` : null
+      ].filter(Boolean).join(' · ');
+
+      const section = (title, items, cls) => items.length
+        ? `<div class="rel"><div class="rel-name">${title}</div>${chips(items, cls)}</div>` : '';
+
+      return `
+        <div class="machine">
+          <div class="m-head">
+            <span class="dot ${online ? 'on' : 'off'}"></span>
+            <span class="m-name">${esc(m.name)}</span>
+            <span class="m-host">${esc(a.host || '')}</span>
+          </div>
+          <div class="specs">${esc(specs) || 'no specs probed'}</div>
+          ${section('runs_os', related(m.id, 'runs_os'), 'os')}
+          ${section('has_capability', related(m.id, 'has_capability'), 'cap')}
+          ${section('has_tool', related(m.id, 'has_tool'), '')}
+        </div>`;
+    }).join('');
+  }
+
+  async function load() {
+    try {
+      const r = await fetch('/api/machines');
+      if (r.status === 401) return location.href = '/login';
+      if (r.status === 503) {
+        document.getElementById('list').innerHTML =
+          `<div class="empty">No agent on this host — the machine graph lives on the master.</div>`;
+        document.getElementById('refresh').disabled = true;
+        return;
+      }
+      document.getElementById('list').innerHTML = render(await r.json());
+      const t = await (await fetch('/api/machines/prompt')).text();
+      document.getElementById('prompt-preview').innerHTML =
+        `<div style="margin-top:14px"><b>What the planner is told:</b><pre>${esc(t)}</pre></div>`;
+    } catch (e) {
+      document.getElementById('list').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    }
+  }
+
+  document.getElementById('refresh').addEventListener('click', async e => {
+    e.target.disabled = true; e.target.textContent = 'Probing…';
+    try { await fetch('/api/machines/refresh', { method: 'POST' }); await load(); }
+    finally { e.target.disabled = false; e.target.textContent = 'Re-probe'; }
+  });
+
+  load();
+</script>

@@ -73,7 +73,7 @@ Full architecture diagrams, data model, and code sketches live in
 ## Status
 
 **Phases 1–3 and 5 are complete and live-verified** — `cargo build --workspace` and
-`cargo test --workspace` both pass cleanly (37 passed, 1 opt-in live test), and `hive task`/
+`cargo test --workspace` both pass cleanly (55 passed, 1 opt-in live test), and `hive task`/
 `hive chat` classify, plan, and execute real commands — locally, or delegated over real SSH to a
 worker running inside a supervised tmux session. See [`docs/STATUS.md`](docs/STATUS.md) for the
 full audit and [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases.
@@ -89,6 +89,14 @@ Short version:
   start a detached tmux session, stream its output live, and watch it with a Tier-1 regex +
   Tier-2 LLM-review safety layer (pulled forward from Phase 10) that pauses — not kills — a
   session that looks dangerous or off-track, logging the exact command to reattach and inspect
+- ✅ **Agent chat UI** at `/` — talk to the master agent from a browser. It classifies the
+  request, shows which model it routed to (and says so when a missing cloud key made it fall
+  back to the local model), plans, and runs. Local commands the watchdog's Tier-1 rules flag
+  stop and wait for an explicit approval in the UI instead of executing
+- ✅ **Machine knowledge graph** at `/machines` — every machine is probed (OS, arch, cores,
+  RAM, disk, GPU, installed tools) and projected into a SQLite entity/relation graph as
+  `machine ──runs_os/has_arch/has_tool/has_capability──►`. Placement is a graph query rather
+  than a hardcoded branch, and the same graph renders into the planner's prompt
 - ✅ `hive-web` is a real web terminal: tmux session dashboard, create/kill sessions running
   `claude`, `codex` or a plain shell, and a `WebSocket ↔ PTY ↔ tmux attach` bridge rendering
   into xterm.js — password-gated, mobile key bar, auto-reconnect. Deployed on the `lawfinder`

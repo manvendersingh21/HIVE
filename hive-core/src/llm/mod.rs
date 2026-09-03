@@ -89,21 +89,27 @@ impl LlmRouter {
     pub fn from_config(cfg: &LlmConfig) -> Self {
         let local = OllamaClient::new(cfg.local.base_url.clone(), cfg.local.model.clone());
 
-        let gemini = cfg.gemini.as_ref().and_then(|c| match GeminiClient::new(c) {
-            Ok(client) => Some(client),
-            Err(e) => {
-                tracing::warn!("Gemini provider not available: {e}");
-                None
-            }
-        });
+        let gemini = cfg
+            .gemini
+            .as_ref()
+            .and_then(|c| match GeminiClient::new(c) {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    tracing::warn!("Gemini provider not available: {e}");
+                    None
+                }
+            });
 
-        let claude = cfg.claude.as_ref().and_then(|c| match ClaudeClient::new(c) {
-            Ok(client) => Some(client),
-            Err(e) => {
-                tracing::warn!("Claude provider not available: {e}");
-                None
-            }
-        });
+        let claude = cfg
+            .claude
+            .as_ref()
+            .and_then(|c| match ClaudeClient::new(c) {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    tracing::warn!("Claude provider not available: {e}");
+                    None
+                }
+            });
 
         let codex = cfg.codex.as_ref().and_then(|c| match OpenAiClient::new(c) {
             Ok(client) => Some(client),
@@ -148,6 +154,11 @@ impl LlmRouter {
     /// Route a prompt to the provider recommended for `complexity`, falling
     /// back to the local model if that provider isn't configured or the
     /// request fails.
+    /// Whether the local model is reachable. See [`LocalLlm::is_available`].
+    pub async fn local_available(&self) -> bool {
+        self.local.is_available().await
+    }
+
     pub async fn route_and_execute(
         &self,
         prompt: &str,

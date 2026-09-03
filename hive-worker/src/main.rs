@@ -48,10 +48,7 @@ async fn health_check() -> &'static str {
 
 /// Receive a task assignment from the master.
 async fn receive_task(Json(task): Json<TaskAssignment>) -> Json<TaskStatus> {
-    info!(
-        "Received task '{}': {}",
-        task.task_id, task.description
-    );
+    info!("Received task '{}': {}", task.task_id, task.description);
 
     // TODO: Create tmux session, execute commands, track status
     let status = TaskStatus::running(&task.task_id, &task.tmux_session_name);

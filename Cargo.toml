@@ -5,7 +5,7 @@ members = [
     "hive-core",
     "hive-worker",
     "hive-web",
-    "hive-cli",
+    "hive-cli", "rust_api",
 ]
 
 [workspace.dependencies]

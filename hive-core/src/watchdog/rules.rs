@@ -17,12 +17,13 @@ pub struct Rule {
 /// The built-in default rule set. `ExtraRule`s from `WatchdogConfig` are
 /// appended on top of these by the caller (see `Watchdog::with_extra_rules`).
 pub fn default_rules() -> Vec<Rule> {
-    let r = |name: &'static str, pattern: &str, severity: Severity, category: SafetyCategory| Rule {
-        name,
-        pattern: Regex::new(pattern).expect("built-in watchdog regex must compile"),
-        severity,
-        category,
-    };
+    let r =
+        |name: &'static str, pattern: &str, severity: Severity, category: SafetyCategory| Rule {
+            name,
+            pattern: Regex::new(pattern).expect("built-in watchdog regex must compile"),
+            severity,
+            category,
+        };
 
     vec![
         r(
@@ -102,7 +103,10 @@ mod tests {
 
     #[test]
     fn catches_force_push() {
-        assert!(matches("force-push-or-hard-reset", "git push origin main --force"));
+        assert!(matches(
+            "force-push-or-hard-reset",
+            "git push origin main --force"
+        ));
     }
 
     #[test]

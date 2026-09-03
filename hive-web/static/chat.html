@@ -1,0 +1,300 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Hive · agent</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115; --panel: #161a21; --line: #262c38; --line2: #39424f;
+    --text: #e6e8ee; --dim: #8b93a7; --accent: #f5a623;
+    --ok: #35d07f; --bad: #ff6b6b; --warn: #ffb733;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+    font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; flex: none;
+    display: flex; align-items: center; gap: 14px; padding: 12px 18px;
+    background: #0f1115ee; backdrop-filter: blur(8px); border-bottom: 1px solid #1e242e;
+  }
+  h1 { margin: 0; font-size: 17px; letter-spacing: -0.01em; }
+  nav { display: flex; gap: 4px; margin-left: auto; }
+  nav a {
+    color: var(--dim); text-decoration: none; font-size: 13px;
+    padding: 6px 11px; border-radius: 7px;
+  }
+  nav a:hover { color: var(--text); background: var(--panel); }
+  nav a.on { color: var(--accent); background: var(--panel); }
+
+  main { flex: 1; overflow-y: auto; }
+  .wrap { max-width: 780px; margin: 0 auto; padding: 22px 18px 8px; }
+
+  .intro { color: var(--dim); font-size: 14px; padding: 32px 0; text-align: center; }
+  .intro code {
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 13px;
+    background: var(--panel); padding: 2px 6px; border-radius: 5px; color: var(--text);
+  }
+
+  .msg { margin-bottom: 22px; }
+  .msg.user .bubble {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 13px;
+    padding: 11px 15px; margin-left: auto; max-width: 82%; width: fit-content;
+  }
+  .agent-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 9px; }
+  .badge {
+    font-size: 11px; font-weight: 650; letter-spacing: 0.02em; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line2); color: var(--dim);
+  }
+  .badge.model { border-color: var(--accent); color: var(--accent); }
+  .badge.fallback { border-color: var(--bad); color: var(--bad); text-transform: none; }
+  .summary { white-space: pre-wrap; margin-bottom: 12px; }
+
+  .step {
+    border: 1px solid var(--line); border-radius: 10px; margin-bottom: 9px;
+    background: var(--panel); overflow: hidden;
+  }
+  .step-head {
+    display: flex; align-items: center; gap: 9px; padding: 9px 13px;
+    border-bottom: 1px solid transparent;
+  }
+  .step.has-body .step-head { border-bottom-color: var(--line); }
+  .step .cmd {
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 13px;
+    flex: 1; min-width: 0; overflow-x: auto; white-space: pre; padding-bottom: 2px;
+  }
+  .step .tag { font-size: 11px; color: var(--dim); flex: none; }
+  .step pre {
+    margin: 0; padding: 10px 13px; font-size: 12.5px; line-height: 1.5;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    white-space: pre-wrap; word-break: break-word; color: var(--dim);
+    max-height: 320px; overflow-y: auto;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .dot.executed, .dot.delegated { background: var(--ok); }
+  .dot.failed, .dot.denied { background: var(--bad); }
+  .dot.awaiting_approval { background: var(--warn); }
+  .dot.skipped { background: var(--line2); }
+
+  .gate { border-color: var(--warn); }
+  .gate .step-head { background: #ffb7330f; }
+  .gate-why {
+    padding: 10px 13px; font-size: 13px; color: var(--warn);
+    border-bottom: 1px solid var(--line);
+  }
+  .gate-actions { display: flex; gap: 8px; padding: 11px 13px; }
+  .gate-actions button {
+    padding: 7px 15px; border-radius: 7px; font-size: 13px; font-weight: 600; cursor: pointer;
+    border: 1px solid var(--line2); background: transparent; color: var(--text);
+  }
+  .gate-actions button.run { background: var(--warn); border-color: var(--warn); color: #17181c; }
+  .gate-actions button:hover { border-color: var(--text); }
+  .gate-actions button.run:hover { background: #ffc555; }
+  .gate-actions button:disabled { opacity: 0.45; cursor: default; }
+
+  .err { color: var(--bad); font-size: 13.5px; }
+  .thinking { color: var(--dim); font-size: 14px; display: flex; align-items: center; gap: 9px; }
+  .spin {
+    width: 12px; height: 12px; border: 2px solid var(--line2); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  footer {
+    flex: none; border-top: 1px solid #1e242e; background: var(--bg);
+    padding: 12px 18px calc(12px + env(safe-area-inset-bottom));
+  }
+  .composer { max-width: 780px; margin: 0 auto; display: flex; gap: 9px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; min-height: 44px; max-height: 160px; padding: 11px 14px;
+    font: inherit; font-size: 16px; border-radius: 11px;
+    background: var(--panel); border: 1px solid var(--line); color: var(--text);
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  .send {
+    flex: none; padding: 12px 19px; border: 0; border-radius: 11px; cursor: pointer;
+    background: var(--accent); color: #17181c; font-weight: 650; font-size: 15px;
+  }
+  .send:disabled { opacity: 0.5; cursor: default; }
+</style>
+
+<header>
+  <h1>🐝 Hive</h1>
+  <nav>
+    <a href="/" class="on">Agent</a>
+    <a href="/sessions">Sessions</a>
+    <a href="/machines">Machines</a>
+  </nav>
+</header>
+
+<main><div class="wrap" id="feed">
+  <div class="intro" id="intro">
+    Ask the agent to do something. It classifies the task, picks a model, plans,
+    and runs it.<br>Anything the watchdog flags stops and waits for you.
+    <br><br>Try <code>how much disk space is left?</code>
+  </div>
+</div></main>
+
+<footer><div class="composer">
+  <textarea id="input" rows="1" placeholder="Ask the agent…"
+            autocapitalize="sentences" autocorrect="on"></textarea>
+  <button class="send" id="send">Send</button>
+</div></footer>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const feed = $('feed'), input = $('input'), send = $('send');
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  const PROVIDER = {
+    Local: 'local · qwen2.5', GeminiFlash: 'gemini flash',
+    Claude: 'claude', Codex: 'codex'
+  };
+  const label = p => PROVIDER[p] || String(p).toLowerCase();
+
+  const scroll = () => feed.parentElement.scrollTo({ top: feed.scrollHeight, behavior: 'smooth' });
+
+  function addUser(text) {
+    $('intro')?.remove();
+    const el = document.createElement('div');
+    el.className = 'msg user';
+    el.innerHTML = `<div class="bubble">${esc(text)}</div>`;
+    feed.appendChild(el);
+    scroll();
+  }
+
+  function addAgent() {
+    const el = document.createElement('div');
+    el.className = 'msg agent';
+    el.innerHTML = `<div class="thinking"><span class="spin"></span>planning…</div>`;
+    feed.appendChild(el);
+    scroll();
+    return el;
+  }
+
+  // A step whose outcome is `awaiting_approval` renders with the command the
+  // server is holding — the browser never sends a command back, only an id.
+  function stepHtml(step, outcome) {
+    const status = outcome?.status ?? 'skipped';
+    const body = (outcome?.output ?? '').trim();
+    const gated = status === 'awaiting_approval';
+    const where = step.target.kind === 'remote'
+      ? (step.target.worker ? `remote · ${esc(step.target.worker)}` : 'remote · no worker')
+      : 'local';
+
+    if (gated) {
+      return `
+        <div class="step gate has-body" data-step="${step.id}">
+          <div class="step-head">
+            <span class="dot awaiting_approval"></span>
+            <span class="cmd">${esc(step.command)}</span>
+            <span class="tag">${where}</span>
+          </div>
+          <div class="gate-why">⚠ ${esc(step.risk?.reason || 'Flagged by the safety watchdog.')}</div>
+          <div class="gate-actions">
+            <button class="run" data-approve="${step.id}">Run it</button>
+            <button data-deny="${step.id}">Skip</button>
+          </div>
+        </div>`;
+    }
+    return `
+      <div class="step ${body ? 'has-body' : ''}">
+        <div class="step-head">
+          <span class="dot ${esc(status)}"></span>
+          <span class="cmd">${esc(step.command) || '<em>no command</em>'}</span>
+          <span class="tag">${where} · ${esc(status.replace(/_/g, ' '))}</span>
+        </div>
+        ${body ? `<pre>${esc(body)}</pre>` : ''}
+      </div>`;
+  }
+
+  function render(el, reply) {
+    const { run, result } = reply;
+    const byId = Object.fromEntries(result.outcomes.map(o => [o.id, o]));
+    el.dataset.runId = run.id;
+    el.innerHTML = `
+      <div class="agent-head">
+        <span class="badge">${esc(run.complexity)}</span>
+        <span class="badge model">${esc(label(run.provider))}</span>
+        ${run.routed_provider !== run.provider
+          ? `<span class="badge fallback" title="${esc(label(run.routed_provider))} was not configured or failed, so the local model handled it">
+               fell back from ${esc(label(run.routed_provider))}
+             </span>` : ''}
+      </div>
+      <div class="summary">${esc(result.summary)}</div>
+      ${run.steps.map(s => stepHtml(s, byId[s.id])).join('')}`;
+    wireGates(el);
+    scroll();
+  }
+
+  function wireGates(el) {
+    el.querySelectorAll('[data-approve], [data-deny]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const approve = btn.hasAttribute('data-approve');
+        const id = Number(btn.dataset.approve ?? btn.dataset.deny);
+        el.querySelectorAll('.gate-actions button').forEach(b => b.disabled = true);
+        btn.textContent = approve ? 'Running…' : 'Skipping…';
+
+        const body = approve ? { approved: [id] } : { denied: [id] };
+        try {
+          const r = await fetch(`/api/chat/${encodeURIComponent(el.dataset.runId)}/approve`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body)
+          });
+          if (!r.ok) throw new Error(await r.text());
+          render(el, await r.json());
+        } catch (e) {
+          el.insertAdjacentHTML('beforeend', `<div class="err">${esc(e.message)}</div>`);
+        }
+      });
+    });
+  }
+
+  async function submit() {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = ''; input.style.height = 'auto';
+    send.disabled = true;
+    addUser(text);
+    const el = addAgent();
+    try {
+      const r = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message: text })
+      });
+      if (r.status === 401) return location.href = '/login';
+      if (!r.ok) throw new Error(await r.text());
+      render(el, await r.json());
+    } catch (e) {
+      el.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    } finally {
+      send.disabled = false;
+      input.focus();
+    }
+  }
+
+  send.addEventListener('click', submit);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+  });
+  input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+  });
+
+  // Hide chat where there is no agent (this binary also runs on workers).
+  fetch('/api/capabilities').then(r => r.json()).then(c => {
+    if (!c.chat) {
+      $('intro').innerHTML =
+        'No agent on this host — this instance serves terminals only.<br>' +
+        'Head to <a href="/sessions" style="color:var(--accent)">Sessions</a>.';
+      input.disabled = send.disabled = true;
+      input.placeholder = 'Agent not available on this host';
+    }
+  }).catch(() => {});
+</script>

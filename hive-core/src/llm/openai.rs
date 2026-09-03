@@ -59,7 +59,10 @@ impl OpenAiClient {
 
     /// Send a single-turn completion request.
     pub async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
-        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.base_url.trim_end_matches('/')
+        );
         let req = ChatCompletionsRequest {
             model: &self.model,
             messages: vec![Message {

@@ -136,7 +136,8 @@ async fn main() -> anyhow::Result<()> {
 /// instead of every worker booting `Offline`).
 async fn build_agent(project_root: &Path) -> anyhow::Result<MasterAgent> {
     let config = HiveConfig::from_project_root(project_root)?;
-    let workers_config = WorkersConfig::from_project_root(project_root).unwrap_or(WorkersConfig { workers: vec![] });
+    let workers_config =
+        WorkersConfig::from_project_root(project_root).unwrap_or(WorkersConfig { workers: vec![] });
 
     let llm = LlmRouter::from_config(&config.llm);
     let mut workers = WorkerPool::new(workers_config.workers);

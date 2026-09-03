@@ -183,7 +183,9 @@ pub struct AiContext {
 // ---------------------------------------------------------------------------
 
 /// Priority levels for task scheduling and execution ordering.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPriority {
     Low,
@@ -338,7 +340,10 @@ impl Complexity {
             "CODE_HEAVY" | "CODEHEAVY" | "CODE-HEAVY" => Complexity::CodeHeavy,
             _ => {
                 // Default to Medium if the LLM gives an unexpected response
-                tracing::warn!("Unknown complexity classification: '{}', defaulting to Medium", s);
+                tracing::warn!(
+                    "Unknown complexity classification: '{}', defaulting to Medium",
+                    s
+                );
                 Complexity::Medium
             }
         }
@@ -423,7 +428,9 @@ impl std::fmt::Display for WorkerStatus {
 // ---------------------------------------------------------------------------
 
 /// Severity levels for safety incidents.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     /// Unusual but probably fine (e.g., unexpected warning).
@@ -601,7 +608,10 @@ mod tests {
         assert_eq!(task.commands.len(), 1);
         assert_eq!(task.commands[0].working_dir, Some("/tmp".to_string()));
         assert_eq!(task.commands[0].timeout_secs, Some(30));
-        assert_eq!(task.commands[0].env_vars.get("FOO"), Some(&"bar".to_string()));
+        assert_eq!(
+            task.commands[0].env_vars.get("FOO"),
+            Some(&"bar".to_string())
+        );
     }
 
     #[test]
@@ -622,11 +632,23 @@ mod tests {
     #[test]
     fn test_complexity_parsing() {
         assert_eq!(Complexity::from_llm_output("SIMPLE"), Complexity::Simple);
-        assert_eq!(Complexity::from_llm_output("  medium  "), Complexity::Medium);
+        assert_eq!(
+            Complexity::from_llm_output("  medium  "),
+            Complexity::Medium
+        );
         assert_eq!(Complexity::from_llm_output("COMPLEX"), Complexity::Complex);
-        assert_eq!(Complexity::from_llm_output("CODE_HEAVY"), Complexity::CodeHeavy);
-        assert_eq!(Complexity::from_llm_output("CODEHEAVY"), Complexity::CodeHeavy);
-        assert_eq!(Complexity::from_llm_output("CODE-HEAVY"), Complexity::CodeHeavy);
+        assert_eq!(
+            Complexity::from_llm_output("CODE_HEAVY"),
+            Complexity::CodeHeavy
+        );
+        assert_eq!(
+            Complexity::from_llm_output("CODEHEAVY"),
+            Complexity::CodeHeavy
+        );
+        assert_eq!(
+            Complexity::from_llm_output("CODE-HEAVY"),
+            Complexity::CodeHeavy
+        );
         // Unknown defaults to Medium
         assert_eq!(Complexity::from_llm_output("banana"), Complexity::Medium);
     }
@@ -634,9 +656,18 @@ mod tests {
     #[test]
     fn test_complexity_provider_mapping() {
         assert_eq!(Complexity::Simple.recommended_provider(), AiProvider::Local);
-        assert_eq!(Complexity::Medium.recommended_provider(), AiProvider::GeminiFlash);
-        assert_eq!(Complexity::Complex.recommended_provider(), AiProvider::Claude);
-        assert_eq!(Complexity::CodeHeavy.recommended_provider(), AiProvider::Codex);
+        assert_eq!(
+            Complexity::Medium.recommended_provider(),
+            AiProvider::GeminiFlash
+        );
+        assert_eq!(
+            Complexity::Complex.recommended_provider(),
+            AiProvider::Claude
+        );
+        assert_eq!(
+            Complexity::CodeHeavy.recommended_provider(),
+            AiProvider::Codex
+        );
     }
 
     #[test]

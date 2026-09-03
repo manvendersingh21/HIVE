@@ -1,14 +1,43 @@
 //! Memory system — project-scoped conversation history, knowledge graph, and RAG.
 
+pub mod graph;
+pub mod machines;
+
+use std::path::Path;
+
+use graph::KnowledgeGraph;
+
 /// The unified memory system.
+///
+/// The knowledge graph is live; RAG, the project registry, and conversation
+/// history are still Phase 9.
 pub struct MemorySystem {
-    // TODO: KnowledgeGraph, RagIndex, ProjectRegistry, SqlitePool
+    /// Persistent entity/relation graph. Currently holds the machine fleet
+    /// (see [`machines`]); projects and conversations land here in Phase 9.
+    pub graph: KnowledgeGraph,
+    // TODO: RagIndex, ProjectRegistry
 }
 
 impl MemorySystem {
-    /// Create a new (empty) memory system.
+    /// Open the memory system backed by a database at `path`.
+    ///
+    /// A database that cannot be opened degrades to an in-memory graph with a
+    /// warning rather than failing startup — losing memory should not stop the
+    /// agent from answering.
+    pub fn open(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        let graph = KnowledgeGraph::open(path).unwrap_or_else(|e| {
+            tracing::warn!(path = %path.display(), error = %e, "could not open knowledge graph on disk, using in-memory");
+            KnowledgeGraph::in_memory().expect("in-memory SQLite is always available")
+        });
+        Self { graph }
+    }
+
+    /// Create a new memory system with an ephemeral graph.
     pub fn new() -> Self {
-        Self {}
+        Self {
+            graph: KnowledgeGraph::in_memory().expect("in-memory SQLite is always available"),
+        }
     }
 
     /// Retrieve relevant context for a user message within a project.

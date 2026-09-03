@@ -47,7 +47,10 @@ impl ToolRegistry {
 
     /// Look up a tool by name.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.as_ref())
     }
 
     /// Iterate over all registered tools (e.g. to build LLM tool definitions).

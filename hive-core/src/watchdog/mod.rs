@@ -31,8 +31,9 @@ impl Watchdog {
         for extra in &config.extra_rules {
             let severity = parse_severity(&extra.severity)?;
             let category = parse_category(&extra.category)?;
-            let pattern = regex::Regex::new(&extra.pattern)
-                .map_err(|e| anyhow::anyhow!("invalid extra_rules pattern '{}': {e}", extra.pattern))?;
+            let pattern = regex::Regex::new(&extra.pattern).map_err(|e| {
+                anyhow::anyhow!("invalid extra_rules pattern '{}': {e}", extra.pattern)
+            })?;
             rules.push(rules::Rule {
                 name: "extra_rule",
                 pattern,

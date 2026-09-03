@@ -17,6 +17,10 @@
   h1 { margin: 0; font-size: 17px; letter-spacing: -0.01em; }
   .host { color: #8b93a7; font-size: 12px; font-family: ui-monospace, SFMono-Regular, monospace; }
   .spacer { flex: 1; }
+  nav { display: flex; gap: 4px; }
+  nav a { color: #8b93a7; text-decoration: none; font-size: 13px; padding: 6px 11px; border-radius: 7px; }
+  nav a:hover { color: #e6e8ee; background: #161a21; }
+  nav a.on { color: #f5a623; background: #161a21; }
   main { max-width: 720px; margin: 0 auto; padding: 18px; }
   .new {
     display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px;
@@ -63,6 +67,11 @@
   <h1>🐝 Hive</h1>
   <span class="host" id="host"></span>
   <span class="spacer"></span>
+  <nav>
+    <a href="/">Agent</a>
+    <a href="/sessions" class="on">Sessions</a>
+    <a href="/machines">Machines</a>
+  </nav>
   <button class="ghost" onclick="fetch('/logout',{method:'POST'}).then(()=>location.href='/login')">
     Sign out
   </button>

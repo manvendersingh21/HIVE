@@ -50,6 +50,23 @@ impl OllamaClient {
     }
 
     /// Send a multi-turn chat completion request.
+    /// Cheap reachability probe against the Ollama server.
+    ///
+    /// The same binary runs on workers that have no local model; callers use
+    /// this to decide whether to offer agent features at all, rather than
+    /// advertising a chat that fails on the first message.
+    pub async fn is_available(&self) -> bool {
+        let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
+        matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                self.http.get(&url).send(),
+            )
+            .await,
+            Ok(Ok(response)) if response.status().is_success()
+        )
+    }
+
     pub async fn chat(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let req = ChatRequest {
@@ -59,9 +76,7 @@ impl OllamaClient {
         };
 
         let resp = self.http.post(&url).json(&req).send().await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to reach Ollama at {url}: {e} (is `ollama serve` running?)"
-            )
+            anyhow::anyhow!("Failed to reach Ollama at {url}: {e} (is `ollama serve` running?)")
         })?;
 
         if !resp.status().is_success() {

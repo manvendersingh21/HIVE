@@ -40,9 +40,13 @@ pub struct HiveConfig {
 impl HiveConfig {
     /// Load configuration from a TOML file.
     pub fn from_file(path: &Path) -> HiveResult<Self> {
-        let content = std::fs::read_to_string(path).map_err(|e| HiveError::Config(
-            format!("Failed to read config file '{}': {}", path.display(), e),
-        ))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            HiveError::Config(format!(
+                "Failed to read config file '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
 
         toml::from_str(&content).map_err(|e| HiveError::ConfigParse {
             path: path.display().to_string(),
@@ -217,9 +221,7 @@ impl DatabaseConfig {
 
 /// Get the user's home directory (compatible helper).
 fn dirs_compat() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
+    std::env::var("HOME").ok().map(PathBuf::from)
 }
 
 /// Skill system settings.
@@ -419,9 +421,13 @@ pub struct WorkersConfig {
 impl WorkersConfig {
     /// Load workers configuration from a TOML file.
     pub fn from_file(path: &Path) -> HiveResult<Self> {
-        let content = std::fs::read_to_string(path).map_err(|e| HiveError::Config(
-            format!("Failed to read workers config '{}': {}", path.display(), e),
-        ))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            HiveError::Config(format!(
+                "Failed to read workers config '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
 
         toml::from_str(&content).map_err(|e| HiveError::ConfigParse {
             path: path.display().to_string(),
@@ -456,7 +462,10 @@ mod tests {
         let db_config = DatabaseConfig {
             path: "/var/data/hive.db".to_string(),
         };
-        assert_eq!(db_config.resolved_path(), PathBuf::from("/var/data/hive.db"));
+        assert_eq!(
+            db_config.resolved_path(),
+            PathBuf::from("/var/data/hive.db")
+        );
     }
 
     #[test]
@@ -502,7 +511,10 @@ entity_dedup_threshold = 0.85
         assert_eq!(config.llm.local.max_context, 8192);
         assert_eq!(config.web.auth_username, "hive");
         assert_eq!(config.memory.embedding_model, "nomic-embed-text");
-        assert_eq!(config.memory.knowledge_graph.max_entities_per_conversation, 20);
+        assert_eq!(
+            config.memory.knowledge_graph.max_entities_per_conversation,
+            20
+        );
         assert!(config.watchdog.enabled); // default
     }
 

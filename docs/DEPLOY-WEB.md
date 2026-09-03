@@ -74,3 +74,55 @@ Two consequences worth knowing:
   session kind at creation.
 - `codex` refuses to start outside a git repo, so it is launched with
   `--skip-git-repo-check`.
+
+---
+
+## The master instance (agent UI)
+
+The same binary runs on the Mac Mini, where it additionally serves the agent
+chat and the machine graph. It decides which of the two modes it is in by
+**probing for a local model**, not by reading config: a host with no reachable
+Ollama serves terminals only and says so through `/api/capabilities`, so the UI
+hides the chat rather than offering one that fails on the first message.
+
+| | master (`manus-mac-mini`) | worker (`lawfinder`) |
+|:---|:---|:---|
+| URL | `http://100.121.248.111:8090` | `http://100.93.65.98:8090` |
+| Chat | yes | no — `/api/chat` returns 503 |
+| Terminal | yes | yes |
+| Supervisor | launchd `dev.hive.web` | systemd `hive-web` |
+
+Master service files:
+
+| Path | Purpose |
+|:---|:---|
+| `~/Library/LaunchAgents/dev.hive.web.plist` | launchd job, `RunAtLoad` + `KeepAlive` |
+| `scripts/run-hive-web.sh` | wrapper: loads the env file, sets bind address and PATH |
+| `~/.config/hive/web.env` | `HIVE_WEB_PASSWORD` (mode 600 — the plist is world-readable) |
+| `~/.hive/hive.db` | SQLite knowledge graph |
+| `~/.hive/web.log` | combined stdout/stderr |
+
+```bash
+launchctl unload ~/Library/LaunchAgents/dev.hive.web.plist
+launchctl load   ~/Library/LaunchAgents/dev.hive.web.plist
+tail -f ~/.hive/web.log
+```
+
+The wrapper sets `PATH` explicitly because launchd starts jobs with a minimal
+one that excludes Homebrew — without it, `ollama` and the agentic CLIs are
+invisible to the agent even though they work in your shell.
+
+## The local approval gate
+
+`POST /api/chat` plans, runs everything the watchdog is happy with, and stops at
+anything its Tier-1 rules flag. Those steps come back as `awaiting_approval` and
+are resumed through `POST /api/chat/{run_id}/approve`.
+
+The plan is held **server-side** between the two calls. The browser sends step
+ids, never command text, so an approval cannot be turned into a different
+command than the one the user was shown. A completed run is dropped from the
+pending map, so replaying an approval returns 404 rather than re-running it.
+
+Only local execution is gated this way. Delegated remote steps are supervised
+live by the same watchdog once their tmux session starts, which is a stronger
+guarantee than a pre-flight check — it keeps watching after the command begins.

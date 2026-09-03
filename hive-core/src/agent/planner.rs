@@ -1,6 +1,6 @@
 //! Task planner — decomposes user requests into subtasks via the LLM router.
 
-use hive_common::Complexity;
+use hive_common::{AiProvider, Complexity};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::LlmRouter;
@@ -12,6 +12,18 @@ pub struct TaskPlan {
     pub summary: String,
     /// Individual subtasks to execute.
     pub subtasks: Vec<SubTask>,
+    /// Which provider actually produced this plan. This is not always the one
+    /// the complexity router asked for — an unconfigured or failing cloud
+    /// provider falls back to the local model, and callers that display a
+    /// model badge need the truth rather than the intent.
+    #[serde(default = "default_provider")]
+    pub provider_used: AiProvider,
+}
+
+/// The planner deserializes `TaskPlan` straight from model output, which never
+/// contains this field — it is stamped on afterwards from the LLM response.
+fn default_provider() -> AiProvider {
+    AiProvider::Local
 }
 
 /// A single subtask within a plan.
@@ -73,7 +85,10 @@ impl Planner {
         let response = llm.route_and_execute(&prompt, complexity).await?;
 
         match extract_plan(&response.text) {
-            Ok(plan) => Ok(plan),
+            Ok(mut plan) => {
+                plan.provider_used = response.provider;
+                Ok(plan)
+            }
             Err(e) => {
                 tracing::warn!(
                     "Planner couldn't parse a JSON plan ({e}), falling back to a single \
@@ -87,6 +102,7 @@ impl Planner {
                         commands: vec![],
                         expected_behavior: None,
                     }],
+                    provider_used: response.provider,
                 })
             }
         }
@@ -136,6 +152,16 @@ mod tests {
         let plan = extract_plan(text).unwrap();
         assert_eq!(plan.summary, "s");
         assert!(plan.subtasks.is_empty());
+    }
+
+    #[test]
+    fn extracted_plan_defaults_provider_then_is_stamped_with_the_real_one() {
+        // Model output never carries `provider_used`; it must deserialize
+        // anyway, and the caller overwrites it with whoever actually answered.
+        let mut plan = extract_plan(r#"{"summary":"s","subtasks":[]}"#).expect("parses");
+        assert_eq!(plan.provider_used, AiProvider::Local);
+        plan.provider_used = AiProvider::Claude;
+        assert_eq!(plan.provider_used, AiProvider::Claude);
     }
 
     #[test]

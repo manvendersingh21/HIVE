@@ -784,6 +784,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures",
  "hive-common",
  "openssh",
  "ractor",
@@ -811,6 +812,7 @@ dependencies = [
  "chrono",
  "futures",
  "hive-common",
+ "hive-core",
  "openssh",
  "portable-pty",
  "serde",
@@ -1735,6 +1737,10 @@ dependencies = [
  "serde_json",
  "smallvec",
 ]
+
+[[package]]
+name = "rust_api"
+version = "0.1.0"
 
 [[package]]
 name = "rustc-hash"
