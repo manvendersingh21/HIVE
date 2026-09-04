@@ -65,3 +65,29 @@ achieved with codex only this session.
 The claude leg remains unexercised (account session limit, resets 07:30 America/Los_Angeles).
 Not a protocol finding; rerun is free once the limit clears. Scratch evidence retained at
 `$TMPDIR/opencode/phase-s/` (sink log, `ingested.jsonl`, both agent dirs, adapter logs).
+
+---
+
+## Live HACP/2.0 runs (2026-09-04, W6)
+
+Real CLI pairs over the file edge via `interop/live/hacp-live.py` — settled:
+`claude×codex` and `agy×opencode` (9 frames each, accept verdicts, all verifier
+checks adapter-corroborated). Transcripts committed under `interop/live/transcripts/`.
+The claude leg above is now exercised. New findings:
+
+8. **Narrated success without an artifact is common and confident.** Two different CLIs
+   (opencode/qwen3.8-max twice, agy once) replied "created and validated on disk" /
+   "I have created … using the file-writing tool" while the file did not exist at the
+   expected path. The adapter's check-file-exists-before-believing rule (§9.4 applied to
+   agents, not just to verdicts) is what kept the runs honest; a retry with an explicit
+   "your previous reply did not create the file" note recovers some cases but not all.
+   Never promote an agent's self-report to evidence.
+
+9. **Briefs must carry absolute paths.** agy (antigravity) resolves "the current
+   directory" to `~/.gemini/antigravity-cli/scratch/`, ignoring the process cwd; its
+   `--add-dir <workspace>` flag plus absolute paths in the brief fixes it. Every
+   file-producing brief in `hacp-live.py` now names the absolute target path.
+
+10. **Exit codes remain meaningless.** Every CLI call in both settled runs exited 0 —
+    including the ones that produced nothing (finding 8). Consistent with finding 4:
+    adapters must derive outcome from artifacts, never from exit status.

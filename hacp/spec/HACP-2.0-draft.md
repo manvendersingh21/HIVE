@@ -474,3 +474,10 @@ different protocols that share a philosophy.
   of `{contract_id, revision, content}` — because an implementer working from the spec
   alone could not previously recompute a freeze digest. Artifacts, evidence, and
   verification implemented (§9) with schemas committed. (W5–W6)
+- 2026-09-04: live heterogeneous runs (W6): two cross-lab CLI pairs (claude×codex,
+  agy×opencode) completed the full bilateral lifecycle over the file edge with real
+  agents authoring terms, reviewing contracts, executing, and verifying; adapters
+  corroborate every claimed check before an accept is emitted (§9.4 applied to
+  agents). Findings 8–10 in `docs/findings/adapter-edge.md`: agents narrate success
+  without artifacts, briefs need absolute paths, exit codes stay meaningless — all
+  adapter-level, no spec semantics changed. (W6)

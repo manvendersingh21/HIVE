@@ -114,6 +114,25 @@ frame-for-frame agreement between their two views of the exchange. The peer's ne
 pinned digest preimage was caught as a spec defect and fixed (spec changelog, §7.5):
 that is the leak test working.
 
+### Live heterogeneous runs (2026-09-04)
+
+Not scripts pretending to be agents — real CLIs as the two minds, `interop/live/hacp-live.py`
+as their hands. The supervisor CLI authors the contract terms; the worker CLI reviews the
+proposal and executes the frozen contract; the supervisor CLI verifies for real; the adapter
+mechanically re-verifies every claimed check before any `accept` goes on the wire (§9.4).
+
+| Pair | Result | Frames | Verdict | Corroborated checks |
+|:---|:---|:---|:---|:---|
+| claude (sup) × codex (wrk) | settled | 9 | accept | 4 |
+| agy (sup) × opencode (wrk) | settled | 9 | accept | 3 |
+
+Transcripts + run reports: `interop/live/transcripts/`. Two failures were observed on
+other pairings/roles and are recorded as findings 8–10 in
+[`findings/adapter-edge.md`](findings/adapter-edge.md) — the headline: two different CLIs
+narrated successful file creation that never happened, and the adapter's evidence-over-signals
+rule refused both. The protocol's core bet — verification is mechanical, not social — held
+against real agents lying (confidently, unintentionally) to it.
+
 ---
 
 ## 2. What the spec deliberately does not say, and Hive does
