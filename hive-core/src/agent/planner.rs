@@ -171,11 +171,18 @@ impl Planner {
                  }}\n  \
                ]\n\
              }}\n\n\
-             Set required_capabilities only when the work genuinely needs them, choosing \
-             from: gpu-compute (CUDA/GPU work), local-inference (running a local LLM), \
-             containers (docker), build (compiling), database, batch-scheduler. Leave it \
-             empty for ordinary shell commands — an unnecessary requirement can leave a \
-             task unplaceable.\n\
+             required_capabilities lists what the TARGET MACHINE must provide. Match the \
+             command to the capability it needs:\n  \
+               nvidia-smi, nvcc, CUDA, torch.cuda, training a model  -> [\"gpu-compute\"]\n  \
+               docker, podman, containers                            -> [\"containers\"]\n  \
+               cargo build, make, compiling                          -> [\"build\"]\n  \
+               ollama, running a local LLM                           -> [\"local-inference\"]\n  \
+               sbatch, srun, queueing a job                          -> [\"batch-scheduler\"]\n  \
+               psql, database queries                                -> [\"database\"]\n  \
+               ls, df, uname, echo, grep and other ordinary commands -> []\n\
+             If the request names a hardware or software requirement (\"a machine with \
+             GPUs\"), that IS a required capability — list it. An unnecessary requirement \
+             can leave a task unplaceable, so do not invent ones the work does not need.\n\
              Use requires_remote=true only if the task must run on a separate worker \
              machine. When you do, write the command exactly as it should run ON that \
              machine — do NOT wrap it in ssh, and do not name the machine in the command. \

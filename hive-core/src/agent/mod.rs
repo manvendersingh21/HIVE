@@ -21,6 +21,13 @@ use run::{
     StepStatus, StepTarget,
 };
 
+/// The capability every supervised remote subtask needs, whatever the work is.
+///
+/// Anything a caller asks for *beyond* this came from the planner because the
+/// task genuinely needs it, and must not be silently substituted away — see
+/// [`MasterAgent::choose_worker`].
+const BASELINE_CAPABILITY: &str = "supervised-sessions";
+
 /// The master agent — central intelligence of the Hive system.
 ///
 /// Receives user requests, plans tasks, classifies complexity,
@@ -252,7 +259,7 @@ impl MasterAgent {
             let target = if subtask.requires_remote {
                 // Ask the graph for a machine that can actually do this work,
                 // rather than any machine at all.
-                let mut needed: Vec<&str> = vec!["supervised-sessions"];
+                let mut needed: Vec<&str> = vec![BASELINE_CAPABILITY];
                 needed.extend(subtask.required_capabilities.iter().map(String::as_str));
                 match self.choose_worker(&needed) {
                     Some(worker) => StepTarget::Remote {
@@ -374,19 +381,38 @@ impl MasterAgent {
                     }),
                 },
                 StepTarget::Remote { worker } => {
-                    let selected = self
-                        .workers
-                        .workers
-                        .iter()
-                        .find(|w| &w.info.name == worker)
-                        .or_else(|| self.workers.select_worker());
+                    // Honor the machine the plan named, and only that machine.
+                    //
+                    // Planning already asked the knowledge graph for a host with
+                    // the capabilities this step needs, so the name is a
+                    // decision, not a hint. Silently substituting the
+                    // least-loaded worker undoes that: a CUDA step planned for
+                    // the GPU box would run on one without a GPU and fail
+                    // confusingly. Only an unnamed target (the graph had no
+                    // opinion) falls back to least-loaded.
+                    let selected = if worker.is_empty() {
+                        self.workers.select_worker()
+                    } else {
+                        self.workers
+                            .workers
+                            .iter()
+                            .find(|w| &w.info.name == worker && w.is_online())
+                    };
 
                     let Some(node) = selected else {
                         outcomes.push(StepOutcome {
                             id: step.id,
                             command: step.command.clone(),
                             status: StepStatus::Failed,
-                            output: "No worker is online to take this step.".into(),
+                            output: if worker.is_empty() {
+                                "No worker is online to take this step.".to_string()
+                            } else {
+                                format!(
+                                    "Worker '{worker}' was planned for this step but is not \
+                                     online. Not substituting another machine — it was chosen \
+                                     for capabilities the others may not have."
+                                )
+                            },
                         });
                         continue;
                     };
@@ -470,14 +496,30 @@ impl MasterAgent {
         let ranked = machines::machines_with_capabilities(&self.memory.graph, capabilities)
             .unwrap_or_default();
 
-        ranked
-            .iter()
-            .find_map(|m| {
-                self.workers.workers.iter().find(|w| {
-                    w.info.name == m.name && w.is_online()
-                })
-            })
-            .or_else(|| self.workers.select_worker())
+        let matched = ranked.iter().find_map(|m| {
+            self.workers
+                .workers
+                .iter()
+                .find(|w| w.info.name == m.name && w.is_online())
+        });
+        if matched.is_some() {
+            return matched;
+        }
+
+        // Nothing in the graph matched. Falling back to "any online worker" is
+        // right for an ordinary command — the graph may simply not be seeded
+        // yet — but wrong when the caller asked for something specific:
+        // running a CUDA job on a box with no GPU fails in a far more
+        // confusing way than being told no machine has `gpu-compute`.
+        let asked_for_specifics = capabilities.iter().any(|c| *c != BASELINE_CAPABILITY);
+        if asked_for_specifics {
+            warn!(
+                required = ?capabilities,
+                "no online worker has the required capabilities"
+            );
+            return None;
+        }
+        self.workers.select_worker()
     }
 
     /// Re-probe every machine (the master and all configured workers) and
