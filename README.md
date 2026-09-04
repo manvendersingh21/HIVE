@@ -72,6 +72,14 @@ Full architecture diagrams, data model, and code sketches live in
 
 ## Status
 
+**The HACP/2.0 agent-collaboration protocol is designed, specified, implemented, and
+proven** — a bilateral contract protocol with an independent second implementation
+and live cross-vendor runs (claude×codex, agy×opencode) settling real lifecycles.
+The full story, commit by commit, is in
+[`docs/PROJECT-RECORD.md`](docs/PROJECT-RECORD.md); the protocol's own map is
+[`docs/HACP-HIVE.md`](docs/HACP-HIVE.md) and its testing method is
+[`docs/TESTING-YOUR-PROTOCOL.md`](docs/TESTING-YOUR-PROTOCOL.md).
+
 **Phases 1–5 are complete and live-verified** — `cargo build --workspace` and
 `cargo test --workspace` both pass cleanly (95 passed, 1 opt-in live test), and `hive task`/
 `hive chat` classify, plan, and execute real commands — locally, or delegated over real SSH to
