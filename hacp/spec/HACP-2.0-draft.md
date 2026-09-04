@@ -264,9 +264,12 @@ either bound without agreement is `NO_AGREEMENT`, never an implicit freeze.
 
 ### 7.5 Freeze, EXECUTE, SUBMIT
 
-- **FREEZE** makes the contract revision immutable: both participants record the canonical
-  digest of revision N; every later reference (submissions, verdicts, amendments) names that
-  digest.
+- **FREEZE** makes the contract revision immutable: both participants record the digest
+  of revision N, taken over the canonical form (§5.1) of
+  `{"contract_id": <id>, "revision": <N>, "content": <terms>}`; every later reference
+  (submissions, verdicts, amendments) names that digest. The preimage is pinned here so
+  two independent implementations verify a freeze against each other, not against a
+  library.
 - **EXECUTE** is the state between freeze and submission. It is entered implicitly on freeze;
   no wire message is required or defined for entry. It is observable through liveness
   (heartbeats) and terminated by `submission.delivered`.
@@ -466,3 +469,8 @@ different protocols that share a philosophy.
   Kernel, session, and contract engines implemented with conformance vectors and golden
   transcripts `bilateral-lifecycle`, `bilateral-no-agreement`; canonical schemas committed for
   envelope, agent, session, contract. (W4)
+- 2026-09-04: §7.5 clarification (leak-test catch, reported by the independent peer's
+  requirements): the revision-digest preimage is now pinned normatively — canonical form
+  of `{contract_id, revision, content}` — because an implementer working from the spec
+  alone could not previously recompute a freeze digest. Artifacts, evidence, and
+  verification implemented (§9) with schemas committed. (W5–W6)

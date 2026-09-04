@@ -68,6 +68,54 @@ test result: ok. 39 passed; 0 failed; 0 ignored
 
 ---
 
+## 6. HACP/2.0 — where the redesign stands
+
+Design lives in [`hacp/spec/HACP-2.0-draft.md`](../hacp/spec/HACP-2.0-draft.md) with its
+section-freeze ledger; the boundary decisions are
+[`adr/ADR-0001`](adr/ADR-0001-hacp-core-is-bilateral.md). Same honesty rule as §1: a row
+moves to ✅ only after the proving command ran.
+
+| 2.0 element | Where | Status |
+|:---|:---|:---|
+| Canonical form + digests (§5.1) | `hacp/src/v2/canon.rs` | ✅ rule-pinning vectors incl. independently computed digest vectors |
+| Envelope + kind registry (§5.2–§5.3) | `hacp/src/v2/envelope.rs` | ✅ incl. no-execute-kind and forward-compat round-trip vectors |
+| Agents + capability vocabulary (§3, §6.3) | `hacp/src/v2/agent.rs` | ✅ shape vectors |
+| Bilateral sessions, observers (§6) | `hacp/src/v2/session.rs` | ✅ observers-cannot-author, lifecycle-events-only, feature-intersection vectors |
+| Contract engine (§7) | `hacp/src/v2/contract.rs` | ✅ full §7.3 machine incl. implicit EXECUTE, NoAgreement terminals, immutable revision digests |
+| Artifacts + provenance (§9.1) | `hacp/src/v2/artifact.rs` | ✅ uuid4/digest shapes, ancestry walk refusing cycles, visibility ladder |
+| Evidence (§9.2) | `hacp/src/v2/evidence.rs` | ✅ shape vectors |
+| Verification, evidence-over-signals (§9.3–§9.4) | `hacp/src/v2/verification.rs` | ✅ accept-without-basis refused by construction; attestation closure |
+| Canonical JSON schemas (§14) | `hacp/spec/schemas/*.json` | ✅ 7 schemas behind the drift gate (`cargo run -p hacp --bin emit-schemas`) |
+| Golden wire transcripts (§14) | `hacp/tests/golden/*.jsonl` | ✅ lifecycle + no-agreement, replayed on every test run |
+| **Independent interop peer** (§14 Independence) | `interop/peer-python/peer.py` | ✅ Python stdlib, spec+schemas only; see below |
+| Phase 3 exit test (ADR-0001) | `hacp/tests/v2_interop.rs` | ✅ reference ↔ independent peer, file edge, mutual transcript agreement |
+| Delegation/CapabilityGrant objects (§8) | — | ⬜ types only inside Contract today; full grant machinery is Phase 4 |
+| Cross-branch permits, escalation engine (§10–§11) | — | ⬜ spec frozen; Phase 4+ |
+| HIVE profile module (§13) | — | ⬜ spec frozen; re-enters with the runtime waves |
+
+Verified by (2026-09-04):
+
+```
+$ cargo test -p hacp
+test result: ok. 47 passed; 0 failed; 0 ignored        (lib: v2 + frozen 1.1 units)
+test result: ok. 43 passed; 0 failed; 0 ignored        (frozen 1.1 conformance vectors)
+test result: ok. 3 passed; 0 failed; 0 ignored         (v2 lifecycles vs goldens)
+test result: ok. 5 passed; 0 failed; 0 ignored         (transcript harness)
+test result: ok. 1 passed; 0 failed; 0 ignored         (Phase 3 exit: independent peer)
+$ interop/run-interop.sh
+test an_independent_peer_interoperates_over_the_file_edge ... ok
+```
+
+**What the exit test proved.** Two implementations that share no code — the Rust
+reference and a Python peer built from the spec, the committed schemas, and the goldens
+— negotiated, froze (both computing the same §7.5 revision digest independently),
+executed, submitted an artifact with a manifest, and settled, over the file edge, with
+frame-for-frame agreement between their two views of the exchange. The peer's need for a
+pinned digest preimage was caught as a spec defect and fixed (spec changelog, §7.5):
+that is the leak test working.
+
+---
+
 ## 2. What the spec deliberately does not say, and Hive does
 
 | Spec (abstract) | Hive (concrete) |
