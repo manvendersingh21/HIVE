@@ -3,7 +3,7 @@ name = "hacp"
 version = "1.1.0"
 edition = "2021"
 description = "HACP — Heterogeneous Agent Collaboration Protocol: wire types, validation, and conformance vectors"
-license = "MIT"
+license = "Apache-2.0"
 
 # This crate is the protocol, not an implementation of a system that uses it.
 # It MUST NOT depend on any hive-* crate, on an async runtime, on a database,
