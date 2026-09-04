@@ -332,6 +332,14 @@ pub struct WatchdogConfig {
     /// Whether to use LLM analysis in addition to regex rules.
     #[serde(default = "default_true_bool")]
     pub llm_analysis: bool,
+    /// Maximum number of files a single operation may affect before the
+    /// interceptor pauses for approval (default: 5).
+    #[serde(default = "default_max_files")]
+    pub max_files: usize,
+    /// Maximum number of lines that may be deleted before the interceptor
+    /// pauses for approval (default: 100).
+    #[serde(default = "default_max_lines_deleted")]
+    pub max_lines_deleted: usize,
     /// Notification settings.
     #[serde(default)]
     pub notifications: NotificationConfig,
@@ -352,6 +360,12 @@ fn default_max_consecutive_safe() -> u32 {
 fn default_reduced_poll() -> u64 {
     15
 }
+fn default_max_files() -> usize {
+    5
+}
+fn default_max_lines_deleted() -> usize {
+    100
+}
 
 impl Default for WatchdogConfig {
     fn default() -> Self {
@@ -362,6 +376,8 @@ impl Default for WatchdogConfig {
             max_consecutive_safe: default_max_consecutive_safe(),
             reduced_poll_interval_secs: default_reduced_poll(),
             llm_analysis: true,
+            max_files: default_max_files(),
+            max_lines_deleted: default_max_lines_deleted(),
             notifications: NotificationConfig::default(),
             extra_rules: vec![],
         }

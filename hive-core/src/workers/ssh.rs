@@ -104,6 +104,14 @@ pgid=$(ps -o tpgid= -p "$pid" | tr -d ' ')
 case "$pgid" in ''|*[!0-9]*) echo "no foreground pgid" >&2; exit 1;; esac
 if [ "$pgid" -le 1 ]; then echo "refusing to signal pgid $pgid" >&2; exit 1; fi
 kill -STOP -"$pgid"
+# `kill` exiting 0 means the signal was delivered, not that it stuck. Verify the
+# group is actually in state T before claiming a pause: reporting a pause that did
+# not happen is the failure that lets a flagged session keep running for a whole
+# phase, which is worse than reporting no pause at all.
+sleep 1
+if ! ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$pgid" '$1 == g && $2 ~ /^T/ {{ found = 1 }} END {{ exit !found }}'; then
+  echo "SIGSTOP did not hold for pgid $pgid" >&2; exit 2
+fi
 echo "stopped $pgid""#
         );
 
@@ -196,7 +204,16 @@ echo "resumed $resumed""#
         // own output is flushed — a real race that dropped output in
         // testing. Capturing `$?` inside the brace group, before the pipe,
         // keeps the original command's exit code rather than tee's.
-        let inner = format!("{{ ( {command} ); echo \"__HIVE_DONE__$?\"; }} 2>&1 | tee {log_path}");
+        // `set -m` is load-bearing for pausing, not a style choice. Without job control
+        // the pipeline runs in bash's own process group, which is also the pane's group
+        // and the terminal's foreground group — so `pause_session`, which stops the
+        // foreground group, ends up stopping tmux's own pane child. tmux reaps that child
+        // with WUNTRACED (`server_child_stopped`) and answers a stop with SIGCONT, so the
+        // work resumes while `kill` still reports success. Job control puts the pipeline
+        // in a group of its own, tmux is never told anything stopped, and the stop holds.
+        // Measured on tmux 3.7c: without this, every process was back in `S` a moment
+        // after a `kill -STOP` that returned 0.
+        let inner = format!("set -m; {{ ( {command} ); echo \"__HIVE_DONE__$?\"; }} 2>&1 | tee {log_path}");
         let status = self
             .session
             .command("tmux")

@@ -191,6 +191,20 @@ pub fn assess_command(
     }
 }
 
+/// Enhanced assessment: Tier-1 watchdog rules **plus** the interceptor's
+/// bulk-deletion patterns. This catches `find ... -delete`, `xargs rm`,
+/// wildcard `rm *.py`, and `git clean` without `--dry-run` — patterns
+/// that the base watchdog was never designed to flag.
+///
+/// Drop-in replacement for [`assess_command`] in `plan_run`.
+pub fn assess_command_with_interceptor(
+    watchdog: &crate::watchdog::Watchdog,
+    interceptor: &crate::watchdog::interceptor::Interceptor,
+    command: &str,
+) -> Option<SafetyAnalysis> {
+    interceptor.assess(watchdog, command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

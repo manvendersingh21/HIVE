@@ -11,6 +11,7 @@
 //! - Fine-tuning data collection
 
 pub mod agent;
+pub mod collab;
 pub mod finetune;
 pub mod llm;
 pub mod memory;

@@ -425,6 +425,29 @@ attachable and the process tree is intact. The remote snippet requires the pgid 
 non-empty, all digits, and `> 1` — passing `-1` to `kill` means *every process the user can
 signal*, which is exactly how the Phase 4 incident happened.
 
+**And SIGSTOP did not hold either — found 2026-09-04, while building the HACP session host.**
+The two fixes above are both real, and the pause still did not work on the SSH path. Without
+job control, `spawn_tmux`'s `bash -c '{ ( cmd ); … } | tee log'` runs the whole pipeline in
+bash's own process group, which is also the pane's group — so `pause_session`, aiming at the
+foreground pgid, was stopping tmux's own pane child. tmux reaps that child with `WUNTRACED`
+(`server_child_stopped`) and answers a stop with SIGCONT. Measured on tmux 3.7c: `kill`
+returned 0, `pause_session` returned `Suspended`, and every process was back in `S` a moment
+later. A flagged session kept running while the operator was told it was frozen.
+
+Fixed by adding `set -m` to the launched shell, which puts the pipeline in a group of its own
+so tmux is never told anything stopped. Verified as a before/after on one machine — old line:
+`pane_pid == tpgid`, states `Ss+ S+ S+ S+` after the stop; new line: `pane_pid 52436 != pgid
+52438`, states `T+ T+ T+`. `pause_session` now also *verifies* the group reached state `T` and
+returns an error if it did not, because the through-line of all three of these bugs is that
+each fix was believed on the strength of a command exiting 0. `kill` exiting 0 means the
+signal was delivered, not that it stuck.
+
+Note what this cost: this section previously read as a closed story, and the entry above it
+says the earlier warning "had previously recorded that warning as a benign race. It was not."
+The same mistake was then made one layer down. The lesson that generalises is not about tmux —
+it is that *a safety mechanism is unverified until something observes the state it is supposed
+to produce*, and every one of these three fixes shipped without that observation.
+
 ### Also fixed: workers were permanently offline
 
 Making `hive-web`'s startup non-blocking dropped its `refresh_health()` call, so every

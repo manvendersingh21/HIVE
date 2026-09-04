@@ -1,0 +1,20 @@
+[package]
+name = "hacp"
+version = "1.1.0"
+edition = "2021"
+description = "HACP — Heterogeneous Agent Collaboration Protocol: wire types, validation, and conformance vectors"
+license = "MIT"
+
+# This crate is the protocol, not an implementation of a system that uses it.
+# It MUST NOT depend on any hive-* crate, on an async runtime, on a database,
+# or on an HTTP client. Adding such a dependency is a design error, not a
+# convenience: see spec/HACP.md, which names no implementation for the same
+# reason.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+schemars = { workspace = true, features = ["chrono"] }
+sha2 = { workspace = true }
+thiserror = { workspace = true }

@@ -10,6 +10,8 @@
 //! floor a supervised session needs, and Phase 3 delegation shouldn't ship
 //! without it.
 
+pub mod interceptor;
+pub mod notifier;
 pub mod rules;
 
 use hive_common::config::WatchdogConfig;

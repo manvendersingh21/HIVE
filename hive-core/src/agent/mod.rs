@@ -13,12 +13,13 @@ use crate::llm::LlmRouter;
 use crate::memory::{machines, MemorySystem};
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
+use crate::watchdog::interceptor::Interceptor;
 use crate::watchdog::Watchdog;
 use crate::workers::WorkerPool;
 use planner::{FleetContext, Planner};
 use run::{
-    assess_command, Approvals, Decision, PlannedRun, PlannedStep, RunResult, StepOutcome,
-    StepStatus, StepTarget,
+    assess_command_with_interceptor, Approvals, Decision, PlannedRun, PlannedStep,
+    RunResult, StepOutcome, StepStatus, StepTarget,
 };
 
 /// The capability every supervised remote subtask needs, whatever the work is.
@@ -45,6 +46,9 @@ pub struct MasterAgent {
     pub tools: ToolRegistry,
     /// Safety watchdog applied to delegated (remote) sessions.
     pub watchdog: Arc<Watchdog>,
+    /// High-risk command interceptor — extends the watchdog with
+    /// bulk-deletion patterns and diff-threshold analysis.
+    pub interceptor: Interceptor,
     /// How this machine is named in the machine knowledge graph. Local
     /// subtasks run here, so the planner is told its OS by this name.
     master_name: String,
@@ -72,6 +76,9 @@ impl MasterAgent {
         memory: MemorySystem,
         watchdog_config: WatchdogConfig,
     ) -> Self {
+        let max_files = watchdog_config.max_files;
+        let max_lines_deleted = watchdog_config.max_lines_deleted;
+
         let watchdog = Watchdog::from_config(watchdog_config).unwrap_or_else(|e| {
             tracing::warn!("Invalid watchdog config ({e}), falling back to built-in defaults");
             Watchdog::new()
@@ -83,6 +90,7 @@ impl MasterAgent {
             skills,
             memory,
             tools: ToolRegistry::new(),
+            interceptor: Interceptor::new(max_files, max_lines_deleted),
             watchdog: Arc::new(watchdog),
             master_name: default_master_name(),
             planner: Planner::new(),
@@ -200,6 +208,30 @@ impl MasterAgent {
             }
 
             for command in &subtask.commands {
+                // Safety gate: check against the interceptor before running.
+                // handle_request has no approval flow, so flagged commands are
+                // refused outright — better than silent execution.
+                if let Some(analysis) = assess_command_with_interceptor(
+                    &self.watchdog,
+                    &self.interceptor,
+                    command,
+                ) {
+                    warn!(
+                        command = %command,
+                        reason = %analysis.reason,
+                        "handle_request: blocked by safety interceptor"
+                    );
+                    notes.push(format!(
+                        "⚠ BLOCKED: $ {command}\n  {}\n  \
+                         Use `hive task` for an interactive approval flow.",
+                        analysis.reason
+                    ));
+                    // Send iMessage notification for the blocked command
+                    let summary = format!("{} — {}", command, analysis.reason);
+                    let _ = crate::watchdog::notifier::send_imessage_alert(&summary).await;
+                    continue;
+                }
+
                 match self.tools.run_shell(command).await {
                     Ok(output) => {
                         info!("Ran `{command}`");
@@ -284,7 +316,11 @@ impl MasterAgent {
                     // delegated; the pre-flight gate is for local execution,
                     // which has no such supervision.
                     risk: match target {
-                        StepTarget::Local => assess_command(&self.watchdog, command),
+                        StepTarget::Local => assess_command_with_interceptor(
+                            &self.watchdog,
+                            &self.interceptor,
+                            command,
+                        ),
                         StepTarget::Remote { .. } => None,
                     },
                     target: target.clone(),

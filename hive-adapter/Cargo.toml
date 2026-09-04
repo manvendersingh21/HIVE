@@ -1,0 +1,26 @@
+[package]
+name = "hive-adapter"
+version = "0.1.0"
+edition = "2021"
+
+# The adapter is vendor-neutral and protocol-only: it shuttles files to and from the
+# bus and never interprets what it carries. It therefore depends on `hacp` and a
+# transport, and MUST NOT depend on hive-core or hive-common — an adapter that knew
+# about a particular master would not be an adapter.
+[dependencies]
+hacp = { path = "../hacp" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+libc = { workspace = true }
+
+[[bin]]
+name = "hive-adapter"
+path = "src/main.rs"

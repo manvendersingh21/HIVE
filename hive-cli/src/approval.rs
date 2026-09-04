@@ -98,10 +98,46 @@ pub fn print_outcomes(result: &RunResult) {
 /// A step whose answer cannot be read (no tty, EOF) is treated as denied:
 /// defaulting to "run it" would make a piped command silently execute exactly
 /// the commands the watchdog objected to.
+///
+/// When steps are flagged and the policy is [`GatePolicy::Prompt`], an
+/// iMessage alert is sent to the operator's phone (via `PHONE_NUMBER` env
+/// var) so they can review even if they've walked away from the terminal.
+/// Accepts `y`/`yes`/`APPROVE` to proceed, anything else (including
+/// `n`/`no`/`REJECT`) denies.
 pub fn decide(run: &PlannedRun, result: &RunResult, policy: GatePolicy) -> (Vec<usize>, Vec<usize>) {
     let gated: HashSet<usize> = result.awaiting_approval.iter().copied().collect();
     let mut approved = Vec::new();
     let mut denied = Vec::new();
+
+    if gated.is_empty() {
+        return (approved, denied);
+    }
+
+    // ── Send iMessage alert for the batch of flagged steps ───────────
+    if policy == GatePolicy::Prompt {
+        let flagged_cmds: Vec<String> = run
+            .steps
+            .iter()
+            .filter(|s| gated.contains(&s.id))
+            .map(|s| s.command.clone())
+            .collect();
+        let summary = if flagged_cmds.len() == 1 {
+            flagged_cmds[0].clone()
+        } else {
+            format!("{} commands flagged", flagged_cmds.len())
+        };
+        hive_core::watchdog::notifier::send_imessage_alert_sync(&summary);
+    }
+
+    // ── Print the AwaitingHumanApproval banner ───────────────────────
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════╗");
+    println!("║             ⚠️  HIGH-RISK ACTION INTERCEPTED  ⚠️                 ║");
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+    println!("║  Status: AwaitingHumanApproval                                 ║");
+    println!("║  {} step(s) require review before execution                  ║",
+        format!("{:>2}", gated.len()));
+    println!("╚══════════════════════════════════════════════════════════════════╝");
 
     for step in &run.steps {
         if !gated.contains(&step.id) {
@@ -113,33 +149,56 @@ pub fn decide(run: &PlannedRun, result: &RunResult, policy: GatePolicy) -> (Vec<
             .map(|r| r.reason.clone())
             .unwrap_or_else(|| "flagged by the safety watchdog".to_string());
 
-        println!("\n⚠  Step {} was flagged", step.id);
-        println!("   $ {}", step.command);
-        println!("   {reason}");
+        let severity = step
+            .risk
+            .as_ref()
+            .map(|r| format!("{}", r.severity))
+            .unwrap_or_else(|| "HIGH".to_string());
+
+        let category = step
+            .risk
+            .as_ref()
+            .and_then(|r| r.category.as_ref())
+            .map(|c| format!("{c}"))
+            .unwrap_or_else(|| "Destructive Command".to_string());
+
+        // ── Rich diff/command summary ───────────────────────────────
+        println!();
+        println!("  ┌─ Step {} ─────────────────────────────────────────────", step.id);
+        println!("  │ Command:   $ {}", step.command);
+        println!("  │ Severity:  {severity}");
+        println!("  │ Category:  {category}");
+        println!("  │ Reason:    {reason}");
+        if let Some(risk) = &step.risk {
+            println!("  │ Suggested: {}", risk.suggested_action);
+        }
+        println!("  └────────────────────────────────────────────────────────");
 
         match policy {
             GatePolicy::AssumeYes => {
-                println!("   → approved (--yes)");
+                println!("   → APPROVED (--yes)");
                 approved.push(step.id);
             }
             GatePolicy::DenyAll => {
-                println!("   → skipped (--deny-flagged)");
+                println!("   → REJECTED (--deny-flagged)");
                 denied.push(step.id);
             }
             GatePolicy::Prompt => {
-                print!("   Run it? [y/N] ");
+                print!("   APPROVE or REJECT? [y/APPROVE/n/REJECT] ");
                 let _ = io::stdout().flush();
                 let mut answer = String::new();
                 match io::stdin().read_line(&mut answer) {
                     Ok(0) | Err(_) => {
-                        println!("   → skipped (no answer available)");
+                        println!("   → REJECTED (no input available — safe default)");
                         denied.push(step.id);
                     }
                     Ok(_) => {
-                        if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                        let trimmed = answer.trim().to_ascii_uppercase();
+                        if matches!(trimmed.as_str(), "Y" | "YES" | "APPROVE") {
+                            println!("   ✅ APPROVED — resuming execution");
                             approved.push(step.id);
                         } else {
-                            println!("   → skipped");
+                            println!("   ❌ REJECTED — skipping this step");
                             denied.push(step.id);
                         }
                     }

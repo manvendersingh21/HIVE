@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "hacp",
+    "hive-adapter",
     "hive-common",
     "hive-core",
     "hive-worker",
@@ -58,6 +60,9 @@ portable-pty = "0.8"
 
 # Actor framework
 ractor = "0.14"
+
+# Hashing (HACP interface digests)
+sha2 = "0.10"
 
 # Regex (for watchdog rules)
 regex = "1"
