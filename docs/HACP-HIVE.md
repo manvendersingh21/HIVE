@@ -21,7 +21,8 @@ is marked implemented on the strength of a file existing.
 > [`findings/adapter-edge.md`](findings/adapter-edge.md)). The 1.1 spec and its 43 conformance
 > vectors are retained as the implemented reference; no further 1.1 protocol work is planned.
 > All collaboration design now moves to **HACP/2.0** — bilateral contracts, sessions, recursive
-> supervision — drafted alongside, per ADR-0001.
+> supervision — drafted in [`hacp/spec/HACP-2.0-draft.md`](../hacp/spec/HACP-2.0-draft.md) per
+> [`adr/ADR-0001-hacp-core-is-bilateral.md`](adr/ADR-0001-hacp-core-is-bilateral.md).
 
 > This table previously lived in the spec itself and claimed six components as
 > "implemented" that had never been written. That is the failure mode this project's
