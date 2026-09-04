@@ -8,5 +8,14 @@
 //! implementation dependency in this crate. The 1.1 modules above stay frozen as the
 //! reference baseline; nothing here may alter them.
 
+pub mod agent;
 pub mod canon;
+pub mod contract;
+pub mod envelope;
 pub mod schema;
+pub mod session;
+
+pub use agent::Agent;
+pub use contract::{Contract, ContractError, ContractLimits, ContractState, Relationship, Revision, Submission, Task, Verdict};
+pub use envelope::{agent_urn, kinds, Envelope, EnvelopeError, PROTOCOL};
+pub use session::{ObserverGrant, Session, SessionError, SessionState};

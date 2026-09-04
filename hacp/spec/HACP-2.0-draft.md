@@ -459,3 +459,10 @@ different protocols that share a philosophy.
 
 - 2026-09-04: skeleton drafted; §①–⑤ frozen at skeleton level; Phase S findings merged into
   §9.4 and §12. (W2)
+- 2026-09-04: §7.3 clarification (appendix-level, no semantics reopened): the diagram's two
+  ACCEPTED boxes are named `Agreed` (pre-freeze: both participants accepted the terms) and
+  `Settled` (post-verification: the verdict) in the reference implementation's
+  [`ContractState`](../src/v2/contract.rs), because two different facts deserve two names.
+  Kernel, session, and contract engines implemented with conformance vectors and golden
+  transcripts `bilateral-lifecycle`, `bilateral-no-agreement`; canonical schemas committed for
+  envelope, agent, session, contract. (W4)

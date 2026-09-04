@@ -68,7 +68,25 @@ fn normalize_schema_numbers(value: &mut Value) {
 /// contracts, artifacts). An entry appearing here without a matching committed file
 /// under `spec/schemas/` — or a committed file without an entry — fails the gate.
 pub fn wire_schemas() -> BTreeMap<&'static str, String> {
-    BTreeMap::new()
+    into_registry([
+        ("envelope", canonical_schema_json::<super::Envelope>()),
+        ("agent", canonical_schema_json::<super::Agent>()),
+        ("session", canonical_schema_json::<super::Session>()),
+        ("contract", canonical_schema_json::<super::Contract>()),
+    ])
+}
+
+fn into_registry(
+    entries: impl IntoIterator<Item = (&'static str, Result<String, CanonError>)>,
+) -> BTreeMap<&'static str, String> {
+    let mut map = BTreeMap::new();
+    for (name, result) in entries {
+        let canonical = result.unwrap_or_else(|e| {
+            panic!("wire schema {name} did not canonicalize — a type broke §5.1: {e}")
+        });
+        map.insert(name, canonical);
+    }
+    map
 }
 
 /// Where committed schemas live, resolved from the crate root so tests behave the
@@ -143,7 +161,8 @@ mod tests {
             let on_disk = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("committed schema {name} unreadable: {e}"));
             assert_eq!(
-                &on_disk, canonical,
+                on_disk.trim_end(),
+                canonical,
                 "committed schema {name} drifted from the type; regenerate it"
             );
         }
