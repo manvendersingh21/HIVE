@@ -9,13 +9,19 @@
 //! reference baseline; nothing here may alter them.
 
 pub mod agent;
+pub mod artifact;
 pub mod canon;
 pub mod contract;
 pub mod envelope;
+pub mod evidence;
 pub mod schema;
 pub mod session;
+pub mod verification;
 
 pub use agent::Agent;
+pub use artifact::{Artifact, ArtifactError, Audience, Visibility};
 pub use contract::{Contract, ContractError, ContractLimits, ContractState, Relationship, Revision, Submission, Task, Verdict};
 pub use envelope::{agent_urn, kinds, Envelope, EnvelopeError, PROTOCOL};
+pub use evidence::{Evidence, EvidenceError, EvidenceKind, EvidenceSubject};
 pub use session::{ObserverGrant, Session, SessionError, SessionState};
+pub use verification::{Check, Verification, VerificationError};

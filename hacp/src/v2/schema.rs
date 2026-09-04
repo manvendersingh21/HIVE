@@ -73,6 +73,9 @@ pub fn wire_schemas() -> BTreeMap<&'static str, String> {
         ("agent", canonical_schema_json::<super::Agent>()),
         ("session", canonical_schema_json::<super::Session>()),
         ("contract", canonical_schema_json::<super::Contract>()),
+        ("artifact", canonical_schema_json::<super::Artifact>()),
+        ("evidence", canonical_schema_json::<super::Evidence>()),
+        ("verification", canonical_schema_json::<super::Verification>()),
     ])
 }
 
