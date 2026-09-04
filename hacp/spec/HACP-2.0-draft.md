@@ -481,3 +481,14 @@ different protocols that share a philosophy.
   agents). Findings 8–10 in `docs/findings/adapter-edge.md`: agents narrate success
   without artifacts, briefs need absolute paths, exit codes stay meaningless — all
   adapter-level, no spec semantics changed. (W6)
+- 2026-09-04: Core complete. §8 implemented (`grant.rs`): CapabilityGrant chains with
+  the inviolable rule enforced at issue time on every layer, revocation closes grants
+  and their downstream, validity windows, and the OrgChart of declared parent chains
+  with LCA discovery. §10 implemented: `collaboration.request`/`collaboration.permit`
+  objects with both authorization paths — LCA issuance and standing
+  `cross-branch/<class>` preauthorization — permits authorize the session pair, never
+  the outcome. §11 implemented (`escalation.rs`): the raise→refer(LCA)→resolve /
+  no_agreement ladder with optional (never mandatory) arbiters. §13 implemented
+  (`profile.rs`): `hive-recursive-pairwise/1` — arity cap 2, LCA routing, sibling
+  preauthorization issuance, role-independence advice — held out of Core as designed.
+  Schemas committed for grant, collaboration-permit, escalation. (Phase 4)

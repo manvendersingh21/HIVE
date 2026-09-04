@@ -206,6 +206,9 @@ fn an_independent_peer_interoperates_over_the_file_edge() {
         vec![],
     )
     .expect("an accept with artifacts and passing checks is lawful (§9.4)");
+    verification
+        .validate()
+        .expect("the recorded verdict is a lawful verification");
     send(&mut reference, &session, &a, &b, kinds::VERIFICATION_DELIVERED,
          json!({"contract_id": contract.contract_id, "verdict": "accept", "artifacts": [artifact_id],
                 "checks": checks, "reasons": []}));

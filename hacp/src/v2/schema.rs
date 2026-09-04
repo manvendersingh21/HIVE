@@ -76,6 +76,9 @@ pub fn wire_schemas() -> BTreeMap<&'static str, String> {
         ("artifact", canonical_schema_json::<super::Artifact>()),
         ("evidence", canonical_schema_json::<super::Evidence>()),
         ("verification", canonical_schema_json::<super::Verification>()),
+        ("grant", canonical_schema_json::<super::CapabilityGrant>()),
+        ("collaboration-permit", canonical_schema_json::<super::CollaborationPermit>()),
+        ("escalation", canonical_schema_json::<super::Escalation>()),
     ])
 }
 

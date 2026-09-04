@@ -89,15 +89,17 @@ moves to ✅ only after the proving command ran.
 | Golden wire transcripts (§14) | `hacp/tests/golden/*.jsonl` | ✅ lifecycle + no-agreement, replayed on every test run |
 | **Independent interop peer** (§14 Independence) | `interop/peer-python/peer.py` | ✅ Python stdlib, spec+schemas only; see below |
 | Phase 3 exit test (ADR-0001) | `hacp/tests/v2_interop.rs` | ✅ reference ↔ independent peer, file edge, mutual transcript agreement |
-| Delegation/CapabilityGrant objects (§8) | — | ⬜ types only inside Contract today; full grant machinery is Phase 4 |
-| Cross-branch permits, escalation engine (§10–§11) | — | ⬜ spec frozen; Phase 4+ |
-| HIVE profile module (§13) | — | ⬜ spec frozen; re-enters with the runtime waves |
+| Delegation/CapabilityGrant machinery (§8) | `hacp/src/v2/grant.rs` | ✅ monotonic authority enforced at issue on every chain layer; revocation closes downstream; OrgChart chains + LCA |
+| Cross-branch permits (§10) | `hacp/src/v2/grant.rs` | ✅ LCA issuance + `cross-branch/<class>` preauthorization; permits authorize the pair, not the outcome |
+| Escalation engine (§11) | `hacp/src/v2/escalation.rs` | ✅ raise→refer→resolve/no_agreement ladder; arbiter optional at every N, never mandatory |
+| HIVE profile module (§13) | `hacp/src/v2/profile.rs` | ✅ `hive-recursive-pairwise/1`: arity ≤ 2, LCA routing, sibling preauth issuance, role-independence advice — out of Core |
+| Re-enters with the runtime waves | HIVE runtime | ⬜ supervisor loops, spawn/delegate lifecycles, org bootstrapping |
 
 Verified by (2026-09-04):
 
 ```
 $ cargo test -p hacp
-test result: ok. 47 passed; 0 failed; 0 ignored        (lib: v2 + frozen 1.1 units)
+test result: ok. 64 passed; 0 failed; 0 ignored        (lib: v2 + frozen 1.1 units)
 test result: ok. 43 passed; 0 failed; 0 ignored        (frozen 1.1 conformance vectors)
 test result: ok. 3 passed; 0 failed; 0 ignored         (v2 lifecycles vs goldens)
 test result: ok. 5 passed; 0 failed; 0 ignored         (transcript harness)
@@ -105,6 +107,11 @@ test result: ok. 1 passed; 0 failed; 0 ignored         (Phase 3 exit: independen
 $ interop/run-interop.sh
 test an_independent_peer_interoperates_over_the_file_edge ... ok
 ```
+
+**HACP/2.0 Core is complete.** Every normative section (§1–§14) has an
+implementation, committed schemas, and refusal-tested vectors. What remains is the
+HIVE runtime layer — supervisor loops and org bootstrapping on top of Core and the
+profile — which is exactly where the boundary says it belongs.
 
 **What the exit test proved.** Two implementations that share no code — the Rust
 reference and a Python peer built from the spec, the committed schemas, and the goldens
