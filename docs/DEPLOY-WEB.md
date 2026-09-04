@@ -195,6 +195,15 @@ target session's tty.
 | `manus-mac-mini` | master — agent UI, terminal, machine graph | launchd, tailnet `100.121.248.111:8090` |
 | `archlinux-worker` | worker — 4 cores, 11.6 GB, docker, ollama | SSH `hive-worker-2` over the tailnet |
 | `cis-a6000` | worker — 2× RTX A6000 (48 GB each), 32 cores, 251 GB | SSH through the `cis-linux2` bastion |
+| `cis-linux2` | worker *and* bastion — 4 cores, 15.6 GB (shared login node) | SSH over the internet |
+
+How a request reaches a machine is documented separately in
+[`PLACEMENT.md`](PLACEMENT.md).
+
+`cis-linux2` is tagged `shared`/`login-node`, so placement deprioritizes it — see
+PLACEMENT.md §3. It is also the ProxyJump for `cis-a6000`, so overloading it
+takes **both** Temple workers offline, not just itself. Short, light commands
+only.
 
 ### `cis-a6000` is shared university infrastructure
 

@@ -39,18 +39,18 @@ review) and escalates to you for a human decision.
 │                    ├──► MemorySystem ──► Knowledge Graph + RAG + SQLite│
 │                    ├──► Watchdog ──────► safety rules + LLM analysis   │
 │                    ├──► SkillRegistry ─► TOML-defined custom skills    │
-│                    └──► WorkerPool ────► least-loaded worker selection │
+│                    └──► WorkerPool ────► capability-based placement    │
 │                                                                       │
-│   hive-web (axum + xterm.js)  ◄── phone/laptop browser over HTTPS      │
+│   hive-web (axum + xterm.js)  ◄── phone/laptop browser over the tailnet│
 └───────────────────────────────┬───────────────────────────────────────┘
-                                │ SSH + JSON over HTTP
+                                │ SSH (direct: tmux driven over the connection)
         ┌───────────────────────┼───────────────────────┐
         ▼                       ▼                       ▼
-   ┌─────────┐            ┌─────────┐            ┌─────────┐
-   │ worker-1│            │ worker-2│    ...     │ worker-4│
-   │hive-work│            │hive-work│            │hive-work│
-   │  tmux   │            │  tmux   │            │  tmux   │
-   └─────────┘            └─────────┘            └─────────┘
+   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+   │archlinux-wkr │    │  cis-a6000   │    │  cis-linux2  │
+   │ 4c / 11.6 GB │    │2× RTX A6000  │    │ shared login │
+   │     tmux     │    │ 32c / 251 GB │    │  (bastion)   │
+   └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
 Full architecture diagrams, data model, and code sketches live in
@@ -63,7 +63,7 @@ Full architecture diagrams, data model, and code sketches live in
 | Crate | Binary | Role |
 |:---|:---|:---|
 | `hive-common` | — | Shared protocol types (`TaskAssignment`, `TaskStatus`, …), config schema, `HiveError` |
-| `hive-core` | — | Master agent brain: agent loop, LLM router, worker pool, tools, skills, memory, watchdog, finetune |
+| `hive-core` | — | Master agent brain: agent loop, LLM router, worker pool + placement, tools, skills, memory, watchdog, finetune |
 | `hive-worker` | `hive-worker` | Daemon on each worker machine: receives tasks, runs them in tmux, reports status |
 | `hive-web` | `hive-web` | axum server: session dashboard + WebSocket↔SSH↔tmux terminal bridge |
 | `hive-cli` | `hive` | Your interface: `hive chat`, `hive task`, `hive sessions`, `hive workers`, … |
@@ -73,10 +73,13 @@ Full architecture diagrams, data model, and code sketches live in
 ## Status
 
 **Phases 1–5 are complete and live-verified** — `cargo build --workspace` and
-`cargo test --workspace` both pass cleanly (79 passed, 1 opt-in live test), and `hive task`/
-`hive chat` classify, plan, and execute real commands — locally, or delegated over real SSH to a
-worker running inside a supervised tmux session. See [`docs/STATUS.md`](docs/STATUS.md) for the
-full audit and [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases.
+`cargo test --workspace` both pass cleanly (95 passed, 1 opt-in live test), and `hive task`/
+`hive chat` classify, plan, and execute real commands — locally, or delegated over real SSH to
+a machine the knowledge graph chose, running inside a tmux session the master supervises for
+its whole life. See [`docs/STATUS.md`](docs/STATUS.md) for the
+full audit, [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases,
+[`docs/PLACEMENT.md`](docs/PLACEMENT.md) for how a request becomes a machine, and
+[`docs/DEPLOY-WEB.md`](docs/DEPLOY-WEB.md) for what runs where.
 
 Short version:
 
@@ -108,13 +111,23 @@ Short version:
   Bearer-token authenticated — it refuses to start without one
 - ✅ `hive-cli/src/main.rs` — full command tree; `chat`/`task` drive a real `MasterAgent`;
   `workers list` and worker health checks reflect real config/real SSH reachability
-- ✅ `config/hive.toml` and `config/workers.toml` in place — `archlinux-worker` configured
-  (the Azure `lawfinder` worker was retired; Hive no longer uses Azure)
-- ⚠️ Watchdog supervision only lasts as long as the CLI process does — `hive task` exits right
-  after delegating, so anything delegated through it runs unsupervised almost immediately
-  after; `hive chat` supervises for its session. No persistent daemon yet. See `docs/STATUS.md`.
-- ⚠️ No safety watchdog for **local** commands — only delegated/remote ones are supervised
-- ⬜ Web terminal, skills, memory, fine-tuning, full incident review UI — see the roadmap
+- ✅ `config/hive.toml` and `config/workers.toml` in place — three workers configured
+  (`archlinux-worker`, `cis-a6000`, `cis-linux2`); the Azure `lawfinder` worker was retired
+- ✅ **Capability-based placement** — machines are probed into a knowledge graph, the planner
+  states what each subtask needs (`gpu-compute`, `containers`, …), and the graph picks the
+  machine. A named machine is a decision, not a hint: Hive will not silently run a CUDA job
+  somewhere without a GPU. See [`docs/PLACEMENT.md`](docs/PLACEMENT.md)
+- ✅ **Durable supervision** — `hive task`/`hive chat` submit to the running master, so a
+  delegated session is watched by a daemon for its whole life rather than for the moment the
+  CLI happens to stay alive
+- ✅ **Safety gate on local commands, in the CLI as well as the web UI** — anything the
+  watchdog's Tier-1 rules flag stops and asks. With no tty (piped, scripted) the answer is
+  *deny*, never *run*
+- ⚠️ Nothing routes GPU work through SLURM yet — `cis-a6000` is a shared university node, and
+  heavy jobs belong in `sbatch` rather than a tmux session. The graph records the capability;
+  no policy acts on it. See `docs/PLACEMENT.md` §5
+- ⚠️ Watchdog incidents are `tracing` warnings only — no incident log, queue, or notifier
+- ⬜ Skills, RAG/projects/history, fine-tuning, incident review UI — see the roadmap
 
 ---
 

@@ -247,27 +247,34 @@ pub async fn probe_remote(name: &str, ssh_target: &str, tags: Vec<String>) -> Ma
         ..Default::default()
     };
 
-    let worker = match SshWorker::connect(ssh_target).await {
-        Ok(w) => w,
-        Err(e) => {
-            warn!(worker = name, error = %e, "probe: SSH connect failed");
-            return unreachable();
-        }
+    // SSH's own ConnectTimeout does not cover every stall — a half-open tunnel
+    // or a wedged ControlMaster can leave the future pending well past it. The
+    // caller bounds the whole refresh, but without a per-probe cap one wedged
+    // host consumes that entire budget and starves every machine behind it.
+    let probe = async {
+        let worker = SshWorker::connect(ssh_target).await?;
+        // A login shell, so PATH additions like ~/.local/bin are visible — the
+        // same reason session launches use `bash -lc`.
+        worker
+            .run(&format!("bash -lc {}", shell_quote(&probe_script())))
+            .await
     };
 
-    // The probe runs through a login shell so PATH additions like ~/.local/bin
-    // are visible — the same reason session launches use `bash -lc`.
-    match worker
-        .run(&format!("bash -lc {}", shell_quote(&probe_script())))
-        .await
-    {
-        Ok(stdout) => parse_probe(name, ssh_target, tags, &stdout),
-        Err(e) => {
-            warn!(worker = name, error = %e, "probe: command failed");
+    match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+        Ok(Ok(stdout)) => parse_probe(name, ssh_target, tags, &stdout),
+        Ok(Err(e)) => {
+            warn!(worker = name, error = %e, "probe failed");
+            unreachable()
+        }
+        Err(_) => {
+            warn!(worker = name, secs = PROBE_TIMEOUT.as_secs(), "probe timed out");
             unreachable()
         }
     }
 }
+
+/// Ceiling on one remote probe, SSH connect included.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Single-quote a string for POSIX shells.
 fn shell_quote(s: &str) -> String {
