@@ -90,7 +90,8 @@ Short version:
   `MasterAgent::handle_request` actually calls for local subtasks
 - ✅ Remote subtasks delegate for real: SSH (`openssh`, connection-pooled) into a worker,
   start a detached tmux session, stream its output live, and watch it with a Tier-1 regex +
-  Tier-2 LLM-review safety layer (pulled forward from Phase 10) that pauses — not kills — a
+  Tier-2 LLM-review safety layer (pulled forward from Phase 10; Tier 2 always runs on the
+  local model, never a routed one — see `docs/STATUS.md`) that pauses — not kills — a
   session that looks dangerous or off-track, logging the exact command to reattach and inspect
 - ✅ **Agent chat UI** at `/` — talk to the master agent from a browser. It classifies the
   request, shows which model it routed to (and says so when a missing cloud key made it fall

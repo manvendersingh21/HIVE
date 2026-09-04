@@ -39,7 +39,7 @@ __HIVE_DONE__0
 |:---|:---|
 | `hive-core/src/workers/ssh.rs` | `SshWorker` — real SSH via `openssh` (`process-mux`: a real `ControlMaster` per connection, `server_alive_interval`, `connect_timeout`). `spawn_tmux` starts a detached tmux session running the command, piping combined stdout/stderr through both the live pane *and* a remote log file (`> >(tee path) 2>&1`, not a plain pipe, so `$?` after the command is preserved for the completion sentinel). `tail` streams that log file line-by-line over its own SSH channel on the same pooled connection — chosen over polling `tmux capture-pane` specifically because polling can miss short bursts of output between checks. `send_keys`/`capture_pane` round out the toolkit. |
 | `hive-core/src/watchdog/rules.rs` | 9 built-in Tier-1 regex rules (`rm -rf /`, disk format/overwrite, `DROP TABLE`/`TRUNCATE`, force-push/hard-reset, `sudo`/`chmod 777`, `curl \| sh`, private-key/API-key patterns, fork bombs), each mapped to the `Severity`/`SafetyCategory` types Phase 1 already defined — those types turned out to already match this design closely. |
-| `hive-core/src/watchdog/mod.rs` | `Watchdog::scan_line` — Tier 1, run on every streamed line, zero LLM cost. `Watchdog::review` — Tier 2, periodic (`WatchdogConfig::poll_interval_secs`, backing off to `reduced_poll_interval_secs` after `max_consecutive_safe` clean checks — both config fields Phase 1 had already added), asks the LLM "does this still look like it's working toward the objective?" over the JSON-extraction pattern proven in the Phase 2 planner. Soft-fails to "inconclusive, safe" on any LLM/parse error — Tier 1 remains the hard stop so a flaky LLM response can't spuriously pause a session. `extra_rules` from `hive.toml` are compiled in alongside the built-ins. |
+| `hive-core/src/watchdog/mod.rs` | `Watchdog::scan_line` — Tier 1, run on every streamed line, zero LLM cost. `Watchdog::review` — Tier 2, periodic (`WatchdogConfig::poll_interval_secs`, backing off to `reduced_poll_interval_secs` after `max_consecutive_safe` clean checks — both config fields Phase 1 had already added), asks **the local model** (never a routed one — see "Who reviews whom" below) "does this still look like it's working toward the objective?" over the JSON-extraction pattern proven in the Phase 2 planner. Soft-fails to "inconclusive, safe" on any LLM/parse error — Tier 1 remains the hard stop so a flaky LLM response can't spuriously pause a session. `extra_rules` from `hive.toml` are compiled in alongside the built-ins. |
 | `WorkerPool::delegate` | SSHes in, starts the tmux session, registers a `SessionInfo` (shared `Arc<Mutex<HashMap>>`, safe to read from `active_sessions()` concurrently), and spawns a background supervisor task. Returns as soon as the session is confirmed *started* — does not block on the remote command finishing. |
 | `supervise` (in `workers/mod.rs`) | The background task: `tokio::select!` between the next tailed line (Tier 1 + sentinel detection) and a poll-interval tick (Tier 2). On a Tier-1 or Tier-2 hit: sends `tmux send-keys C-c` (pause, not kill — preserves state for review), marks the session `TaskState::PausedByWatchdog`, and logs a handover notification with the exact `ssh ... -t 'tmux attach -t ...'` command to take over. On the `__HIVE_DONE__<code>` sentinel: marks `Completed`/`Failed` by exit code. |
 | `WorkerPool::refresh_health` | Real SSH reachability probe replacing "every worker boots `Offline`" — `hive-cli`'s `build_agent` now calls it before every `hive task`/`hive chat`. |
@@ -457,3 +457,46 @@ running today. What runs today:
 The `hive-worker` daemon has no host at present: the Arch box has no Rust toolchain,
 so nothing has been built there. Direct SSH+tmux delegation (the default path) works
 without it.
+
+
+---
+
+## Who reviews whom: the Tier-2 model asymmetry
+
+Surfaced by a knowledge-graph trace of `LlmRouter`, which is the second-highest
+betweenness node in the codebase. Four subsystems depend on it — the agent loop,
+the planner, the supervisor, and the watchdog — and they do **not** all use it
+the same way.
+
+| Consumer | Method | Model that actually runs |
+|:---|:---|:---|
+| `Planner::plan` (`planner.rs:196`) | `route_and_execute` | routed by complexity; **falls back to local** if the provider is unconfigured or fails |
+| `MasterAgent` (`agent/mod.rs:129`) | `classify_complexity` | routed |
+| `Watchdog::review` (`watchdog/mod.rs:101`) | **`local_complete`** | **always local — never routed** |
+
+So when a `CODE_HEAVY` task is planned by Codex or Claude, the safety review of
+that plan is still performed by the local 9B. The weakest model in the fleet
+judges the output of the strongest.
+
+**Why it is this way.** Tier 2 fires every `poll_interval_secs` for the whole
+life of every supervised session. Routing it to a cloud provider would bill
+continuously and add seconds of latency to a loop meant to be cheap, and Tier 1
+(regex) is the hard stop precisely because Tier 2 is the weaker, advisory signal.
+That is a defensible trade — but it was never written down, and `local_complete`
+at the call site looks indistinguishable from an oversight. It is now documented
+in `Watchdog::review`'s doc comment.
+
+**What it costs.** This is the likeliest source of Tier-2 false positives. On a
+successful run, review saw `4` from `nproc` during a 15-second sleep and reported
+the agent as "stuck". Harmless while verdicts are advisory; a watchdog that cries
+wolf on healthy work trains you to ignore it.
+
+**The second-order effect.** With no cloud API keys configured — the current
+state — planning *also* degrades to local. Both sides of the safety check then
+collapse onto the same 9B model: it plans the commands and it reviews its own
+output. Nothing distinguishes that from the healthy case except the "fell back
+from claude" badge in the agent UI.
+
+**The decision this leaves open.** If Tier-2 verdicts are ever promoted from
+advisory to blocking, route `review` through `route_and_execute` first. An
+advisory signal is allowed to be cheap and noisy; a blocking one is not.

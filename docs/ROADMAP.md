@@ -19,7 +19,7 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
 | 9 | Memory — projects, KG, RAG | 2–3 days | 2 | 🟡 KG substrate + machine graph + capability placement live ([`PLACEMENT.md`](PLACEMENT.md)); RAG, projects, history not started |
-| 10 | Safety watchdog | 2–3 days | 3, 7 | 🟡 Tier-1/Tier-2 remote (now suspends, not interrupts) + gate on local exec everywhere; no incident log/notifier |
+| 10 | Safety watchdog | 2–3 days | 3, 7 | 🟡 Tier-1/Tier-2 remote (now suspends, not interrupts) + gate on local exec everywhere; Tier 2 is always the local model ([STATUS](STATUS.md)); no incident log/notifier |
 | | **Total** | **~16–22 days** | | |
 
 Legend: ✅ done · 🟡 partial · 🔴 broken · ⬜ not started
@@ -92,7 +92,8 @@ state.
 - [x] Load `workers.toml` into a live pool at startup — **this was silently broken**:
       `hive-cli/src/main.rs` called `WorkerPool::new(vec![])` unconditionally even though
       `WorkersConfig` parsing already existed for `hive workers list`. Fixed.
-- [x] Tier-1 (regex) + Tier-2 (periodic LLM review) safety supervision, pulled forward from
+- [x] Tier-1 (regex) + Tier-2 (periodic **local**-LLM review — it bypasses the complexity
+      router, so a Claude-planned task is reviewed by the 9B) safety supervision, pulled forward from
       Phase 10 — see `docs/STATUS.md` for what's real vs. still-stub in that pull-forward.
 
 **Known limitation, not yet solved:** the background supervisor is a `tokio::spawn` task tied to

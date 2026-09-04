@@ -78,6 +78,27 @@ impl Watchdog {
     /// confidence" on any LLM/parse error — Tier 1 is the hard stop, this
     /// is supplementary judgment, and a flaky LLM response shouldn't pause
     /// a session on its own.
+    /// # Which model reviews
+    ///
+    /// This calls [`LlmRouter::local_complete`], **not** `route_and_execute`, so
+    /// Tier-2 always runs on the local model no matter how the task itself was
+    /// routed. A `CODE_HEAVY` plan written by Codex or Claude is therefore
+    /// judged by the local 9B — the weakest model in the fleet reviewing the
+    /// output of the strongest.
+    ///
+    /// That is a deliberate cost/latency trade, not an oversight: review fires
+    /// every `poll_interval_secs` for the whole life of every supervised
+    /// session, so routing it to a cloud provider would bill continuously and
+    /// add seconds of latency to a loop that is meant to be cheap. Tier 1
+    /// (regex) is the hard stop precisely because Tier 2's judgment is the
+    /// weaker signal.
+    ///
+    /// It has a real cost, and it is the likeliest source of Tier-2 false
+    /// positives: a 9B model shown a partial buffer mid-command has been
+    /// observed calling a healthy run "stuck". If Tier-2 verdicts are ever
+    /// promoted from advisory to blocking, route this through
+    /// `route_and_execute` first — an advisory signal may be cheap and noisy,
+    /// a blocking one may not.
     pub async fn review(
         &self,
         llm: &LlmRouter,
