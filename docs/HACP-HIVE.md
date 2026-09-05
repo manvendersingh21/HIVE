@@ -49,7 +49,7 @@ is marked implemented on the strength of a file existing.
 | Adapter (§13.2) | `hive-adapter/` | ✅ built, 37 tests, smoke-tested against a throwaway coordinator — and against a real CLI (codex) in the Phase S smoke, 2026-09-04 |
 | HTTP transport (§13.1) | `hive-web/src/collab.rs` | ⬜ not written |
 | CLI surface | `hive collab` | ⬜ not written |
-| Live two-agent run | — | ⬜ never run (Phase S exercised one real CLI + sink, not two agents; claude leg blocked by session limit) |
+| Live two-agent run | — | ⬜ never run **on 1.1** (Phase S exercised one real CLI + sink, not two agents). The live two-agent runs that exist are HACP/2.0 — see §6. |
 | Live N≥3 federated run | — | ⬜ never run |
 
 **What "offline-tested" means here, and does not.** Every ✅ above rests on `cargo test`:
@@ -93,7 +93,10 @@ moves to ✅ only after the proving command ran.
 | Cross-branch permits (§10) | `hacp/src/v2/grant.rs` | ✅ LCA issuance + `cross-branch/<class>` preauthorization; permits authorize the pair, not the outcome |
 | Escalation engine (§11) | `hacp/src/v2/escalation.rs` | ✅ raise→refer→resolve/no_agreement ladder; arbiter optional at every N, never mandatory |
 | HIVE profile module (§13) | `hacp/src/v2/profile.rs` | ✅ `hive-recursive-pairwise/1`: arity ≤ 2, LCA routing, sibling preauth issuance, role-independence advice — out of Core |
-| Re-enters with the runtime waves | HIVE runtime | ⬜ supervisor loops, spawn/delegate lifecycles, org bootstrapping |
+| Bilateral runtime — two agents, start to finish | `hive-core/src/runtime/` | ✅ `hive collab run`; 47 hermetic tests + two live pairs, 2026-09-05 |
+| Recursive spawn / delegate lifecycles (§8, §13) | HIVE runtime | ⬜ next milestone — arity ≤ 2, capability grants, LCA routing |
+| Org bootstrapping | HIVE runtime | ⬜ |
+| Distribution over SSH workers | HIVE runtime | ⬜ — today every agent runs in a local tmux session |
 
 Verified by (2026-09-04):
 
@@ -120,6 +123,57 @@ executed, submitted an artifact with a manifest, and settled, over the file edge
 frame-for-frame agreement between their two views of the exchange. The peer's need for a
 pinned digest preimage was caught as a spec defect and fixed (spec changelog, §7.5):
 that is the leak test working.
+
+### The HIVE runtime's first live runs (2026-09-05)
+
+Until this date the only thing that had ever driven a live 2.0 session was
+`interop/live/hacp-live.py` — a Python script that is not HIVE. `hive-core/src/runtime/`
+closes that: the production Rust path launches both agents, opens the session, freezes
+the contract, executes it, and gates the verdict. Every agent invocation is a supervised
+tmux session (`collab::session::LocalSessionHost`) with Tier-1 rules scanned on each
+output line, a timeout that suspends rather than kills, and SIGSTOP to the pane's
+foreground process group — none of which `subprocess.run` can do.
+
+```
+$ cargo build --workspace && cargo test --workspace
+    Finished `dev` profile [unoptimized + debuginfo] target(s)      # zero warnings
+test result: ok. 393 passed; 0 failed; 4 ignored                    # summed across the workspace
+
+$ hive collab run --supervisor claude --worker codex \
+    --task "produce status.txt containing exactly one line: a status report confirming \
+            the work is done, ending with the word ready" --timeout-secs 300
+Run directory: <run-dir>/20260905T001159Z-claudexcodex
+
+SETTLED — verdict accept
+  pair       claude x codex
+  session    s-34b09a064b31
+  contract   c-34b09a0601fe
+  frames     10
+  agent runs 4
+  checks     5 corroborated, 0 unmatched, 0 contradicted
+
+$ hive collab run --supervisor agy --worker claude --task "<same>" --timeout-secs 300
+SETTLED — verdict accept
+  pair       agy x claude
+  session    s-5c3839156696
+  contract   c-5c383915bbc2
+  frames     10
+  agent runs 4
+  checks     4 corroborated, 0 unmatched, 0 contradicted
+```
+
+Ten frames, not the Python driver's nine: this runtime closes the session on the wire.
+Transcripts and reports are committed as `interop/live/transcripts/hive-*`.
+
+**What these runs do and do not show.** They show that HIVE's own code can drive two
+heterogeneous stock CLIs through a complete bilateral lifecycle, and that the verifying
+agent's claims were re-measured — `shasum`, `wc`, `xxd`, `awk` output quoted in the
+verdict records, every claim independently corroborated by
+`runtime::attest`. They do not show that the *work* was worth doing: in the first pair
+the delivered artifact was six bytes long and satisfied every acceptance criterion the
+supervising agent had written, which is
+[finding 11](findings/adapter-edge.md). They also exercise no hierarchy — two agents, one
+contract, one machine.
 
 ### Live heterogeneous runs (2026-09-04)
 

@@ -1,0 +1,73 @@
+{
+ "artifact": {
+  "artifact_id": "urn:hacp:artifact:a845f5b4-7947-433c-b4ee-0417259baddd",
+  "contract_id": "c-34b09a0601fe",
+  "contract_revision": "62900c92567fd31a6100c71e4af240863c1024582e0759430d8422067ee0f4ff",
+  "derived_from": [],
+  "digest": "ed1a545bb85e55816bbf9566b028b2a0bc456b88f49f6f266c0401048824194b",
+  "location": "wrk/status.txt",
+  "media_type": "text/plain",
+  "producer": "urn:hacp:agent:wrk-34b09a06",
+  "size": 6,
+  "task_id": "t-34b09a06fe12",
+  "visibility": "participants"
+ },
+ "calls": [
+  {
+   "outcome": "exit 0",
+   "produced": true,
+   "role": "supervisor",
+   "seconds": 9,
+   "session": "hive-34b09a06-01-author",
+   "stage": "01-author"
+  },
+  {
+   "outcome": "exit 0",
+   "produced": true,
+   "role": "worker",
+   "seconds": 9,
+   "session": "hive-34b09a06-02-review",
+   "stage": "02-review"
+  },
+  {
+   "outcome": "exit 0",
+   "produced": true,
+   "role": "worker",
+   "seconds": 11,
+   "session": "hive-34b09a06-03-work",
+   "stage": "03-work"
+  },
+  {
+   "outcome": "exit 0",
+   "produced": true,
+   "role": "supervisor",
+   "seconds": 26,
+   "session": "hive-34b09a06-04-verify",
+   "stage": "04-verify"
+  }
+ ],
+ "contract_id": "c-34b09a0601fe",
+ "corroboration": {
+  "backed": [
+   "sha256-digest",
+   "line-count",
+   "file-size",
+   "non-whitespace-content",
+   "required-final-word"
+  ],
+  "contradicted": [],
+  "unmatched": []
+ },
+ "driver": "hive-core::runtime (hive collab run)",
+ "frames": 10,
+ "outcome": "settled",
+ "pair": "claude x codex",
+ "run_dir": "<run-dir>/claudexcodex",
+ "session_id": "s-34b09a064b31",
+ "supervisor_cli": "claude",
+ "task": "produce status.txt containing exactly one line: a status report confirming the work is done, ending with the word ready",
+ "task_id": "t-34b09a06fe12",
+ "transcript": "interop/live/transcripts/hive-claudexcodex.jsonl",
+ "verdict": "accept",
+ "worker_cli": "codex"
+}

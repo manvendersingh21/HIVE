@@ -91,3 +91,50 @@ The claude leg above is now exercised. New findings:
 10. **Exit codes remain meaningless.** Every CLI call in both settled runs exited 0 —
     including the ones that produced nothing (finding 8). Consistent with finding 4:
     adapters must derive outcome from artifacts, never from exit status.
+
+---
+
+## The HIVE runtime's own live runs (2026-09-05, M1)
+
+The same lifecycle, now driven by `hive-core::runtime` through `hive collab run` rather
+than by the Python script — every agent invocation a supervised tmux session, every
+claim measured by `runtime::attest`. Two pairs settled on their first attempt:
+
+| Pair | Frames | Verdict | Corroborated | Contradicted | Unmatched |
+|:---|:---:|:---|:---:|:---:|:---:|
+| `claude` sup × `codex` wrk | 10 | accept | 5 | 0 | 0 |
+| `agy` sup × `claude` wrk | 10 | accept | 4 | 0 | 0 |
+
+Ten frames rather than the Python driver's nine: this runtime also emits `session.close`,
+so the session reaches a terminal state on the wire instead of being abandoned.
+Transcripts and reports: `interop/live/transcripts/hive-*.{jsonl,json}`.
+
+11. **A contract can be satisfied completely and still deliver nothing.** In
+    `claude × codex` the supervising agent authored three acceptance criteria — one line,
+    non-empty, final word `ready` — and the performing agent wrote a file containing
+    exactly `ready\n`, six bytes. Every criterion holds. The verifier ran `shasum`, `wc`,
+    `xxd` and `awk` for real and accepted, correctly. The objective given to the run was
+    "a status report confirming the work is done, ending with the word ready", and no
+    report was produced.
+
+    Nothing malfunctioned. The worker satisfied the contract, the verifier verified the
+    contract, and the contract was not the objective. The identical artifact — same
+    digest, `ed1a545b…`, same six bytes — came out of the Python driver's `claude × codex`
+    run a day earlier, so this is reproducible, not a fluke.
+
+    It is worth being precise about what this does and does not show. §9.4 protects
+    against an agent lying about what it did; it says nothing about whether what it did
+    was worth doing. That second gap is a **drafting** problem — the supervising agent
+    wrote criteria that a degenerate output satisfies — and the place to close it is the
+    authoring brief and, eventually, an objective-satisfaction check that is not the
+    contract's own acceptance list. Adding a rule to the verifier would be the wrong fix:
+    the verifier did its job exactly.
+
+    Recorded rather than patched. The measurement is more useful than a quick guard, and
+    the next milestone that touches formation should be checked against it.
+
+12. **Both settled runs needed no retries.** Twelve of twelve invocations across the two
+    runs produced their required file on the first attempt (9–26 s each). Finding 8's
+    narrated-success failure did not reappear here, which is evidence about briefs rather
+    than about vendors: every brief in `runtime::brief` names an absolute target path
+    (finding 9) and states the required file as the single deliverable.

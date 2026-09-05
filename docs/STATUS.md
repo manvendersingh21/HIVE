@@ -5,6 +5,73 @@ compiled, tested, and run — not what a session claimed.
 
 ---
 
+## HIVE runtime: ✅ HIVE runs its own protocol, live — 2026-09-05
+
+For a while this project had a finished protocol it did not use. HACP/2.0 Core was
+complete, schema'd, golden'd, and proved against an independent Python peer — but the
+only thing that had ever driven a *live* 2.0 session was `interop/live/hacp-live.py`,
+432 lines of Python, and every line of HIVE's own Rust binding
+(`hive-core/src/collab/`, `hive-adapter/`) was built on the frozen 1.1 and could not open
+a 2.0 session at all.
+
+`hive-core/src/runtime/` closes that.
+
+```
+$ cargo build --workspace          # clean, zero warnings
+$ cargo test --workspace           # 393 passed, 0 failed, 4 ignored  (was 344)
+
+$ hive collab run --supervisor claude --worker codex \
+    --task "produce status.txt containing exactly one line: a status report \
+            confirming the work is done, ending with the word ready"
+SETTLED — verdict accept
+  pair       claude x codex     frames 10     agent runs 4
+  checks     5 corroborated, 0 unmatched, 0 contradicted
+
+$ hive collab run --supervisor agy --worker claude --task "<same>"
+SETTLED — verdict accept
+  pair       agy x claude       frames 10     agent runs 4
+  checks     4 corroborated, 0 unmatched, 0 contradicted
+```
+
+Both settled on the first attempt. Transcripts and reports are committed under
+`interop/live/transcripts/hive-*`.
+
+### What it is
+
+| Piece | Detail |
+|:---|:---|
+| `runtime/lifecycle.rs` | The bilateral run, in the order proved live by the Python driver: handshake → authoring → proposal → review → freeze → execute → submission → verification → settlement. Every protocol decision is taken by `hacp::v2`'s state machines; this module decides nothing about the work and everything about whether a claim may advance the run. |
+| `runtime/cli.rs` | How each stock CLI is started non-interactively. Every flag is there because leaving it out produced an observed failure — `codex`'s default sandbox is read-only and a blocked run exits 0; `agy`'s `--print` eats the token after it. |
+| `runtime/brief.rs` | The four briefs, and `require_file`: run the agent, then **look on disk**, with one retry that states what was missing. A test greps every rendered brief for every vendor name (§3). |
+| `runtime/edge.rs` | The file edge as two directories, not a shared variable — so the two sides share no state and the end-of-run transcript comparison means something. |
+| `runtime/attest.rs` | §9.4. The runtime measures the artifact itself and refuses to put an `accept` on the wire unless a claimed check is independently corroborated and none is contradicted. |
+| `runtime/report.rs` | The outcome taxonomy: `Settled`, `NoAgreement` (a protocol success, exit 0), `Failed { stage }`, `Paused { attach }`. No failure can read as success. |
+| `hive collab run\|show\|list` | The surface. Its exit code is the only part a script reads: 0 settled or no-agreement, 1 failed, 2 paused. |
+
+### Why this belongs in HIVE rather than in a script
+
+Every agent invocation is a supervised tmux session via
+`collab::session::LocalSessionHost`: Tier-1 rules scanned on every output line as it
+arrives, a timeout that suspends rather than kills, SIGSTOP to the pane's foreground
+process group. `subprocess.run` can do none of that, and this file records three separate
+occasions on which getting that wrong cost real work.
+
+### What these runs do not show
+
+- **Nothing about hierarchy.** Two agents, one contract, one machine. Recursive spawning
+  under the `hive-recursive-pairwise/1` profile and distribution over SSH workers are the
+  next two milestones, deliberately not stacked on top of this one.
+- **Nothing about the work being worth doing.** In `claude × codex` the artifact was six
+  bytes — `ready\n` — and satisfied every acceptance criterion the supervising agent had
+  written. The worker performed the contract; the verifier verified the contract; the
+  contract was not the objective. Recorded as
+  [finding 11](findings/adapter-edge.md), reproducible (the Python driver produced the
+  identical digest a day earlier), and deliberately not patched — §9.4 catches an agent
+  lying about what it did, and says nothing about whether it was worth doing. That is a
+  drafting gap, and it belongs to whichever milestone next touches formation.
+
+---
+
 ## Phase 3: ✅ Core delegation + safety supervision complete and live-verified
 
 This landed as a redesign, not the original plan's pseudocode: instead of a deployed

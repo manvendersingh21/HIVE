@@ -9,12 +9,14 @@
 //! - Memory system (projects, knowledge graph, RAG)
 //! - Safety watchdog (continuous monitoring, human-in-the-loop)
 //! - Fine-tuning data collection
+//! - Runtime (`runtime`) — running an HACP/2.0 collaboration between real agent CLIs
 
 pub mod agent;
 pub mod collab;
 pub mod finetune;
 pub mod llm;
 pub mod memory;
+pub mod runtime;
 pub mod skills;
 pub mod tools;
 pub mod watchdog;

@@ -15,7 +15,7 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | 3 | Worker pool, SSH delegation, tmux creation | 2 days | 2 | ✅ done, live-verified against a real worker (redesigned: direct SSH+tmux, no daemon — see below) |
 | 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ✅ done, live-verified (on the since-retired Azure worker) |
 | 5 | `hive-web` — web terminal + agent UI | 2–3 days | 3 | ✅ done, live on the master |
-| 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 `task`/`chat` route through the master and are gated; other subcommands still stubs |
+| 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 `task`/`chat`/`collab` are real; `sessions`/`attach`/`serve` still print stubs that are now false |
 | 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
 | 9 | Memory — projects, KG, RAG | 2–3 days | 2 | 🟡 KG substrate + machine graph + capability placement live ([`PLACEMENT.md`](PLACEMENT.md)); RAG, projects, history not started |
@@ -192,18 +192,28 @@ is only worth building when there are enough workers to justify a single pane.
 ---
 
 ## Phase 6 — CLI
-*Plan section: "Phase 7: CLI Interface"* · **Status: 🔴 no source file**
+*Plan section: "Phase 7: CLI Interface"* · **Status: 🟡 partial**
+
+> This section read "🔴 no source file" for a CLI that is 804 lines across
+> `hive-cli/src/{main,approval,master,collab}.rs`, contradicting this document's own
+> summary table. Corrected 2026-09-05.
 
 `clap`-based, binary named `hive`:
 
-- [ ] `hive chat` — interactive session with the master agent
-- [ ] `hive task -d "<description>"` — one-shot task submission
-- [ ] `hive sessions` — table of active sessions across workers
-- [ ] `hive attach <session_id>` — attach from a local terminal
-- [ ] `hive workers <add|list|remove|health>`
-- [ ] `hive skills <list|add|remove>`
-- [ ] `hive finetune <export|stats>`
-- [ ] `hive serve --bind` — start the web terminal server
+- [x] `hive chat` — interactive session with the master agent; prefers the long-lived
+      master, falls back in-process with a warning that supervision then ends on exit
+- [x] `hive task -d "<description>"` — one-shot submission, gated by the watchdog
+- [x] `hive collab <run|show|list>` — two-agent HACP/2.0 collaborations
+      ([`HACP-HIVE.md`](HACP-HIVE.md) §6)
+- [ ] `hive sessions` — **prints a false "not implemented (Phase 3/4)"**;
+      `WorkerPool::active_sessions()` has existed since Phase 3
+- [ ] `hive attach <session_id>` — **prints a false "not implemented (Phase 5)"**;
+      `workers::ssh::pane_target` and the web terminal both exist
+- [ ] `hive workers <add|remove|health>` — only `list` is wired, though
+      `WorkerPool::refresh_health` exists
+- [ ] `hive skills <list|add|remove>` (needs Phase 7)
+- [ ] `hive finetune <export|stats>` (needs Phase 8)
+- [ ] `hive serve --bind` — today it tells you to run `hive-web` directly
 - [ ] `hive project <new|list|switch>` and memory/search commands (needs Phase 9)
 
 ---

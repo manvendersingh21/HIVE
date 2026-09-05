@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 mod approval;
+mod collab;
 mod master;
 
 use approval::GatePolicy;
@@ -70,6 +71,11 @@ enum Commands {
     Finetune {
         #[command(subcommand)]
         action: FinetuneAction,
+    },
+    /// Run and review two-agent HACP/2.0 collaborations.
+    Collab {
+        #[command(subcommand)]
+        action: collab::CollabAction,
     },
     /// Start the web terminal server.
     Serve {
@@ -157,6 +163,15 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         },
+        Commands::Collab { action } => {
+            // The only command whose exit code carries information: a script needs to
+            // tell a settled run from one that stopped, and from one waiting on a human.
+            let code = collab::run(action).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Commands::Serve { bind } => {
             println!(
                 "hive-web is a separate binary. Run it directly:\n  HIVE_WEB_ADDR={bind} cargo run --bin hive-web"
