@@ -17,6 +17,16 @@ host = "hive-worker-2"
 user = "manubaba"
 tags = ["arch", "docker"]
 
+# The user's own MacBook Air over Tailscale (macOS 26, Apple Silicon, 8 GB).
+# Key auth via the fleet key (~/.ssh/hive_worker_ed25519, alias `mac-air`).
+# Tagged `personal` and `light` deliberately: it is a laptop someone may be
+# using — short jobs only, nothing sustained or memory-heavy.
+[[workers]]
+name = "mac-air"
+host = "mac-air"
+user = "manubaba"
+tags = ["macos", "arm64", "personal", "light"]
+
 # Temple University shared GPU node, reached through the cis-linux2 bastion.
 # Tagged `shared` and `slurm` deliberately: 30+ people use this box and it runs
 # a batch scheduler, so heavy or long work belongs in an sbatch job rather than
