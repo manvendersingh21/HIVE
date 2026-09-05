@@ -258,6 +258,7 @@ mod tests {
             complexity: Complexity::Simple,
             routed_provider: AiProvider::Local,
             provider: AiProvider::Local,
+            conversation_id: None,
             steps: vec![
                 PlannedStep {
                     id: 0,

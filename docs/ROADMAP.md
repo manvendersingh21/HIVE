@@ -21,7 +21,7 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 `task`/`chat`/`collab`/`sessions`/`attach`/`serve`/`workers health` all real and live-checked; `skills`/`finetune` wait on phases 7–8 |
 | 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
-| 9 | Memory — projects, KG, RAG | 2–3 days | 2 | 🟡 KG substrate + machine graph + capability placement live ([`PLACEMENT.md`](PLACEMENT.md)); RAG, projects, history not started |
+| 9 | Memory — projects, KG, RAG | 2–3 days | 2 | ✅ done, live-verified cross-process ([STATUS](STATUS.md)): scoped KG on the proven substrate, transcripts, RAG (nomic + cosine), local-model extraction, context injection, `hive project`/`search`/`memory` |
 | 10 | Safety watchdog | 2–3 days | 3, 7 | ✅ Tier-1/Tier-2 remote (suspends, not interrupts) + gate on local exec; durable incident log, all four `HumanDecision` variants, ntfy/webhook delivery, one `ractor` supervisor, review UI. Tier 2 is still always the local model ([STATUS](STATUS.md)) |
 | | **Total** | **~16–22 days** | | |
 
@@ -224,7 +224,9 @@ is only worth building when there are enough workers to justify a single pane.
       or it does not land.
 - [ ] `hive skills <list|add|remove>` (needs Phase 7)
 - [ ] `hive finetune <export|stats>` (needs Phase 8)
-- [ ] `hive project <new|list|switch>` and memory/search commands (needs Phase 9)
+- [x] `hive project <new|list|switch>` and `hive search` / `hive memory` (Phase 9) —
+      `--project` on `chat`/`task`, defaulting to the `hive project switch` marker;
+      live-verified cross-process in [STATUS.md](STATUS.md)
 
 ---
 
@@ -256,25 +258,23 @@ TOML-defined skills in `~/.hive/skills/<name>/`, each with `skill.toml`,
 ---
 
 ## Phase 9 — Memory: Projects, Knowledge Graph, RAG
-*Plan section: "Phase 9: Conversation Memory, Knowledge Graph & Project Scoping"* · **Status: 🟡**
+*Plan section: "Phase 9: Conversation Memory, Knowledge Graph & Project Scoping"* · **Status: ✅ done, live-verified**
 
-The reason the agent still knows what you decided three weeks ago.
+The reason the agent still knows what you decided three weeks ago — and now it
+does. Full detail, including the proving run and the schema decision, is in
+[STATUS.md](STATUS.md); the design notes live in [HANDOFF.md](HANDOFF.md) §3.
 
-The graph substrate is live and proven — `memory/graph.rs` (entities, edges, WAL,
-idempotent upsert) carries the machine fleet and capability placement
-([`PLACEMENT.md`](PLACEMENT.md)). What is missing is everything conversational: projects,
-transcripts, extraction, RAG. `MemorySystem::retrieve_context` returns three empty vectors
-and both of its call sites discard the result. Full breakdown, including the one schema
-decision that must be made first, is in [`HANDOFF.md`](HANDOFF.md) §3.
-
-- [ ] SQLite schema: `projects`, `conversations`, `messages`, `kg_nodes`, `kg_edges`, `rag_chunks`
-- [ ] `memory/projects.rs` — project registry and conversation scoping
-- [ ] `memory/extractor.rs` — local LLM extracts entities + relationships as JSON after each conversation
-- [ ] `memory/knowledge_graph.rs` — upsert, dedup by cosine similarity (`entity_dedup_threshold = 0.85`), traversal
-- [ ] `memory/rag.rs` — chunk (512 tokens / 64 overlap), embed via `nomic-embed-text`, vector search
-- [ ] `MemorySystem::retrieve_context` — real KG + RAG + recent-message retrieval (returns empty vectors today)
-- [ ] Context injection capped at `max_context_tokens`
-- [ ] `hive search` / `hive memory` CLI surface
+- [x] SQLite schema: `projects`, `conversations`, `messages`, `rag_chunks`,
+      `kg_embeddings` — and the **existing** `entities`/`edges` tables scoped
+      by a nullable `project_id` rather than the plan's parallel
+      `kg_nodes`/`kg_edges` (divergence recorded in STATUS)
+- [x] `memory/projects.rs` — project registry and conversation scoping
+- [x] `memory/extractor.rs` — local LLM extracts entities + relationships as JSON after each conversation
+- [x] Knowledge-graph upsert + dedup by cosine similarity (`entity_dedup_threshold = 0.85`) on the `memory/graph.rs` substrate
+- [x] `memory/rag.rs` — chunk (512 tokens / 64 overlap), embed via `nomic-embed-text`, vector search (linear scan, documented)
+- [x] `MemorySystem::retrieve_context` — real KG + RAG + recent-message retrieval
+- [x] Context injection capped at `max_context_tokens` — into the planner prompt, with an injection wall (memory is background, not instructions)
+- [x] `hive search` / `hive memory` / `hive project <new|list|switch>` CLI surface
 
 ---
 

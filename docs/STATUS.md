@@ -1,10 +1,198 @@
 # Hive — Current Status
 
-**Updated 2026-09-02, verified against a live build.** This audit reflects what was actually
+**Updated 2026-09-05, verified against a live build.** This audit reflects what was actually
 compiled, tested, and run — not what a session claimed.
 
 This file is the backward-looking record. The forward-looking one — what is left, in what
 order, with the gate and the traps — is [`HANDOFF.md`](HANDOFF.md).
+
+---
+
+## RT-0: the runtime re-verified live, as the gate before M4/M5 — 2026-09-05
+
+Before starting Phase 9 memory, the landed HACP/2.0 runtime was re-proven from the
+current tree — not quoted from this file. No runtime, `hacp/`, `collab/`, or
+`hive-adapter/` code was touched; the point was to confirm the existing path still
+works with a freshly rebuilt binary.
+
+```
+$ cargo build --workspace        # workspace members force-recompiled first —
+                                 # a cached build replays no warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.65s   # zero warnings
+$ cargo test --workspace --no-run                                         # zero warnings, test profile too
+$ cargo test --workspace 2>&1 | grep -E '^test result' \
+  | awk '{p+=$4; f+=$6; i+=$8} END {print "TOTAL:", p, "passed,", f, "failed,", i, "ignored"}'
+TOTAL: 449 passed, 0 failed, 5 ignored
+$ interop/run-interop.sh
+test an_independent_peer_interoperates_over_the_file_edge ... ok
+
+$ hive collab run --supervisor claude --worker codex \
+    --task "produce status.txt containing exactly one line: a status report \
+            confirming the work is done, ending with the word ready"
+SETTLED — verdict accept
+  pair       claude x codex     session s-70479c67e1f2   contract c-70479c67acc2
+  frames     10                 agent runs 4
+  checks     5 corroborated, 0 unmatched, 0 contradicted
+EXIT_CODE: 0
+
+$ hive collab run --supervisor agy --worker claude --task "<same>"
+SETTLED — verdict accept
+  pair       agy x claude       session s-74488b7ec5e8   contract c-74488b7e85ad
+  frames     10                 agent runs 4
+  checks     4 corroborated, 0 unmatched, 0 contradicted
+EXIT_CODE: 0
+```
+
+Both settled on the first attempt. Each run's report and transcript were then checked
+mechanically — not read pasted: `outcome=settled`, `verdict=accept`, ≥1 corroborated
+check with 0 unmatched / 0 contradicted, all four agent calls `exit 0` (clean shutdown),
+a frozen contract revision present, and the artifact digest **recomputed from the file
+on disk** matching the report. Both transcripts carry the full lifecycle on the wire,
+every frame `"protocol": "HACP/2.0"`:
+
+```
+session.open → session.features ×2 → contract.proposed → contract.accepted ×2
+→ contract.frozen → submission.delivered → verification.delivered → session.close
+```
+
+No 1.1 anywhere in the drive path: `git status` was clean during the runs (zero source
+changes), and the path is `hive collab run` → `runtime::run_bilateral` → `hacp::v2`
+state machines, with `collab`'s protocol-neutral `LocalSessionHost` only launching and
+supervising the CLIs. Transcripts and reports are committed under
+`interop/live/transcripts/rt0-20260905-*`.
+
+**Gate result: green. M4 (Phase 9 memory) may start.**
+
+---
+
+## M4 decision: one knowledge graph, project-scoped — 2026-09-05
+
+`docs/implementation-plan.md:681` prescribes project-scoped `kg_nodes` / `kg_edges`
+tables. `memory/graph.rs` already ships an unscoped `entities` / `edges` schema that
+holds the machine fleet, that `machines.rs` (785 lines) and the incident store depend
+on, and that is live in production. Two schemas for one idea.
+
+**Decision: extend the existing graph.** Entities gain a nullable `project_id` column
+(NULL = fleet/global scope — the machine fleet and everything `machines.rs` writes
+stays exactly where it is); project-scoped entities get ids namespaced
+`p:<project>:<kind>:<name>` so the primary key stays unique across scopes without a
+table rebuild. Existing read methods (`entities_of_kind`, `snapshot`) are explicitly
+unscoped reads; new scoped methods serve conversation memory. Old databases migrate
+in place (`ALTER TABLE … ADD COLUMN`, guarded by `PRAGMA table_info`) — the live
+`~/.hive/hive.db` must survive, not be recreated.
+
+Why not the plan's literal tables: a second graph implementation would leave
+`machines.rs` on the older one forever, and every traversal would exist twice. The
+substrate is proven; the plan's schema was written before it existed. The divergence
+is recorded here rather than silently taken — that is what this file is for.
+
+---
+
+## Phase 9: ✅ the agent remembers, across processes — 2026-09-05
+
+Until this pass, `MemorySystem::retrieve_context` returned three empty vectors
+and both of its call sites discarded the result. The knowledge-graph substrate
+was real — it holds the machine fleet — but nothing conversational existed: no
+projects, no transcripts, no RAG, no extraction, no injection, no CLI. And the
+CLI built its agent on `MemorySystem::new()`, the **in-memory** constructor, so
+even a working memory layer would have vanished between invocations (the M4
+trap in [`HANDOFF.md`](HANDOFF.md) §3.4 — fixed first, `hive-cli/src/main.rs`).
+
+```
+$ cargo build --workspace                          # zero warnings
+$ cargo test --workspace --no-run                  # zero warnings, test profile
+$ cargo test --workspace                           # 480 passed, 0 failed, 5 ignored  (was 449)
+$ interop/run-interop.sh                           # green — hacp untouched
+```
+
+### The proving run — two processes, one memory
+
+```
+$ hive project new hive-m4 --title "M4 acceptance"
+Project 'hive-m4' — M4 acceptance
+
+# process one: state a fact
+$ hive chat --local --project hive-m4
+> Remember this decision: our production database is called orion-prod and it
+  runs on port 5433, and we chose sqlite for local dev. Just acknowledge.
+Plan: Acknowledge the decision to use orion-prod on port 5433 …
+
+# process two — a fresh process with no shared state:
+$ hive chat --local --project hive-m4
+> What is our production database called, and what port does it run on?
+Plan: Retrieve stored project decisions regarding database configuration…
+  [0] echo "Production database: orion-prod (port 5433)"  (local)
+[ok] $ echo "Production database: orion-prod (port 5433)"
+    stdout: Production database: orion-prod (port 5433)
+
+$ hive search "orion"
+== conversations == … 5 hits across both turns …
+== knowledge ==
+- orion-prod
+- decision to use orion-prod on port 5433 for production
+== passages ==
+[0.59] user: Remember this decision: our production database is called orion-prod…
+
+$ hive memory
+database  /Users/manubaba/.hive/hive.db      # mode 0600 (ls -l: -rw-------)
+projects  1   conversations  3   messages  6
+rag       3 chunks   knowledge graph  36 fleet entities
+
+$ ls -l ~/.hive/hive.db
+-rw-------  …  hive.db
+```
+
+`orion-prod` and `5433` never existed outside the first process's memory
+writes. The second process planned its answer from retrieved context; the
+extraction pass had turned the turn into graph entities (`orion-prod`, the
+decision) which `hive search` now surfaces beside the RAG passages. The 36
+fleet entities are the machine graph — the **live production database was
+migrated in place** (`ALTER TABLE … ADD COLUMN project_id`), not recreated.
+
+### What was built
+
+| File | What it does |
+|:---|:---|
+| `memory/graph.rs` | Nullable `project_id` scope + guarded in-place migration + `p:<project>:<kind>:<name>` id namespacing + scoped reads (`entities_in_project`, `search_entities`). Fleet reads (`entities_of_kind`, `snapshot`) are explicitly NULL-scope — conversation concepts can never wander into the machine UI. `open` forces the file to 0600. |
+| `memory/projects.rs` | `projects` / `conversations` / `messages` on the graph's shared connection. Idempotent `ensure_project`; every `hive task`/chat request with a project opens exactly one conversation. |
+| `memory/rag.rs` | Chunk (512/64, chars/4 token approximation), embed via `OllamaClient::embed`, LE-f32 BLOBs, **linear-scan cosine** — the module doc says so and says why. `Embedder` trait; deterministic `HashEmbedder` for tests. Re-indexing replaces, never duplicates. |
+| `memory/extractor.rs` | Post-conversation extraction via the **local model only** (its module doc carries the same reasoning as `Watchdog::review`'s — a continuous background job must not bill a cloud provider). Cap 20 entities enforced after parsing; cosine dedup at 0.85 against stored entity embeddings; relations only between extracted entities. Every failure is a logged no-op. |
+| `memory/mod.rs` | `MemorySystem::open(path, &HiveConfig)`; real `retrieve_context` (recent + KG keyword match + RAG, jointly capped at `max_context_tokens`); `begin_turn`/`complete_turn` lifecycle; `search_all` for the CLI. |
+| `agent/mod.rs`, `planner.rs` | `plan_run` opens the turn and **injects** the rendered context into the planner prompt (framed as background, never instructions — memory is untrusted prior conversation). `execute_run` closes the turn only when the run actually completes — a plan parked awaiting approval has answered nothing worth remembering. `handle_request` gets the same treatment. |
+| `hive-cli` | `--project` on `chat`/`task` (defaulting to `hive project switch`'s marker); `hive project <new|list|switch>`; `hive search`; `hive memory`. All on the configured DB path. |
+
+### Decisions worth recording
+
+**One graph, not two** — see the M4 decision entry above: the plan's
+`kg_nodes`/`kg_edges` tables were not built; the proven `entities`/`edges`
+schema gained a scope column instead, and the divergence is documented here
+rather than taken silently.
+
+**Retrieval that is never injected is a more expensive way of doing nothing.**
+The old code retrieved context and discarded it at both call sites. The
+injection point is the *planner prompt* (not classification): memory should
+shape what the agent decides to do, and the classifier's job is routing, which
+past decisions do not change.
+
+**A parked plan is not an outcome.** `execute_run` persists and indexes only
+when `RunResult::is_complete()` — the two-legged web approval flow calls it
+twice, and the first pass (steps awaiting approval) records nothing.
+
+**Knowledge extraction runs local-only and fails soft** — same law as the
+Tier-2 review, stated in the module doc.
+
+### Found in passing — recorded, not rushed
+
+`hive chat` fed from a **pipe** with workers configured reads EOF immediately:
+the SSH ControlMaster spawned by `build_agent`'s health probe consumes piped
+stdin before the chat loop gets it. `hive task` (the scripting surface) never
+reads stdin and is unaffected; interactive chat is unaffected (proven in M3).
+The acceptance run used a workers-empty project root against the same
+database. The real fix belongs in the SSH layer with its own tests — noted
+here so it is found in minutes, not rediscovered.
+
+**Deployment note:** the long-lived master (`hive-web` under launchd) still
+runs the pre-Phase-9 binary; restart it to give the web chat the same memory.
 
 ---
 

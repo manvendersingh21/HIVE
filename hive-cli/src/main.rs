@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 mod approval;
 mod collab;
 mod master;
+mod memory_cli;
 
 use approval::GatePolicy;
 use clap::{Parser, Subcommand};
@@ -34,6 +35,9 @@ enum Commands {
         /// Run in this process instead of using the master daemon.
         #[arg(long)]
         local: bool,
+        /// Scope the conversation (and memory) to a project.
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Submit a task directly.
     Task {
@@ -52,6 +56,9 @@ enum Commands {
         /// process exits — which for `hive task` is almost immediately.
         #[arg(long)]
         local: bool,
+        /// Scope the task (and memory) to a project.
+        #[arg(long)]
+        project: Option<String>,
     },
     /// List active sessions across all workers.
     Sessions,
@@ -62,6 +69,20 @@ enum Commands {
         #[command(subcommand)]
         action: WorkerAction,
     },
+    /// Manage projects and the memory scope.
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+    /// Search project memory: conversations, knowledge, passages.
+    Search {
+        query: String,
+        /// Restrict the search to one project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Show what the memory system holds.
+    Memory,
     /// Manage skills.
     Skills {
         #[command(subcommand)]
@@ -82,6 +103,21 @@ enum Commands {
         #[arg(short, long, default_value = "0.0.0.0:8080")]
         bind: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Create a project (or show the existing one with that id).
+    New {
+        slug: String,
+        /// A human-readable title; defaults to the slug.
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// List every project, marking the current one.
+    List,
+    /// Set the default project for `hive chat` / `hive task`.
+    Switch { slug: String },
 }
 
 #[derive(Subcommand)]
@@ -121,12 +157,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Chat { local } => run_chat(&cli.project_root, local).await,
+        Commands::Chat { local, project } => {
+            let project = project.or_else(memory_cli::current_project);
+            run_chat(&cli.project_root, local, project.as_deref()).await
+        }
         Commands::Task {
             description,
             yes,
             deny_flagged,
             local,
+            project,
         } => {
             let policy = if yes {
                 GatePolicy::AssumeYes
@@ -135,7 +175,8 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 GatePolicy::Prompt
             };
-            run_task(&cli.project_root, &description, policy, local).await
+            let project = project.or_else(memory_cli::current_project);
+            run_task(&cli.project_root, &description, policy, local, project.as_deref()).await
         }
         Commands::Sessions => run_sessions(&cli.project_root).await,
         Commands::Attach { session_id } => run_attach(&cli.project_root, &session_id).await,
@@ -143,6 +184,18 @@ async fn main() -> anyhow::Result<()> {
             WorkerAction::List => run_workers_list(&cli.project_root),
             WorkerAction::Health => run_workers_health(&cli.project_root).await,
         },
+        Commands::Project { action } => {
+            let action = match action {
+                ProjectAction::New { slug, title } => memory_cli::ProjectAction::New { slug, title },
+                ProjectAction::List => memory_cli::ProjectAction::List,
+                ProjectAction::Switch { slug } => memory_cli::ProjectAction::Switch { slug },
+            };
+            memory_cli::run_project(&cli.project_root, action).await
+        }
+        Commands::Search { query, project } => {
+            memory_cli::run_search(&cli.project_root, &query, project.as_deref()).await
+        }
+        Commands::Memory => memory_cli::run_memory_status(&cli.project_root).await,
         Commands::Skills { action } => match action {
             SkillAction::List => {
                 println!("No skills loaded yet — the skill loader is not implemented (Phase 7).");
@@ -183,7 +236,11 @@ async fn build_agent(project_root: &Path) -> anyhow::Result<MasterAgent> {
     let workers = WorkerPool::new(workers_config.workers);
     workers.refresh_health().await;
     let skills = SkillRegistry::new();
-    let memory = MemorySystem::new();
+    // Opened on the configured path, not `new()`: the in-memory constructor
+    // was the M4 trap — an agent built on it forgets everything between
+    // invocations while appearing to work, which is the most expensive kind
+    // of bug to find. Persistence is the point of the memory system.
+    let memory = MemorySystem::open(config.database.resolved_path(), &config);
 
     Ok(MasterAgent::with_watchdog_config(
         llm,
@@ -211,12 +268,13 @@ async fn run_task(
     description: &str,
     policy: GatePolicy,
     force_local: bool,
+    project: Option<&str>,
 ) -> anyhow::Result<()> {
     if !force_local {
         let url = master::MasterClient::default_url();
         if let Some(client) = master::MasterClient::connect(&url).await? {
             println!("Submitting to the master at {url}\n");
-            return run_task_via_master(&client, description, policy).await;
+            return run_task_via_master(&client, description, policy, project).await;
         }
         println!(
             "No master reachable at {url} — running in this process.\n\
@@ -225,15 +283,16 @@ async fn run_task(
              supervision, or pass --local to silence this.\n"
         );
     }
-    run_task_locally(project_root, description, policy).await
+    run_task_locally(project_root, description, policy, project).await
 }
 
 async fn run_task_via_master(
     client: &master::MasterClient,
     description: &str,
     policy: GatePolicy,
+    project: Option<&str>,
 ) -> anyhow::Result<()> {
-    let reply = client.submit(description, None).await?;
+    let reply = client.submit(description, project).await?;
     approval::print_plan(&reply.run);
     approval::print_outcomes(&reply.result);
 
@@ -255,9 +314,10 @@ async fn run_task_locally(
     project_root: &Path,
     description: &str,
     policy: GatePolicy,
+    project: Option<&str>,
 ) -> anyhow::Result<()> {
     let agent = build_agent(project_root).await?;
-    run_request_on_agent(&agent, description, policy).await
+    run_request_on_agent(&agent, description, policy, project).await
 }
 
 /// Interactive chat.
@@ -265,7 +325,11 @@ async fn run_task_locally(
 /// Prefers the master for the same reasons as `hive task`. A long chat session
 /// does supervise its own delegations while it is open, but it still ends when
 /// you type `exit` — the master does not.
-async fn run_chat(project_root: &Path, force_local: bool) -> anyhow::Result<()> {
+async fn run_chat(
+    project_root: &Path,
+    force_local: bool,
+    project: Option<&str>,
+) -> anyhow::Result<()> {
     use std::io::{self, Write};
 
     let client = if force_local {
@@ -311,9 +375,11 @@ async fn run_chat(project_root: &Path, force_local: bool) -> anyhow::Result<()> 
 
         // Prompting is right here: a chat session is interactive by definition.
         let outcome = match (&client, &agent) {
-            (Some(client), _) => run_task_via_master(client, input, GatePolicy::Prompt).await,
+            (Some(client), _) => {
+                run_task_via_master(client, input, GatePolicy::Prompt, project).await
+            }
             (None, Some(agent)) => {
-                run_request_on_agent(agent, input, GatePolicy::Prompt).await
+                run_request_on_agent(agent, input, GatePolicy::Prompt, project).await
             }
             (None, None) => unreachable!("one of client or agent is always built"),
         };
@@ -330,10 +396,11 @@ async fn run_request_on_agent(
     agent: &MasterAgent,
     description: &str,
     policy: GatePolicy,
+    project: Option<&str>,
 ) -> anyhow::Result<()> {
     use hive_core::agent::run::Approvals;
 
-    let plan = agent.plan_run(description, None).await?;
+    let plan = agent.plan_run(description, project).await?;
     approval::print_plan(&plan);
 
     let result = agent.execute_run(&plan, &Approvals::none()).await;

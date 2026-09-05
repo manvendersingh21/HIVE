@@ -51,6 +51,14 @@ impl PlannedStep {
 pub struct PlannedRun {
     pub id: String,
     pub user_input: String,
+    /// The memory conversation this run belongs to, when the request carried
+    /// a project. `execute_run` closes the turn (persisting the outcome and
+    /// re-indexing memory) only when the run completes — a plan parked
+    /// awaiting approval has produced nothing worth remembering yet.
+    ///
+    /// `#[serde(default)]` keeps plans serialized by older builds loadable.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
     /// The planner's own description of its approach.
     pub summary: String,
     pub complexity: Complexity,
@@ -265,6 +273,7 @@ mod tests {
                 step(0, "df -h", None),
                 step(1, "rm -rf /", assess_command(&wd, "rm -rf /")),
             ],
+            conversation_id: None,
         };
         assert_eq!(run.gated_steps(), vec![1]);
     }

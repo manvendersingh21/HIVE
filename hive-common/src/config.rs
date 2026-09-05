@@ -271,6 +271,19 @@ pub struct MemoryConfig {
     pub knowledge_graph: KnowledgeGraphConfig,
 }
 
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            auto_index: default_true_bool(),
+            embedding_model: default_embed_model(),
+            chunk_size: default_chunk_size(),
+            chunk_overlap: default_chunk_overlap(),
+            max_context_tokens: default_max_context_tokens(),
+            knowledge_graph: KnowledgeGraphConfig::default(),
+        }
+    }
+}
+
 fn default_embed_model() -> String {
     "nomic-embed-text".to_string()
 }

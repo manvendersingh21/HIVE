@@ -111,7 +111,7 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
     // serving.
     let workers = WorkerPool::new(workers_config.workers);
 
-    let memory = MemorySystem::open(config.database.resolved_path());
+    let memory = MemorySystem::open(config.database.resolved_path(), &config);
     let agent = MasterAgent::with_watchdog_config(
         llm,
         workers,

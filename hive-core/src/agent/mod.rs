@@ -6,7 +6,7 @@ pub mod run;
 use std::sync::Arc;
 
 use hive_common::config::WatchdogConfig;
-use hive_common::{AgentResponse, TaskAssignment, TaskCommand};
+use hive_common::{AgentResponse, SafetyAnalysis, Severity, TaskAssignment, TaskCommand};
 use tracing::{info, warn};
 
 use crate::llm::LlmRouter;
@@ -125,13 +125,15 @@ impl MasterAgent {
     ) -> anyhow::Result<AgentResponse> {
         info!("Handling user request: {}", user_input);
 
-        // 1. Retrieve relevant context from memory (if project-scoped)
-        let _context = if let Some(pid) = project_id {
-            info!("Loading project context for '{}'", pid);
-            Some(self.memory.retrieve_context(pid, user_input).await?)
-        } else {
-            None
+        // 1. Open a memory turn: persist the input under the project and
+        //    fetch the context worth injecting. A broken memory degrades to
+        //    an empty turn rather than failing the request.
+        let turn = match project_id {
+            Some(pid) => Some(self.memory.begin_turn(pid, user_input).await),
+            None => None,
         };
+        let context_block = render_turn_context(turn.as_ref());
+        let skill = self.skills.resolve(user_input, &self.llm).await;
 
         // 2. Classify task complexity
         let complexity = self.llm.classify_complexity(user_input).await?;
@@ -141,8 +143,18 @@ impl MasterAgent {
         // 3. Plan: decompose into subtasks using the routed provider
         let plan = self
             .planner
-            .plan(&self.llm, user_input, complexity, &self.fleet_context())
+            .plan(
+                &self.llm,
+                user_input,
+                complexity,
+                &self.fleet_context(),
+                context_block.as_deref(),
+                skill,
+            )
             .await?;
+        if let Some(s) = skill {
+            info!(skill = %s.name, "skill active for this request");
+        }
         info!(
             "Plan: {} ({} subtask(s))",
             plan.summary,
@@ -208,6 +220,21 @@ impl MasterAgent {
             }
 
             for command in &subtask.commands {
+                // A confirmation-gated skill cannot run through this path:
+                // handle_request has no approval flow, so the commands are
+                // refused with a pointer to the surfaces that do gate —
+                // same posture as the Tier-1 interceptor below.
+                if let Some(s) = &skill {
+                    if s.require_confirmation {
+                        warn!(skill = %s.name, "skill requires confirmation; refusing in the one-shot path");
+                        notes.push(format!(
+                            "⚠ SKILL GATE: skill '{}' requires confirmation. \
+                             Use `hive task` or the web chat to approve it.\n  $ {command}",
+                            s.name
+                        ));
+                        continue;
+                    }
+                }
                 // Safety gate: check against the interceptor before running.
                 // handle_request has no approval flow, so flagged commands are
                 // refused outright — better than silent execution.
@@ -251,7 +278,13 @@ impl MasterAgent {
             format!("{}\n\n{}", plan.summary, notes.join("\n\n"))
         };
 
-        // 5. Return summary with tmux session access info for anything delegated
+        // 5b. Close the memory turn: persist the answer, re-index the
+        //     conversation, extract knowledge. Best-effort by contract.
+        if let Some(turn) = &turn {
+            self.memory.complete_turn(&turn.conversation_id, &summary).await;
+        }
+
+        // 6. Return summary with tmux session access info for anything delegated
         Ok(AgentResponse {
             summary,
             sessions,
@@ -273,9 +306,12 @@ impl MasterAgent {
     ) -> anyhow::Result<PlannedRun> {
         info!("Planning run for: {}", user_input);
 
-        if let Some(pid) = project_id {
-            let _context = self.memory.retrieve_context(pid, user_input).await?;
-        }
+        let turn = match project_id {
+            Some(pid) => Some(self.memory.begin_turn(pid, user_input).await),
+            None => None,
+        };
+        let context_block = render_turn_context(turn.as_ref());
+        let skill = self.skills.resolve(user_input, &self.llm).await;
 
         let complexity = self.llm.classify_complexity(user_input).await?;
         let provider = complexity.recommended_provider();
@@ -283,8 +319,18 @@ impl MasterAgent {
 
         let plan = self
             .planner
-            .plan(&self.llm, user_input, complexity, &self.fleet_context())
+            .plan(
+                &self.llm,
+                user_input,
+                complexity,
+                &self.fleet_context(),
+                context_block.as_deref(),
+                skill,
+            )
             .await?;
+        if let Some(s) = skill {
+            info!(skill = %s.name, "skill active for this request");
+        }
 
         let mut steps = Vec::new();
         for subtask in &plan.subtasks {
@@ -338,6 +384,25 @@ impl MasterAgent {
             }
         }
 
+        // A confirmation-gated skill marks every local step for approval —
+        // even ones the Tier-1 rules would allow. The gate is the existing
+        // one (`PlannedStep::needs_approval` → the interactive/web approval
+        // flow), not a new execution path; Phase 10 depends on there being
+        // no other way around the watchdog.
+        if let Some(s) = skill.filter(|s| s.require_confirmation) {
+            for step in &mut steps {
+                if step.risk.is_none() && matches!(step.target, StepTarget::Local) {
+                    step.risk = Some(SafetyAnalysis {
+                        is_safe: false,
+                        severity: Severity::Low,
+                        category: None,
+                        reason: format!("skill '{}' requires confirmation before running", s.name),
+                        suggested_action: "review".into(),
+                    });
+                }
+            }
+        }
+
         Ok(PlannedRun {
             id: format!("run-{}", uuid::Uuid::new_v4()),
             user_input: user_input.to_string(),
@@ -346,6 +411,7 @@ impl MasterAgent {
             routed_provider: provider,
             provider: plan.provider_used,
             steps,
+            conversation_id: turn.map(|t| t.conversation_id),
         })
     }
 
@@ -487,7 +553,7 @@ impl MasterAgent {
             }
         }
 
-        RunResult {
+        let result = RunResult {
             run_id: plan.id.clone(),
             summary: plan.summary.clone(),
             complexity: plan.complexity.clone(),
@@ -495,7 +561,19 @@ impl MasterAgent {
             outcomes,
             sessions,
             awaiting_approval: awaiting,
+        };
+
+        // Close the memory turn once the run is actually finished — not while
+        // steps still await approval. A parked plan has answered nothing;
+        // persisting it would teach memory that a half-run was the outcome.
+        if result.is_complete() {
+            if let Some(conv) = plan.conversation_id.as_deref().filter(|c| !c.is_empty()) {
+                let assistant = render_run_result(&result);
+                self.memory.complete_turn(conv, &assistant).await;
+            }
         }
+
+        result
     }
 
     // ----------------------------------------------------------- machine graph
@@ -615,4 +693,39 @@ fn default_master_name() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "master".to_string())
+}
+
+/// Render a memory turn's retrieved context for the planner prompt, or None
+/// when there is nothing worth injecting. The renderer already frames the
+/// content as background rather than instructions — memory is untrusted
+/// prior conversation, and the framing lives with the data, not at each
+/// call site.
+fn render_turn_context(turn: Option<&crate::memory::Turn>) -> Option<String> {
+    let t = turn?;
+    if t.context.is_empty() {
+        return None;
+    }
+    Some(t.context.render())
+}
+
+/// The persisted form of a finished run: the summary plus what each step
+/// actually did, trimmed so one runaway command output cannot dominate the
+/// memory index.
+fn render_run_result(result: &crate::agent::run::RunResult) -> String {
+    let mut text = result.summary.clone();
+    for o in &result.outcomes {
+        if o.command.is_empty() {
+            continue;
+        }
+        let output: String = o
+            .output
+            .chars()
+            .take(400)
+            .collect();
+        text.push_str(&format!(
+            "\n\n$ {} [{:?}]\n{}",
+            o.command, o.status, output
+        ));
+    }
+    text
 }

@@ -1,0 +1,71 @@
+{
+  "pair": "agy x claude",
+  "supervisor_cli": "agy",
+  "worker_cli": "claude",
+  "run_dir": "/Users/manubaba/.hive/collab/20260905T012938Z-agyxclaude",
+  "session_id": "s-74488b7ec5e8",
+  "contract_id": "c-74488b7e85ad",
+  "task_id": "t-74488b7e0fa9",
+  "task": "produce status.txt containing exactly one line: a status report confirming the work is done, ending with the word ready",
+  "outcome": "settled",
+  "verdict": "accept",
+  "frames": 10,
+  "calls": [
+    {
+      "role": "supervisor",
+      "stage": "01-author",
+      "session": "hive-74488b7e-01-author",
+      "outcome": "exit 0",
+      "seconds": 11,
+      "produced": true
+    },
+    {
+      "role": "worker",
+      "stage": "02-review",
+      "session": "hive-74488b7e-02-review",
+      "outcome": "exit 0",
+      "seconds": 6,
+      "produced": true
+    },
+    {
+      "role": "worker",
+      "stage": "03-work",
+      "session": "hive-74488b7e-03-work",
+      "outcome": "exit 0",
+      "seconds": 9,
+      "produced": true
+    },
+    {
+      "role": "supervisor",
+      "stage": "04-verify",
+      "session": "hive-74488b7e-04-verify",
+      "outcome": "exit 0",
+      "seconds": 18,
+      "produced": true
+    }
+  ],
+  "artifact": {
+    "artifact_id": "urn:hacp:artifact:bf3572d3-2c4a-4edb-84cf-3c3e81e63f64",
+    "media_type": "text/plain",
+    "digest": "7250e764d8a6d50dd1b3af5551a7d843495751560067e90c82254aa99c8b9852",
+    "size": 41,
+    "producer": "urn:hacp:agent:wrk-74488b7e",
+    "task_id": "t-74488b7e0fa9",
+    "contract_id": "c-74488b7e85ad",
+    "contract_revision": "dde3c2bfb4c0c308418d097be698113094d19e7dc69845b046bbf70fbecf9b32",
+    "derived_from": [],
+    "location": "wrk/status.txt",
+    "visibility": "participants"
+  },
+  "corroboration": {
+    "backed": [
+      "digest",
+      "size",
+      "line count",
+      "required words"
+    ],
+    "contradicted": [],
+    "unmatched": []
+  },
+  "transcript": "/Users/manubaba/.hive/collab/20260905T012938Z-agyxclaude/agyxclaude.jsonl"
+}

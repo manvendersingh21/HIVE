@@ -164,8 +164,22 @@ impl LlmRouter {
         prompt: &str,
         complexity: Complexity,
     ) -> anyhow::Result<LlmResponse> {
-        let provider = complexity.recommended_provider();
+        self.complete_with(prompt, complexity.recommended_provider())
+            .await
+    }
 
+    /// Run a prompt against one explicit provider.
+    ///
+    /// Exists for per-skill `ai_provider` overrides: a skill names the model
+    /// it wants its *reasoning* done by, and that choice must not be
+    /// overruled by whatever complexity the classifier happened to assign.
+    /// Falls back to local exactly as routed execution does — a forced but
+    /// unconfigured provider degrades, it does not fail the request.
+    pub async fn complete_with(
+        &self,
+        prompt: &str,
+        provider: AiProvider,
+    ) -> anyhow::Result<LlmResponse> {
         let result = match provider {
             AiProvider::Local => self.local.complete_raw(prompt).await,
             AiProvider::GeminiFlash => match &self.gemini {

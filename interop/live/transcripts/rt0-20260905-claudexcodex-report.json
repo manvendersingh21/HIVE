@@ -1,0 +1,72 @@
+{
+  "pair": "claude x codex",
+  "supervisor_cli": "claude",
+  "worker_cli": "codex",
+  "run_dir": "/Users/manubaba/.hive/collab/20260905T012837Z-claudexcodex",
+  "session_id": "s-70479c67e1f2",
+  "contract_id": "c-70479c67acc2",
+  "task_id": "t-70479c6766b2",
+  "task": "produce status.txt containing exactly one line: a status report confirming the work is done, ending with the word ready",
+  "outcome": "settled",
+  "verdict": "accept",
+  "frames": 10,
+  "calls": [
+    {
+      "role": "supervisor",
+      "stage": "01-author",
+      "session": "hive-70479c67-01-author",
+      "outcome": "exit 0",
+      "seconds": 9,
+      "produced": true
+    },
+    {
+      "role": "worker",
+      "stage": "02-review",
+      "session": "hive-70479c67-02-review",
+      "outcome": "exit 0",
+      "seconds": 12,
+      "produced": true
+    },
+    {
+      "role": "worker",
+      "stage": "03-work",
+      "session": "hive-70479c67-03-work",
+      "outcome": "exit 0",
+      "seconds": 14,
+      "produced": true
+    },
+    {
+      "role": "supervisor",
+      "stage": "04-verify",
+      "session": "hive-70479c67-04-verify",
+      "outcome": "exit 0",
+      "seconds": 21,
+      "produced": true
+    }
+  ],
+  "artifact": {
+    "artifact_id": "urn:hacp:artifact:73a65483-f64b-4cc0-8f42-655bd547a131",
+    "media_type": "text/plain",
+    "digest": "170e28aabbc2bd08a7d0009e76da8bcf2f9eefd3e53fbbdc971224f4179426a5",
+    "size": 30,
+    "producer": "urn:hacp:agent:wrk-70479c67",
+    "task_id": "t-70479c6766b2",
+    "contract_id": "c-70479c67acc2",
+    "contract_revision": "0a8cd06ab5cef3d5627e4514aeb012287eea5499bf38e76001be19c763e9a984",
+    "derived_from": [],
+    "location": "wrk/status.txt",
+    "visibility": "participants"
+  },
+  "corroboration": {
+    "backed": [
+      "sha256-digest",
+      "byte-size",
+      "line-count",
+      "required-last-word",
+      "content-encoding"
+    ],
+    "contradicted": [],
+    "unmatched": []
+  },
+  "transcript": "/Users/manubaba/.hive/collab/20260905T012837Z-claudexcodex/claudexcodex.jsonl"
+}
