@@ -5,6 +5,126 @@ compiled, tested, and run — not what a session claimed.
 
 ---
 
+## Watchdog: ✅ Phase 10's back half — incidents are durable and answerable — 2026-09-05
+
+Until this pass, a Tier-1 or Tier-2 hit produced a `tracing::warn!` and nothing else. The
+session was suspended correctly, but the fact that it happened lived only in a log line:
+nothing could list what was awaiting review, nothing recorded whether a human had
+answered, and restarting the supervising process forgot every incident it had ever
+raised. `Incident`, `IncidentReviewState`, and `HumanDecision` had been declared in
+`hive-common/src/protocol.rs` since Phase 1 with no producer and no consumer;
+`HiveError::IncidentNotFound` had never been constructed. All four are now live.
+
+```
+$ cargo build --workspace                          # zero warnings
+$ cargo test --workspace --no-run | grep -i warning # zero warnings in the TEST profile too
+$ cargo test --workspace                           # 449 passed, 0 failed, 5 ignored  (was 402)
+$ interop/run-interop.sh                           # L4 still green — hacp untouched
+running 1 test
+test an_independent_peer_interoperates_over_the_file_edge ... ok
+```
+
+### The loop, proven end to end against a real worker
+
+A real tmux session on `cis-linux2`, suspended the way the watchdog suspends one, then
+answered through the review API — not a fake, not a unit test:
+
+```
+# a real job, SIGSTOPped at its foreground process group
+pane_pid=955826 foreground_pgid=955837
+state after SIGSTOP:  955837 TN   sleep
+
+$ curl -b cookie http://127.0.0.1:18116/api/incidents
+  inc-live-4  critical cis-linux2  hive-m3-live
+
+$ curl -b cookie -X POST -d '"resume"' .../api/incidents/inc-live-4/decide
+{... "review_state":"resumed", "decision":"resume", "applied":"resumed"}   <- 200
+
+# the remote process actually moved:
+process group state now:  956177 SN+  sleep
+tick lines: before=21  after 6s=24
+VERDICT: the session is running again
+
+# a second operator now clicks Abort on the same incident:
+{"error":"incident 'inc-live-4' was already reviewed (resumed) — refusing to decide it twice"}  <- 409
+SESSION ALIVE — abort was refused before it could kill anything
+```
+
+That last exchange is the point of the whole design. See "deciding twice" below.
+
+### What was built
+
+| File | What it does |
+|:---|:---|
+| `hive-core/src/watchdog/incidents.rs` | SQLite incident log on the `memory/graph.rs` substrate. `record` is an idempotent upsert; `pending`/`recent`/`for_session` are the review queries; `resolve` is a compare-and-swap. |
+| `hive-core/src/watchdog/review.rs` | `SessionControl` + `ReviewDesk`. Consumes all four `HumanDecision` variants against a real session. |
+| `hive-core/src/watchdog/supervisor.rs` | One `ractor` actor supervising every session, with a registry keyed by session name, replacing the ad-hoc `tokio::spawn` per delegation. |
+| `hive-core/src/watchdog/notifier.rs` | ntfy.sh and webhook delivery beside the existing iMessage path. Every channel best-effort and independent. |
+| `hive-web/src/incidents.rs` + `static/incidents.html` | The review UI: the queue, the flagged output, and the four answers. |
+
+### Three decisions worth recording
+
+**Deciding twice is refused, not merged.** `IncidentStore::resolve` guards its UPDATE on
+`review_state = 'pending_review'`, making it a compare-and-swap: exactly one caller can
+resolve a given incident. `ReviewDesk` therefore records *before* it acts. Acting first
+would let two operators with the review page open both reach the session — and *resume*
+racing *abort* on the same suspended process is precisely the state a human was asked to
+prevent. The live 409 above is that guard firing, with the session still alive behind it.
+
+The cost is a window where the row is committed but the SSH call failed. No transaction
+spans SQLite and a remote tmux, so it cannot be closed — it is reported instead:
+`DecisionError::RecordedButNotApplied` names the session and says the decision cannot be
+re-submitted, because a second click can only ever hit the 409. An unreachable worker is
+refused *before* anything is written (HTTP 502, incident stays open), so a bad connection
+never spends the incident's one answer.
+
+**The incident database is mode 0600.** `SafetyCategory::CredentialExposure` fires
+*because* a credential appeared in a session's output — and `flagged_output` is that
+output. Redacting it would defeat the record: a reviewer who cannot see what was flagged
+cannot judge it. So the bytes are kept and the file is locked down, with a test asserting
+the mode. Anyone who can read `~/.hive/hive.db` could already read the operator's `~/.hive`
+credentials; nothing new is exposed to a reader already inside.
+
+**ractor's default supervision would have been a silent disaster.** Its stock
+`handle_supervisor_evt` is `myself.stop(None)` on *any* child exit — so the first session
+to finish *normally* would have torn down supervision of every other running session.
+`SessionSupervisor` overrides it. This was verified by deleting the override: 7 of 9
+supervisor tests fail with "the actor is likely terminated". Restored, all 9 pass.
+
+### Fixed in passing: static pages were served outside the auth gate
+
+`hive-web`'s router called `.fallback_service(ServeDir::new(...))` *after*
+`.layer(require_auth)`. `Router::layer` wraps only what has been added when it is called,
+so the static fallback sat outside the gate — `GET /index.html`, `/machines.html`, and now
+`/incidents.html` returned their page shells to anyone who could reach the port. No data
+leaked (every page fetches its contents through a gated `/api/` route), but the markup was
+public, and a page whose buttons abort running sessions made it worth fixing rather than
+noting. Proven:
+
+```
+/incidents.html  status=303 -> http://127.0.0.1:18111/login
+/index.html      status=303 -> http://127.0.0.1:18111/login
+/api/incidents   unauthorized <- status=401
+/login           status=200      (still open, as required)
+/api/health      status=200      (still open)
+```
+
+### Still open
+
+- `hive-web`'s `IncidentReview::from_env` and `WorkerPool::open_incident_log` each resolve
+  `~/.hive/hive.db` separately, because `DatabaseConfig` has no `Default`. One of them
+  belongs in `hive-common`.
+- `SupervisorHandle::stop_session` / `shutdown` exist so supervision is addressable, but
+  no CLI or web surface calls them yet.
+- Terminal rows are retained in the supervisor registry rather than dropped, because
+  `delegate`'s contract says `active_sessions()` is how completion is observed. A
+  long-lived master therefore accumulates one row per delegated session — the same
+  unbounded growth the Phase 3 map had, carried forward deliberately rather than changed
+  silently.
+- `worker.active_tasks` is incremented on delegate and never decremented. Pre-existing.
+
+---
+
 ## HIVE runtime: ✅ HIVE runs its own protocol, live — 2026-09-05
 
 For a while this project had a finished protocol it did not use. HACP/2.0 Core was
@@ -227,10 +347,10 @@ with **no** safety net once the CLI process exits, not as "the watchdog has it."
   `SshWorker`/`supervise` machinery built here should cover it once a worker has those CLIs
   installed and authenticated; a **local** (no-SSH, local tmux) supervised session for the
   already-authenticated local `claude`/`codex` is the more natural next slice.
-- Full Phase 10 watchdog: no `Incident`/`IncidentReviewState` persistence, no `HumanDecision`
-  (resume/abort/modify-and-resume) handling, no ntfy.sh/webhook delivery — today's notification
-  is a `tracing::warn!` log line. `Severity`/`SafetyCategory`/`SafetyAnalysis`/`Incident` are
-  all still the Phase 1 types; only `SafetyAnalysis` is actually produced and used yet.
+- Full Phase 10 watchdog: **closed 2026-09-05** — see the watchdog section at the top of this
+  file. `Incident`/`IncidentReviewState` are persisted, all four `HumanDecision` variants are
+  consumed, and ntfy.sh/webhook delivery is wired. This entry is left in place because the
+  sentence below it about `active_sessions()` still describes the Phase 3 state accurately.
 - `WorkerPool::active_sessions()` isn't surfaced anywhere in the CLI yet (`hive sessions` still
   prints its Phase 1 placeholder) or in `hive-web` (`/api/sessions` still returns `"[]"`).
 

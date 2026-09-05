@@ -25,3 +25,8 @@ chrono = { workspace = true }
 portable-pty = { workspace = true }
 uuid = { workspace = true }
 futures = "0.3"
+
+[dev-dependencies]
+# Only the test fake for `SessionControl` needs it; the production path takes
+# the trait already implemented on `SshWorker` in hive-core.
+async-trait = { workspace = true }

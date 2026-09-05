@@ -4,20 +4,22 @@
 pub mod sessions;
 pub mod ssh;
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hive_common::{
-    SafetyAnalysis, SessionInfo, TaskAssignment, TaskState, WorkerInfo, WorkerStatus,
-};
-use tokio::sync::Mutex;
-use tracing::{info, warn};
+use async_trait::async_trait;
+use hive_common::{SessionInfo, TaskAssignment, TaskState, WorkerInfo, WorkerStatus};
+use tokio::sync::OnceCell;
+use tracing::{error, info, warn};
 
 use crate::llm::LlmRouter;
+use crate::watchdog::notifier::Notifier;
+use crate::watchdog::supervisor::{
+    open_incident_log, SessionSpec, SessionTap, SupervisorHandle,
+};
 use crate::watchdog::Watchdog;
-use ssh::SshWorker;
+use ssh::{LogTail, PauseOutcome, SshWorker};
 
 /// Ceiling on one worker health probe.
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -26,7 +28,12 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct WorkerPool {
     /// Worker definitions loaded from config.
     pub workers: Vec<WorkerNode>,
-    sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
+    /// The one supervisor watching everything this pool has delegated.
+    ///
+    /// Started on first use rather than in [`WorkerPool::new`]: `new` is sync
+    /// and called from both binaries' startup paths, and spawning an actor is
+    /// not. A pool that never delegates never pays for a supervisor.
+    supervisor: OnceCell<SupervisorHandle>,
 }
 
 /// A worker node with connection state.
@@ -94,7 +101,7 @@ impl WorkerPool {
 
         Self {
             workers: nodes,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            supervisor: OnceCell::new(),
         }
     }
 
@@ -153,9 +160,24 @@ impl WorkerPool {
         }
     }
 
+    /// The supervisor watching this pool's sessions, starting it if this is
+    /// the first delegation.
+    ///
+    /// Its incident log is the configured one (`~/.hive/hive.db`), falling
+    /// back to an ephemeral log if that cannot be opened — losing the history
+    /// is survivable, refusing to supervise is not.
+    pub async fn supervisor(&self) -> anyhow::Result<&SupervisorHandle> {
+        self.supervisor
+            .get_or_try_init(|| async {
+                SupervisorHandle::start(Arc::new(open_incident_log())).await
+            })
+            .await
+    }
+
     /// Delegate `task` to `worker`: SSH in, start a supervised tmux
-    /// session on it, and spawn a background monitor that applies the
-    /// watchdog's Tier-1/Tier-2 checks to its output as it streams in.
+    /// session on it, and hand the session to the central supervisor, which
+    /// applies the watchdog's Tier-1/Tier-2 checks to its output as it
+    /// streams in.
     ///
     /// Returns as soon as the remote session is confirmed started — the
     /// caller does not block on the delegated command finishing. Track
@@ -181,6 +203,13 @@ impl WorkerPool {
         }
         let log_path = format!("/tmp/{}.log", task.tmux_session_name);
 
+        // The supervisor is started before the remote session, not after: if
+        // it cannot start, nothing would be watching the session we are about
+        // to create, and an unwatched remote session is the state this whole
+        // subsystem exists to prevent. Failing here costs one delegation;
+        // failing after `spawn_tmux` would leave real work running blind.
+        let supervisor = self.supervisor().await?;
+
         ssh.spawn_tmux(&task.tmux_session_name, &command, &log_path)
             .await?;
         worker.active_tasks.fetch_add(1, Ordering::Relaxed);
@@ -192,179 +221,107 @@ impl WorkerPool {
             state: TaskState::Running,
             created_at: chrono::Utc::now(),
         };
-        self.sessions
-            .lock()
-            .await
-            .insert(task.tmux_session_name.clone(), session_info.clone());
 
-        let sessions = self.sessions.clone();
-        let session_name = task.tmux_session_name.clone();
         let expected_behavior = task
             .expected_behavior
             .clone()
             .unwrap_or_else(|| task.description.clone());
 
-        tokio::spawn(async move {
-            let session_name_for_log = session_name.clone();
-            let result = supervise(SuperviseParams {
-                ssh,
-                session_name,
-                ssh_target,
-                log_path,
-                expected_behavior,
-                llm,
-                watchdog,
-                sessions,
-            })
-            .await;
-            if let Err(e) = result {
-                warn!("Supervisor for session '{session_name_for_log}' ended with error: {e}");
+        // The tail is opened here, on the connection that just started the
+        // session, so a failure to attach to the log is reported to the caller
+        // rather than surfacing minutes later inside a detached task.
+        //
+        // Past this point the remote work is already running, so both failures
+        // below leave a live, *unwatched* session behind. That is not something
+        // to clean up by killing it — killing is what destroys the state a
+        // human would need — so it is reported instead, with the command to go
+        // and look. Returning `Err` while the session runs is the honest
+        // answer: the caller was promised supervision and did not get it.
+        let tail = match ssh.tail(&log_path).await {
+            Ok(tail) => tail,
+            Err(e) => {
+                error!(
+                    "Session '{}' is RUNNING UNWATCHED on '{}': could not tail its log ({e}). \
+                     Inspect: ssh {ssh_target} -t 'tmux attach -t {}'",
+                    task.tmux_session_name, worker.info.name, task.tmux_session_name
+                );
+                return Err(e);
             }
-        });
+        };
+        let tap = SshTap {
+            ssh,
+            tail,
+            session_name: task.tmux_session_name.clone(),
+        };
+
+        if let Err(e) = supervisor
+            .supervise(SessionSpec {
+                session: session_info.clone(),
+                ssh_target: ssh_target.clone(),
+                expected_behavior,
+                tap: Box::new(tap),
+                llm,
+                alerts: Arc::new(Notifier::from_config(
+                    watchdog.config().notifications.clone(),
+                )),
+                watchdog,
+            })
+            .await
+        {
+            error!(
+                "Session '{}' is RUNNING UNWATCHED on '{}': the supervisor refused it ({e}). \
+                 Inspect: ssh {ssh_target} -t 'tmux attach -t {}'",
+                task.tmux_session_name, worker.info.name, task.tmux_session_name
+            );
+            return Err(e);
+        }
 
         Ok(session_info)
     }
 
     /// Currently tracked delegated sessions (across all workers).
+    ///
+    /// The supervisor's registry is the source: there is no second map here to
+    /// drift out of step with what is actually being watched. Empty before the
+    /// first delegation, because nothing is being supervised yet.
+    ///
+    /// Still process-local, and still not what `hive sessions` should ask —
+    /// see [`crate::workers::sessions`] for why that command reads `tmux ls`
+    /// instead.
     pub async fn active_sessions(&self) -> Vec<SessionInfo> {
-        self.sessions.lock().await.values().cloned().collect()
-    }
-}
-
-/// Owned inputs for [`supervise`] — grouped so the spawned task can move
-/// everything in one shot without a long argument list.
-struct SuperviseParams {
-    ssh: SshWorker,
-    session_name: String,
-    ssh_target: String,
-    log_path: String,
-    expected_behavior: String,
-    llm: Arc<LlmRouter>,
-    watchdog: Arc<Watchdog>,
-    sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
-}
-
-/// Tail a delegated session's log, applying Tier-1 rules to every line and
-/// Tier-2 LLM review on a timer, until the task finishes or an incident
-/// pauses it.
-async fn supervise(params: SuperviseParams) -> anyhow::Result<()> {
-    let SuperviseParams {
-        ssh,
-        session_name,
-        ssh_target,
-        log_path,
-        expected_behavior,
-        llm,
-        watchdog,
-        sessions,
-    } = params;
-    let session_name = session_name.as_str();
-    let ssh_target = ssh_target.as_str();
-    let expected_behavior = expected_behavior.as_str();
-
-    let mut tail = ssh.tail(&log_path).await?;
-    let config = watchdog.config().clone();
-
-    let mut poll_interval =
-        tokio::time::interval(Duration::from_secs(config.poll_interval_secs.max(1)));
-    poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut consecutive_safe: u32 = 0;
-    let mut recent_lines: Vec<String> = Vec::new();
-
-    loop {
-        tokio::select! {
-            line = tail.next_line() => {
-                let Some(line) = line? else {
-                    // Remote tail process ended without a completion sentinel
-                    // (e.g. the tmux session or SSH connection was killed).
-                    if let Some(info) = sessions.lock().await.get_mut(session_name) {
-                        info.state = TaskState::Failed;
-                    }
-                    return Ok(());
-                };
-
-                if let Some(code_str) = line.strip_prefix("__HIVE_DONE__") {
-                    let exit_code: i32 = code_str.trim().parse().unwrap_or(-1);
-                    if let Some(info) = sessions.lock().await.get_mut(session_name) {
-                        info.state = if exit_code == 0 { TaskState::Completed } else { TaskState::Failed };
-                    }
-                    info!("Session '{session_name}' finished with exit code {exit_code}");
-                    return Ok(());
-                }
-
-                recent_lines.push(line.clone());
-                if recent_lines.len() > config.capture_lines as usize {
-                    recent_lines.remove(0);
-                }
-
-                if let Some(analysis) = watchdog.scan_line(&line) {
-                    handle_incident(&ssh, session_name, ssh_target, &analysis, &sessions).await;
-                    return Ok(());
-                }
-            }
-            _ = poll_interval.tick(), if config.llm_analysis && !recent_lines.is_empty() => {
-                let analysis = watchdog.review(&llm, expected_behavior, &recent_lines.join("\n")).await;
-                if !analysis.is_safe {
-                    handle_incident(&ssh, session_name, ssh_target, &analysis, &sessions).await;
-                    return Ok(());
-                }
-                consecutive_safe += 1;
-                if consecutive_safe == config.max_consecutive_safe {
-                    poll_interval = tokio::time::interval(Duration::from_secs(config.reduced_poll_interval_secs.max(1)));
-                    poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                }
+        let Some(supervisor) = self.supervisor.get() else {
+            return Vec::new();
+        };
+        match supervisor.supervised().await {
+            Ok(sessions) => sessions.into_iter().map(|s| s.info).collect(),
+            Err(e) => {
+                warn!("could not read the supervisor's registry: {e}");
+                Vec::new()
             }
         }
     }
 }
 
-/// Pause the session (not kill it — preserves state for human review),
-/// mark it in the registry, and log a handover notification with the
-/// exact command to reattach. Full incident logging / IncidentReviewState
-/// tracking / push notifications are still Phase 10; this is the minimum
-/// needed to not run an unattended session with zero safety net.
-async fn handle_incident(
-    ssh: &SshWorker,
-    session_name: &str,
-    ssh_target: &str,
-    analysis: &SafetyAnalysis,
-    sessions: &Arc<Mutex<HashMap<String, SessionInfo>>>,
-) {
-    warn!(
-        "WATCHDOG INCIDENT [{}] session '{session_name}': {}{}",
-        analysis.severity,
-        analysis
-            .category
-            .as_ref()
-            .map(|c| format!("{c} — "))
-            .unwrap_or_default(),
-        analysis.reason
-    );
+/// The [`SessionTap`] the real system uses.
+///
+/// `tail -f` over the worker's pooled SSH connection for output, and that same
+/// connection for the suspend. Both halves are held together so supervision
+/// owns exactly one connection per session and cannot end up suspending
+/// through a connection that has since been dropped.
+struct SshTap {
+    ssh: SshWorker,
+    tail: LogTail,
+    session_name: String,
+}
 
-    // SIGSTOP, not C-c. Interrupting kills the session outright — the shell
-    // spawned by `spawn_tmux` has only this one command to run — which
-    // destroys the state a reviewer is being told to attach to, and can orphan
-    // long-running children. Suspending freezes it intact.
-    let outcome = ssh.pause_session(session_name).await;
-
-    if let Some(info) = sessions.lock().await.get_mut(session_name) {
-        info.state = TaskState::PausedByWatchdog;
+#[async_trait]
+impl SessionTap for SshTap {
+    async fn next_line(&mut self) -> anyhow::Result<Option<String>> {
+        self.tail.next_line().await
     }
 
-    match outcome {
-        Ok(crate::workers::ssh::PauseOutcome::Suspended) => warn!(
-            "Session '{session_name}' SUSPENDED for human review. To inspect and take over: \
-             ssh {ssh_target} -t 'tmux attach -t {session_name}'  \
-             (it is stopped; resume with: kill -CONT -<pgid>)"
-        ),
-        Ok(crate::workers::ssh::PauseOutcome::AlreadyEnded) => warn!(
-            "Session '{session_name}' was flagged, but had already finished — nothing left \
-             to suspend. The output is still on the worker for review."
-        ),
-        Err(e) => warn!(
-            "Session '{session_name}' flagged and is STILL RUNNING — suspend failed: {e}. \
-             Inspect immediately: ssh {ssh_target} -t 'tmux attach -t {session_name}'"
-        ),
+    async fn pause(&mut self) -> anyhow::Result<PauseOutcome> {
+        self.ssh.pause_session(&self.session_name).await
     }
 }
 

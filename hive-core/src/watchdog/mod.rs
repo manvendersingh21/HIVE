@@ -2,17 +2,30 @@
 //! Tier-2 periodic LLM review checks whether a long-running session still
 //! looks like it's working toward its stated objective.
 //!
-//! This intentionally does not (yet) include the full ractor-actor,
-//! multi-session supervisor, or ntfy.sh/webhook notification delivery from
-//! the original Phase 10 plan — those still belong there. What's here is
-//! the part needed to safely run *any* unattended session at all: fast
-//! regex triage plus a from-first-principles LLM judgment call are the
-//! floor a supervised session needs, and Phase 3 delegation shouldn't ship
-//! without it.
+//! Detection ([`rules`], [`Watchdog::scan_line`], [`Watchdog::review`]) shipped
+//! first, ahead of its phase, because Phase 3 delegation should not run an
+//! unattended remote session with no safety net at all. The rest of Phase 10
+//! is now here around it:
+//!
+//! - [`supervisor`] — one `ractor` actor supervising every session, with a
+//!   registry keyed by session name, in place of a detached task per delegation.
+//! - [`incidents`] — the durable log. A hit used to be a `warn!` and nothing
+//!   else, so nothing could list what was awaiting review or remember that a
+//!   human had answered.
+//! - [`review`] — carrying that answer out: resume, abort, resume-with-note,
+//!   modify-and-resume.
+//! - [`notifier`] — iMessage, ntfy.sh, and webhook delivery, each best-effort
+//!   and independent of the others.
+//!
+//! Tier 1 remains the hard stop and Tier 2 remains advisory; see
+//! [`Watchdog::review`] for why that asymmetry is deliberate.
 
+pub mod incidents;
 pub mod interceptor;
 pub mod notifier;
+pub mod review;
 pub mod rules;
+pub mod supervisor;
 
 use hive_common::config::WatchdogConfig;
 use hive_common::{SafetyAnalysis, SafetyCategory, Severity};

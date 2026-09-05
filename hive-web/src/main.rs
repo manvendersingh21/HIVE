@@ -9,6 +9,7 @@
 
 mod auth;
 mod chat;
+mod incidents;
 mod sessions;
 mod terminal;
 mod workers;
@@ -45,6 +46,7 @@ struct AppState {
     auth: auth::Auth,
     agent: chat::AgentHandle,
     workers: workers::WorkerIngest,
+    incidents: incidents::IncidentReview,
 }
 
 impl FromRef<AppState> for auth::Auth {
@@ -62,6 +64,12 @@ impl FromRef<AppState> for chat::AgentHandle {
 impl FromRef<AppState> for workers::WorkerIngest {
     fn from_ref(s: &AppState) -> Self {
         s.workers.clone()
+    }
+}
+
+impl FromRef<AppState> for incidents::IncidentReview {
+    fn from_ref(s: &AppState) -> Self {
+        s.incidents.clone()
     }
 }
 
@@ -183,12 +191,14 @@ async fn main() -> anyhow::Result<()> {
         auth: auth::Auth::new(password),
         agent: build_agent(&master_name).await,
         workers: workers::WorkerIngest::from_env(),
+        incidents: incidents::IncidentReview::from_env(),
     };
 
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/sessions", get(sessions_page))
         .route("/machines", get(machines_page))
+        .route("/incidents", get(incidents_page))
         .route("/login", get(login_page).post(auth::login))
         .route("/logout", post(auth::logout))
         .route("/terminal/{name}", get(terminal_page))
@@ -201,14 +211,29 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/machines", get(chat::machine_graph))
         .route("/api/machines/refresh", post(chat::refresh_machines))
         .route("/api/machines/prompt", get(chat::machines_prompt))
+        // Deciding an incident reaches a suspended process, so these must stay
+        // above the `require_auth` layer with every other browser route — see
+        // the module docs in `incidents.rs`.
+        .route("/api/incidents", get(incidents::list))
+        .route("/api/incidents/{id}", get(incidents::get_one))
+        .route("/api/incidents/{id}/decide", post(incidents::decide))
         .route("/api/worker/status", post(workers::ingest))
         .route("/api/worker/tasks", get(workers::list))
         .route("/ws/{name}", get(ws_handler))
+        // The static fallback is registered *above* the auth layer on purpose.
+        // `Router::layer` wraps only what has been added when it is called, so
+        // a `fallback_service` attached afterwards sits outside the gate — which
+        // is where it was, serving every page shell (`/index.html`,
+        // `/incidents.html`, …) to anyone who could reach the port. No incident
+        // data leaked, since each page fetches its contents through a gated
+        // `/api/` route, but the markup was public and the review page made that
+        // worth fixing rather than noting. `require_auth` keeps `.css`/`.js` and
+        // `/assets/` open, so the login page still styles itself.
+        .fallback_service(ServeDir::new(&static_dir))
         .layer(middleware::from_fn_with_state(
             state.auth.clone(),
             auth::require_auth,
         ))
-        .fallback_service(ServeDir::new(&static_dir))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -230,6 +255,10 @@ async fn sessions_page() -> Html<&'static str> {
 
 async fn machines_page() -> Html<&'static str> {
     Html(include_str!("../static/machines.html"))
+}
+
+async fn incidents_page() -> Html<&'static str> {
+    Html(incidents::PAGE)
 }
 
 /// Short hostname, for naming the master in the machine graph.

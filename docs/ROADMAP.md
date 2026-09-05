@@ -19,7 +19,7 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
 | 9 | Memory — projects, KG, RAG | 2–3 days | 2 | 🟡 KG substrate + machine graph + capability placement live ([`PLACEMENT.md`](PLACEMENT.md)); RAG, projects, history not started |
-| 10 | Safety watchdog | 2–3 days | 3, 7 | 🟡 Tier-1/Tier-2 remote (now suspends, not interrupts) + gate on local exec everywhere; Tier 2 is always the local model ([STATUS](STATUS.md)); no incident log/notifier |
+| 10 | Safety watchdog | 2–3 days | 3, 7 | ✅ Tier-1/Tier-2 remote (suspends, not interrupts) + gate on local exec; durable incident log, all four `HumanDecision` variants, ntfy/webhook delivery, one `ractor` supervisor, review UI. Tier 2 is still always the local model ([STATUS](STATUS.md)) |
 | | **Total** | **~16–22 days** | | |
 
 Legend: ✅ done · 🟡 partial · 🔴 broken · ⬜ not started
@@ -269,7 +269,7 @@ The reason the agent still knows what you decided three weeks ago.
 ---
 
 ## Phase 10 — Safety Watchdog
-*Plan section: "Phase 10: Safety Watchdog — Continuous Monitoring & Human-in-the-Loop"* · **Status: 🟡 partial — core detection pulled forward into Phase 3**
+*Plan section: "Phase 10: Safety Watchdog — Continuous Monitoring & Human-in-the-Loop"* · **Status: ✅ done, live-verified**
 
 Polls every active session; pauses first, asks you second.
 
@@ -280,22 +280,31 @@ Polls every active session; pauses first, asks you second.
 - [x] `watchdog/mod.rs` — `Watchdog::review`, Tier-2 periodic LLM safety analysis producing
       `SafetyAnalysis`, checked against the task's `expected_behavior`, with `poll_interval_secs`
       backing off to `reduced_poll_interval_secs` after `max_consecutive_safe` clean checks
-- [x] Pause path: `send-keys C-c` → mark `TaskState::PausedByWatchdog` → log a handover
-      notification with the reattach command (not a full `Incident` log — see below)
+- [x] Pause path: SIGSTOP to the pane's foreground process group (the `send-keys C-c` this
+      line used to describe killed the session outright — see `docs/STATUS.md`) → mark
+      `TaskState::PausedByWatchdog` → log a handover notification with the reattach command
 - [x] Tail-based monitoring (not `tmux capture-pane -p` polling — a dedicated log-file tail, to
       avoid missing short-lived output between polls)
 
-**Still not built:**
-- [ ] `watchdog/mod.rs` as a `ractor` actor supervising *all* sessions in one place (today: one
-      ad hoc `tokio::spawn` task per delegated session, no central supervisor)
-- [ ] Persisted `Incident` log / `IncidentReviewState` tracking (today: a `tracing::warn!` line,
-      nothing recorded)
-- [ ] `watchdog/notifier.rs` — ntfy.sh push, webhook (Slack/Discord), web dashboard
-- [ ] Incident review UI: resume / abort / resume-with-note / modify-and-resume
-      (`HumanDecision` variants already exist in `protocol.rs`, nothing consumes them yet)
-- [ ] Continuous supervision independent of CLI process lifetime (needs the persistent master
-      daemon noted in Phase 3 — today, exiting `hive task`/`hive chat` ends supervision even
-      though the delegated remote command keeps running)
+**Completed in the M3 pass** (see `docs/STATUS.md` for the pasted proving output):
+- [x] `watchdog/supervisor.rs` — one `ractor` actor supervising *all* sessions, with a registry
+      keyed by session name, replacing the ad-hoc `tokio::spawn` per delegated session
+- [x] `watchdog/incidents.rs` — durable `Incident` / `IncidentReviewState` log over SQLite,
+      with a compare-and-swap `resolve` so one incident can only be decided once
+- [x] `watchdog/notifier.rs` — ntfy.sh push and webhook (Slack/Discord) delivery alongside
+      iMessage, every channel best-effort and independent
+- [x] `watchdog/review.rs` + `hive-web` incident review UI: resume / abort / resume-with-note /
+      modify-and-resume, all four `HumanDecision` variants now consumed
+- [x] Continuous supervision independent of CLI process lifetime — `hive task`/`hive chat`
+      submit to the running master, so the supervisor lives in a daemon (Phase 6 work; the
+      supervisor actor is what it now owns)
+
+**Deliberately not done:**
+- Deduplicating incident-log config resolution: `hive-web`'s `IncidentReview::from_env` and
+  `WorkerPool::open_incident_log` resolve `~/.hive/hive.db` separately because
+  `DatabaseConfig` has no `Default`. One belongs in `hive-common`; noted rather than rushed.
+- `SupervisorHandle::stop_session` / `shutdown` exist so supervision is addressable, but no
+  CLI or web surface calls them yet.
 
 ---
 
