@@ -254,7 +254,7 @@ mod tests {
         // The zip above stops at the shorter side; without the explicit length check a
         // dropped final message would read as agreement.
         let (_t, ao, bo) = dirs();
-        let (mut a, mut b) = sides(ao, bo);
+        let (mut a, b) = sides(ao, bo);
         a.emit("s-1", B, kinds::SESSION_OPEN, json!({}))
             .await
             .unwrap();

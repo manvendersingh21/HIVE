@@ -1,6 +1,7 @@
 //! Worker pool — manages SSH connections to worker machines and delegates
 //! tasks to supervised tmux sessions on them.
 
+pub mod sessions;
 pub mod ssh;
 
 use std::collections::HashMap;

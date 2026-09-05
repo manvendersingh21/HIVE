@@ -88,6 +88,8 @@ enum Commands {
 enum WorkerAction {
     /// List configured workers.
     List,
+    /// Probe every worker over SSH and report what is actually reachable.
+    Health,
 }
 
 #[derive(Subcommand)]
@@ -135,18 +137,11 @@ async fn main() -> anyhow::Result<()> {
             };
             run_task(&cli.project_root, &description, policy, local).await
         }
-        Commands::Sessions => {
-            println!("No sessions yet — worker delegation is not implemented (Phase 3/4).");
-            Ok(())
-        }
-        Commands::Attach { session_id } => {
-            println!(
-                "Cannot attach to '{session_id}' yet — the tmux/SSH bridge is not implemented (Phase 5)."
-            );
-            Ok(())
-        }
+        Commands::Sessions => run_sessions(&cli.project_root).await,
+        Commands::Attach { session_id } => run_attach(&cli.project_root, &session_id).await,
         Commands::Workers { action } => match action {
             WorkerAction::List => run_workers_list(&cli.project_root),
+            WorkerAction::Health => run_workers_health(&cli.project_root).await,
         },
         Commands::Skills { action } => match action {
             SkillAction::List => {
@@ -172,12 +167,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Commands::Serve { bind } => {
-            println!(
-                "hive-web is a separate binary. Run it directly:\n  HIVE_WEB_ADDR={bind} cargo run --bin hive-web"
-            );
-            Ok(())
-        }
+        Commands::Serve { bind } => run_serve(&bind),
     }
 }
 
@@ -365,15 +355,162 @@ async fn run_request_on_agent(
     Ok(())
 }
 
+/// Every tmux session Hive can see: this machine, and each configured worker.
+///
+/// Deliberately not `WorkerPool::active_sessions()`. That map is populated by
+/// `delegate` inside the calling process, so a fresh CLI invocation would report
+/// an empty list truthfully and uselessly, whatever was actually running. `tmux
+/// list-sessions` is the same source `hive-web` reads, and it cannot drift.
+async fn run_sessions(project_root: &Path) -> anyhow::Result<()> {
+    use hive_core::workers::sessions;
+
+    let mut rows: Vec<sessions::TmuxSession> = sessions::list_local().await.unwrap_or_default();
+    let mut unreachable: Vec<(String, String)> = Vec::new();
+
+    let workers = WorkersConfig::from_project_root(project_root)
+        .map(|c| c.workers)
+        .unwrap_or_default();
+    for w in &workers {
+        match sessions::list_on(w).await {
+            Ok(mut found) => rows.append(&mut found),
+            // Named, not swallowed: "no sessions" and "could not ask" are different
+            // answers, and printing the first when the second is true is how a
+            // status command becomes untrustworthy.
+            Err(e) => unreachable.push((w.name.clone(), e.to_string())),
+        }
+    }
+
+    if rows.is_empty() {
+        println!("No tmux sessions on this machine or on any configured worker.");
+    } else {
+        println!("{:<34} {:<12} {:<9} {:<8} WINDOW", "SESSION", "HOST", "ATTACHED", "HIVE");
+        rows.sort_by(|a, b| (&a.host, &a.name).cmp(&(&b.host, &b.name)));
+        for s in &rows {
+            println!(
+                "{:<34} {:<12} {:<9} {:<8} {}",
+                s.name,
+                s.host,
+                if s.attached { "yes" } else { "no" },
+                if sessions::is_hive_session(&s.name) { "yes" } else { "-" },
+                s.window_name,
+            );
+        }
+    }
+    for (name, why) in unreachable {
+        println!("\n! worker '{name}' could not be asked: {why}");
+    }
+    Ok(())
+}
+
+/// Hand this terminal over to a session, wherever it is running.
+///
+/// `exec`, not spawn-and-wait: tmux wants the terminal, and an intermediate
+/// process between the shell and tmux gets signal handling and window resizing
+/// subtly wrong.
+async fn run_attach(project_root: &Path, session_id: &str) -> anyhow::Result<()> {
+    use hive_core::workers::sessions;
+    use std::os::unix::process::CommandExt;
+
+    let workers = WorkersConfig::from_project_root(project_root)
+        .map(|c| c.workers)
+        .unwrap_or_default();
+
+    let mut found: Option<(sessions::TmuxSession, Option<hive_common::protocol::WorkerInfo>)> =
+        sessions::list_local()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|s| s.name == session_id)
+            .map(|s| (s, None));
+
+    if found.is_none() {
+        for w in &workers {
+            if let Ok(list) = sessions::list_on(w).await {
+                if let Some(s) = list.into_iter().find(|s| s.name == session_id) {
+                    found = Some((s, Some(w.clone())));
+                    break;
+                }
+            }
+        }
+    }
+
+    let Some((session, worker)) = found else {
+        // Say where we looked. "Not found" without a search scope is unactionable.
+        let scope = if workers.is_empty() {
+            "this machine (no workers are configured)".to_string()
+        } else {
+            format!(
+                "this machine and {} worker(s): {}",
+                workers.len(),
+                workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        };
+        anyhow::bail!("no tmux session named '{session_id}' on {scope}");
+    };
+
+    let command = session.attach_command(worker.as_ref());
+    println!("Attaching: {command}");
+    Err(std::process::Command::new("sh").arg("-c").arg(&command).exec().into())
+}
+
+/// Probe every worker and report what is reachable right now.
+async fn run_workers_health(project_root: &Path) -> anyhow::Result<()> {
+    let config = WorkersConfig::from_project_root(project_root)?;
+    if config.workers.is_empty() {
+        println!("No workers configured.");
+        return Ok(());
+    }
+    let pool = WorkerPool::new(config.workers);
+    pool.refresh_health().await;
+    println!("{:<18} {:<22} STATUS", "NAME", "HOST");
+    for node in &pool.workers {
+        println!(
+            "{:<18} {:<22} {:?}",
+            node.info.name,
+            node.info.host,
+            node.status()
+        );
+    }
+    println!("\n{} of {} online.", pool.online_count(), pool.workers.len());
+    Ok(())
+}
+
+/// Start the web/master server.
+///
+/// `hive-web` is its own binary, so this execs the copy sitting beside this one
+/// rather than linking it in — which keeps the CLI free of axum and keeps the
+/// deployed server a single, separately restartable process. Previously this
+/// command printed the command you should have typed instead, which is not a
+/// command, it is a note.
+fn run_serve(bind: &str) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let here = std::env::current_exe()?;
+    let dir = here.parent().unwrap_or(Path::new("."));
+    let server = dir.join("hive-web");
+    if !server.is_file() {
+        anyhow::bail!(
+            "hive-web is not next to this binary (looked in {}). Build it with \
+             `cargo build --bin hive-web`, or run it directly with HIVE_WEB_ADDR={bind}.",
+            dir.display()
+        );
+    }
+    println!("Starting {} on {bind}", server.display());
+    Err(std::process::Command::new(server)
+        .env("HIVE_WEB_ADDR", bind)
+        .exec()
+        .into())
+}
+
 fn run_workers_list(project_root: &Path) -> anyhow::Result<()> {
     let config = WorkersConfig::from_project_root(project_root)?;
     if config.workers.is_empty() {
         println!("No workers configured.");
         return Ok(());
     }
-    println!("{:<12} {:<20} {:<10} TAGS", "NAME", "HOST", "USER");
+    println!("{:<18} {:<20} {:<10} TAGS", "NAME", "HOST", "USER");
     for w in &config.workers {
-        println!("{:<12} {:<20} {:<10} {:?}", w.name, w.host, w.user, w.tags);
+        println!("{:<18} {:<20} {:<10} {:?}", w.name, w.host, w.user, w.tags);
     }
     Ok(())
 }

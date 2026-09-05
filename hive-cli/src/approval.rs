@@ -93,6 +93,34 @@ pub fn print_outcomes(result: &RunResult) {
     }
 }
 
+/// The banner's inner width, in columns.
+const BANNER_WIDTH: usize = 66;
+
+/// The "stop and look at this" banner, built rather than hand-spaced.
+///
+/// The previous version was a block of literals with the closing `║` typed at
+/// what looked like the right column, and it did not line up: the title carried
+/// `⚠️`, which is two `char`s (U+26A0 plus a variation selector) and renders as
+/// one or two columns depending on the terminal, so no amount of counting in an
+/// editor could make every row agree. Padding is computed here, and the content
+/// is ASCII so `chars().count()` is the column count.
+fn banner(gated: usize) -> Vec<String> {
+    let row = |content: &str| {
+        let pad = BANNER_WIDTH.saturating_sub(content.chars().count());
+        format!("║{content}{}║", " ".repeat(pad))
+    };
+    let plural = if gated == 1 { "" } else { "s" };
+    vec![
+        format!("╔{}╗", "═".repeat(BANNER_WIDTH)),
+        row("            !!  HIGH-RISK ACTION INTERCEPTED  !!"),
+        format!("╠{}╣", "═".repeat(BANNER_WIDTH)),
+        row("  Status: AwaitingHumanApproval"),
+        row(&format!("  {gated} step{plural} require review before execution")),
+        format!("╚{}╝", "═".repeat(BANNER_WIDTH)),
+    ]
+}
+
+
 /// Ask about every gated step, returning the approved and denied ids.
 ///
 /// A step whose answer cannot be read (no tty, EOF) is treated as denied:
@@ -131,13 +159,9 @@ pub fn decide(run: &PlannedRun, result: &RunResult, policy: GatePolicy) -> (Vec<
 
     // ── Print the AwaitingHumanApproval banner ───────────────────────
     println!();
-    println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║             ⚠️  HIGH-RISK ACTION INTERCEPTED  ⚠️                 ║");
-    println!("╠══════════════════════════════════════════════════════════════════╣");
-    println!("║  Status: AwaitingHumanApproval                                 ║");
-    println!("║  {} step(s) require review before execution                  ║",
-        format!("{:>2}", gated.len()));
-    println!("╚══════════════════════════════════════════════════════════════════╝");
+    for line in banner(gated.len()) {
+        println!("{line}");
+    }
 
     for step in &run.steps {
         if !gated.contains(&step.id) {
@@ -303,5 +327,42 @@ mod tests {
             describe_target(&StepTarget::Remote { worker: String::new() }),
             "remote (no worker)"
         );
+    }
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::*;
+
+    #[test]
+    fn every_banner_row_is_the_same_width() {
+        // The whole point. The hand-spaced version this replaced did not line up,
+        // and nobody noticed because it only shows when something is already wrong.
+        for gated in [1usize, 2, 10, 100] {
+            let rows = banner(gated);
+            let widths: Vec<usize> = rows.iter().map(|r| r.chars().count()).collect();
+            assert!(
+                widths.windows(2).all(|w| w[0] == w[1]),
+                "rows of unequal width for {gated} gated steps: {widths:?}\n{}",
+                rows.join("\n")
+            );
+            assert_eq!(widths[0], BANNER_WIDTH + 2);
+        }
+    }
+
+    #[test]
+    fn one_step_is_singular() {
+        assert!(banner(1).iter().any(|r| r.contains("1 step require")));
+        assert!(banner(2).iter().any(|r| r.contains("2 steps require")));
+    }
+
+    #[test]
+    fn the_banner_stays_ascii_inside_its_borders() {
+        // Padding is computed from `chars().count()`, which equals the column count
+        // only for ASCII. An emoji here is what broke the old one.
+        for row in banner(3) {
+            let inner: String = row.chars().filter(|c| !"╔╗╚╝╠╣║═".contains(*c)).collect();
+            assert!(inner.is_ascii(), "non-ASCII content in a padded row: {row}");
+        }
     }
 }

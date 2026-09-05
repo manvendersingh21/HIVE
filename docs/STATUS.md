@@ -72,6 +72,70 @@ occasions on which getting that wrong cost real work.
 
 ---
 
+## CLI: ✅ the three commands that lied now do the thing — 2026-09-05
+
+`hive sessions` printed *"worker delegation is not implemented (Phase 3/4)"*.
+`hive attach` printed *"the tmux/SSH bridge is not implemented (Phase 5)"*. Both
+features had shipped phases earlier. `hive serve` printed the command you should have
+typed instead, which is a note, not a command. In a repo whose first line is "claims
+here are only made after live verification", stale stubs that under-claim are the same
+defect as a status table that over-claims, and they had been sitting there longer.
+
+```
+$ hive sessions
+SESSION                            HOST         ATTACHED  HIVE     WINDOW
+8                                  cis-a6000    no        -        bash
+fourth                             cis-a6000    no        -        bash
+lala                               cis-a6000    no        -        bash
+qwen                               cis-a6000    no        -        bash
+third                              cis-a6000    no        -        bash
+hivew2                             local        no        -        zsh
+
+$ hive workers health
+NAME               HOST                   STATUS
+archlinux-worker   hive-worker-2          Online
+cis-a6000          cis-a6000              Online
+cis-linux2         cis-linux2             Online
+
+3 of 3 online.
+
+$ hive attach not-a-session
+Error: no tmux session named 'not-a-session' on this machine and 3 worker(s):
+archlinux-worker, cis-a6000, cis-linux2
+
+$ hive serve --bind 127.0.0.1:18099
+Starting /…/target/debug/hive-web on 127.0.0.1:18099
+Error: HIVE_WEB_PASSWORD is not set — refusing to start an unauthenticated terminal server
+```
+
+The last one is the proof that `serve` really hands off: that error is `hive-web`'s own.
+
+### The design decision worth recording
+
+`hive sessions` does **not** call `WorkerPool::active_sessions()`, which is what the
+obvious fix would have been. That map is an `Arc<Mutex<HashMap>>` populated by
+`delegate` inside the calling process, so a fresh CLI invocation would have reported an
+empty list — truthfully, uselessly, and every single time, no matter what was running.
+Trading a loud lie for a quiet one is not a fix. The source is `tmux list-sessions`,
+locally and over SSH per worker (`workers::sessions`), which is the same source
+`hive-web` reads and cannot drift out of date.
+
+Two smaller things fell out of it: a worker that cannot be asked is printed as such
+rather than folded into "no sessions", and sessions Hive did not create are shown with
+`HIVE: -` rather than filtered away — a status command that hides rows lies by omission.
+
+### Also fixed: the approval banner never lined up
+
+`hive-cli/src/approval.rs`'s "HIGH-RISK ACTION INTERCEPTED" box was literals with the
+closing `║` typed at what looked like the right column. It could not line up: the title
+carried `⚠️`, which is two `char`s (U+26A0 plus a variation selector) and renders as one
+or two columns depending on the terminal. Padding is now computed, the content is ASCII
+so character count equals column count, and a test asserts every row is the same width.
+It only ever showed when something was already going wrong, which is exactly why nobody
+had looked at it.
+
+---
+
 ## Phase 3: ✅ Core delegation + safety supervision complete and live-verified
 
 This landed as a redesign, not the original plan's pseudocode: instead of a deployed
