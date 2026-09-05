@@ -3,6 +3,9 @@
 All 10 phases, in dependency order. This ordering is canonical and comes from the
 **Implementation Order** table in [`implementation-plan.md`](implementation-plan.md).
 
+> Picking the work up? Start at [`HANDOFF.md`](HANDOFF.md) — it carries the verified
+> baseline, the gate, the next milestone in full detail, and the traps already paid for.
+
 > **Note on numbering:** the narrative sections of `implementation-plan.md` use a slightly
 > different numbering than its own Implementation Order table (the prose has no "Phase 8",
 > and puts Skills at 5 / Finetune at 6 / CLI at 7). This roadmap uses the **table's**
@@ -253,9 +256,16 @@ TOML-defined skills in `~/.hive/skills/<name>/`, each with `skill.toml`,
 ---
 
 ## Phase 9 — Memory: Projects, Knowledge Graph, RAG
-*Plan section: "Phase 9: Conversation Memory, Knowledge Graph & Project Scoping"* · **Status: ⬜**
+*Plan section: "Phase 9: Conversation Memory, Knowledge Graph & Project Scoping"* · **Status: 🟡**
 
 The reason the agent still knows what you decided three weeks ago.
+
+The graph substrate is live and proven — `memory/graph.rs` (entities, edges, WAL,
+idempotent upsert) carries the machine fleet and capability placement
+([`PLACEMENT.md`](PLACEMENT.md)). What is missing is everything conversational: projects,
+transcripts, extraction, RAG. `MemorySystem::retrieve_context` returns three empty vectors
+and both of its call sites discard the result. Full breakdown, including the one schema
+decision that must be made first, is in [`HANDOFF.md`](HANDOFF.md) §3.
 
 - [ ] SQLite schema: `projects`, `conversations`, `messages`, `kg_nodes`, `kg_edges`, `rag_chunks`
 - [ ] `memory/projects.rs` — project registry and conversation scoping

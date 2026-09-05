@@ -3,6 +3,9 @@
 **Updated 2026-09-02, verified against a live build.** This audit reflects what was actually
 compiled, tested, and run — not what a session claimed.
 
+This file is the backward-looking record. The forward-looking one — what is left, in what
+order, with the gate and the traps — is [`HANDOFF.md`](HANDOFF.md).
+
 ---
 
 ## Watchdog: ✅ Phase 10's back half — incidents are durable and answerable — 2026-09-05

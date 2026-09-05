@@ -87,7 +87,9 @@ a machine the knowledge graph chose, running inside a tmux session the master su
 its whole life. See [`docs/STATUS.md`](docs/STATUS.md) for the
 full audit, [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases,
 [`docs/PLACEMENT.md`](docs/PLACEMENT.md) for how a request becomes a machine, and
-[`docs/DEPLOY-WEB.md`](docs/DEPLOY-WEB.md) for what runs where.
+[`docs/DEPLOY-WEB.md`](docs/DEPLOY-WEB.md) for what runs where. Picking the work up from
+here starts at [`docs/HANDOFF.md`](docs/HANDOFF.md) — what is done, what is next, and the
+traps this repo has already paid for.
 
 Short version:
 
