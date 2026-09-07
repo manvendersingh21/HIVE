@@ -69,6 +69,8 @@ pub struct MachineFacts {
 pub const PROBED_TOOLS: &[&str] = &[
     "claude",
     "codex",
+    "opencode",
+    "agy",
     "ollama",
     "git",
     "tmux",
@@ -92,7 +94,7 @@ pub const PROBED_TOOLS: &[&str] = &[
 fn capabilities_for(tools: &[String]) -> Vec<&'static str> {
     let has = |t: &str| tools.iter().any(|x| x == t);
     let mut caps = Vec::new();
-    if has("claude") || has("codex") {
+    if crate::runtime::cli::KNOWN.iter().any(|cli| has(cli)) {
         caps.push("agentic-cli");
     }
     if has("ollama") {
@@ -142,7 +144,7 @@ if [ "$kernel_name" = "Darwin" ]; then
   echo "os_version=$(sw_vers -productVersion 2>/dev/null)"
   echo "cores=$(sysctl -n hw.ncpu 2>/dev/null)"
   echo "memory_gb=$(echo "scale=2; $(sysctl -n hw.memsize 2>/dev/null) / 1073741824" | bc 2>/dev/null)"
-  echo "memory_available_gb=$(echo "scale=2; $(vm_stat 2>/dev/null | awk '/Pages free/ {{gsub(/\./,"",$3); f=$3}} /Pages inactive/ {{gsub(/\./,"",$3); i=$3}} END {{print (f+i)*4096}}') / 1073741824" | bc 2>/dev/null)"
+  echo "memory_available_gb=$(vm_stat 2>/dev/null | awk '{mac_memory_awk}')"
   echo "disk_free_gb=$(df -g / 2>/dev/null | awk 'NR==2 {{print $4}}')"
   echo "gpu=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/ {{print $2; exit}}')"
 else
@@ -164,9 +166,17 @@ fi
 # non-zero — without this the whole script's status reflects whichever check
 # happened to run last, and the probe is discarded.
 exit 0
-"#
+"#,
+        mac_memory_awk = MAC_MEMORY_AWK,
     )
 }
+
+// vm_stat reports the host's page size in its header (16 KiB on Apple Silicon,
+// commonly 4 KiB on Intel). Missing headers yield no estimate, never a guess.
+const MAC_MEMORY_AWK: &str = r#"/page size of/ {for (n=1; n<=NF; n++) if ($n == "of") p=$(n+1)}
+/Pages free/ {gsub(/\./,"",$3); f=$3}
+/Pages inactive/ {gsub(/\./,"",$3); i=$3}
+END {if (p > 0) printf "%.2f", (f+i)*p/1073741824}"#;
 
 fn parse_probe(name: &str, host: &str, tags: Vec<String>, raw: &str) -> MachineFacts {
     let mut facts = MachineFacts {
@@ -783,3 +793,29 @@ mod tests {
         assert!(text.contains("agentic-cli"));
     }
 }
+    #[test]
+    fn every_supported_agent_cli_is_discoverable_as_a_capability() {
+        for cli in crate::runtime::cli::KNOWN {
+            assert!(PROBED_TOOLS.contains(cli), "{cli} missing from inventory");
+            assert!(capabilities_for(&[cli.to_string()]).contains(&"agentic-cli"));
+        }
+    }
+
+    #[test]
+    fn mac_memory_uses_the_reported_page_size_and_no_fallback_guess() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        for (header, expected) in [
+            ("Mach Virtual Memory Statistics: (page size of 16384 bytes)", "2.00"),
+            ("Mach Virtual Memory Statistics: (page size of 4096 bytes)", "0.50"),
+            ("missing header", ""),
+        ] {
+            let mut child = Command::new("awk").arg(MAC_MEMORY_AWK)
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            writeln!(child.stdin.take().unwrap(), "{header}\nPages free: 65536.\nPages inactive: 65536.").unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(result.status.success());
+            assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
+        }
+        assert!(probe_script().contains(MAC_MEMORY_AWK));
+    }

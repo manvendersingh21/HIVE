@@ -19,6 +19,8 @@
 //!        ├── cli.rs      which stock CLI, and how to start it non-interactively
 //!        ├── brief.rs    what an agent is told, and "did it actually write the file?"
 //!        ├── edge.rs     the file edge (§12.1): two outboxes, and the transcript
+//!        ├── journal.rs  durable v2 inputs, receipts and invocation recovery
+//!        ├── hosting.rs  per-role SSH/local placement and checked file transfer
 //!        ├── attest.rs   §9.4 — the runtime's own measurements, never the agent's word
 //!        └── report.rs   what happened, in a form that cannot flatter itself
 //! ```
@@ -29,10 +31,9 @@
 //! as it arrives, a timeout that suspends rather than kills, and SIGSTOP to the pane's
 //! foreground process group. `subprocess.run` can do none of that.
 //!
-//! **What it deliberately does not do yet:** recursive spawning (the
-//! `hive-recursive-pairwise/1` profile's org chart and capability grants) and SSH
-//! distribution. Both are next milestones. Introducing hierarchy or networking before
-//! the two-agent path works would stack failure modes that are hard to tell apart.
+//! **What it does not do yet:** recursive spawning (the `hive-recursive-pairwise/1`
+//! profile's org chart and capability grants), autonomous fleet placement and peer
+//! discovery. SSH hosting uses explicit trusted aliases; reachability is not discovery.
 
 pub mod attest;
 pub mod brief;
@@ -40,9 +41,12 @@ pub mod cli;
 pub mod edge;
 pub mod lifecycle;
 pub mod report;
+pub mod journal;
+pub mod hosting;
+pub mod verification;
 
 pub use cli::AgentCli;
-pub use lifecycle::{run_bilateral, RunConfig};
+pub use lifecycle::{authorize_continuation, resume_bilateral, resume_configured, run_bilateral, run_configured, RunConfig};
 pub use report::{RunOutcome, RunReport, Stage};
 
 /// A self-deleting scratch directory for tests.

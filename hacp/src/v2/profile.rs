@@ -18,10 +18,18 @@ pub const MAX_DIRECT_SUBORDINATES: usize = 2;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProfileError {
-    #[error("agent {agent:?} has {count} direct subordinates; this profile caps arity at {max} (§13)")]
-    ArityExceeded { agent: String, count: usize, max: usize },
+    #[error(
+        "agent {agent:?} has {count} direct subordinates; this profile caps arity at {max} (§13)"
+    )]
+    ArityExceeded {
+        agent: String,
+        count: usize,
+        max: usize,
+    },
     #[error("the profile must be declared by both session participants; {0:?} did not")]
     NotDeclared(String),
+    #[error(transparent)]
+    InvalidOrg(#[from] super::grant::GrantError),
 }
 
 /// Validation and conveniences for deployments that declared the profile.
@@ -38,6 +46,7 @@ impl HiveProfile {
     /// Arity check over the org chart: no agent may exceed
     /// [`MAX_DIRECT_SUBORDINATES`] direct subordinates.
     pub fn validate_org(&self, org: &OrgChart) -> Result<(), ProfileError> {
+        org.validate()?;
         let mut supervisors: Vec<&String> = org.parent_of.values().collect();
         supervisors.sort();
         supervisors.dedup();
@@ -76,25 +85,26 @@ impl HiveProfile {
                 grantee: child.to_string(),
             });
         }
-        if !ledger.covers(supervisor, &format!("cross-branch/{task_class}"), valid_from)
-            && !ledger.covers(supervisor, "work/all", valid_from)
-        {
-            return Err(super::grant::GrantError::NotDelegable(format!(
-                "cross-branch/{task_class}"
-            )));
-        }
+        org.validate()?;
+        let scope = format!("cross-branch/{task_class}");
+        let parent = ledger
+            .held_by(supervisor, valid_from)
+            .into_iter()
+            .find(|grant| grant.scopes.iter().any(|s| s.name == scope && s.delegable))
+            .map(|g| g.grant_id.clone())
+            .ok_or_else(|| super::grant::GrantError::NotDelegable(scope.clone()))?;
         ledger.issue(
             super::grant::CapabilityGrant {
                 grant_id: grant_id.to_string(),
                 grantor: supervisor.to_string(),
                 grantee: child.to_string(),
                 scopes: vec![ScopeElement {
-                    name: format!("cross-branch/{task_class}"),
+                    name: scope,
                     delegable: false,
                 }],
                 valid_from: valid_from.to_string(),
                 valid_until: valid_until.to_string(),
-                parent: None,
+                parent: Some(parent),
             },
             valid_from,
         )
@@ -154,14 +164,17 @@ mod tests {
         org.parent_of.insert(urn("c2"), urn("p1"));
 
         let mut ledger = GrantLedger::default();
-        // p1 holds delegable work/all, chartered by the deployment.
+        // p1 holds the exact delegable cross-branch scope.
         ledger
             .issue(
                 super::super::grant::CapabilityGrant::charter(
                     "g-000000000001",
                     "urn:hacp:agent:charter-1",
                     &urn("p1"),
-                    vec![ScopeElement { name: "work/all".into(), delegable: true }],
+                    vec![ScopeElement {
+                        name: "cross-branch/review".into(),
+                        delegable: true,
+                    }],
                     T0,
                     T1,
                 )
@@ -172,23 +185,48 @@ mod tests {
 
         // c1 gets a standing cross-branch/review grant; c2 does not.
         HiveProfile
-            .authorize_siblings(&mut ledger, &org, &urn("p1"), &urn("c1"), "review",
-                "g-000000000002", T0, T1)
+            .authorize_siblings(
+                &mut ledger,
+                &org,
+                &urn("p1"),
+                &urn("c1"),
+                "review",
+                "g-000000000002",
+                T0,
+                T1,
+            )
             .unwrap();
-        assert_eq!(ledger.preauthorizes(&urn("c1"), "review", T0), Some("g-000000000002".into()));
+        assert_eq!(
+            ledger.preauthorizes(&urn("c1"), "review", T0),
+            Some("g-000000000002".into())
+        );
         assert_eq!(ledger.preauthorizes(&urn("c2"), "review", T0), None);
 
         // A supervisor cannot preauthorize someone else's child.
         assert!(matches!(
-            HiveProfile.authorize_siblings(&mut ledger, &org, &urn("p1"), &urn("c9"), "review",
-                "g-000000000003", T0, T1),
+            HiveProfile.authorize_siblings(
+                &mut ledger,
+                &org,
+                &urn("p1"),
+                &urn("c9"),
+                "review",
+                "g-000000000003",
+                T0,
+                T1
+            ),
             Err(super::super::grant::GrantError::ChainMismatch { .. })
         ));
     }
 
     #[test]
     fn role_independence_is_advice() {
-        assert!(HiveProfile::supervisor_verifier_independent(&urn("s"), &urn("v")));
-        assert!(!HiveProfile::supervisor_verifier_independent(&urn("s"), &urn("s")));
+        assert!(HiveProfile::supervisor_verifier_independent(
+            &urn("s"),
+            &urn("v")
+        ));
+        assert!(!HiveProfile::supervisor_verifier_independent(
+            &urn("s"),
+            &urn("s")
+        ));
     }
 }

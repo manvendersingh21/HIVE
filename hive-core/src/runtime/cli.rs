@@ -31,6 +31,15 @@ pub struct AgentCli {
 pub const KNOWN: &[&str] = &["claude", "codex", "agy", "opencode"];
 
 impl AgentCli {
+    /// OpenCode scopes completion events to the conversation's original project
+    /// directory. Moving its client into a repair subdirectory can lose those
+    /// events even though the model writes its verdict. Output paths remain
+    /// explicit in the brief; they need not equal the client's project directory.
+    pub fn working_directory<'a>(&self, output: &'a Path, conversation_root: &'a Path,
+        conversation: Option<&str>) -> &'a Path {
+        if self.name == "opencode" && conversation.is_some() { conversation_root } else { output }
+    }
+
     /// Look up a CLI by name. An unknown name is an error rather than a guess: an
     /// invented invocation would fail inside the pane, where it reads exactly like an
     /// agent that produced no output.
@@ -70,12 +79,101 @@ impl AgentCli {
             other => unreachable!("unregistered CLI '{other}' reached args()"),
         }
     }
+
+    pub fn args_with_model(&self, cwd: &Path, model: Option<&str>) -> anyhow::Result<Vec<String>> {
+        let mut args = self.args(cwd);
+        if let Some(model) = model {
+            anyhow::ensure!(!model.trim().is_empty() && !model.contains(['\n', '\r', '\0']), "invalid model identifier");
+            // AGY's --print consumes the next token, which must remain the prompt.
+            let at = if self.name == "agy" { args.len()-1 } else { args.len() };
+            args.splice(at..at, ["--model".into(), model.into()]);
+        }
+        Ok(args)
+    }
+
+    pub fn call_args(&self, cwd: &Path, model: Option<&str>, conversation: Option<&str>) -> anyhow::Result<Vec<String>> {
+        let mut args = self.args_with_model(cwd, model)?;
+        let mut extra = Vec::new();
+        match self.name {
+            "opencode" => {
+                extra.extend(["--format".into(), "json".into(), "--auto".into()]);
+                if let Some(id) = conversation { extra.extend(["--session".into(), id.into()]); }
+            }
+            "agy" => {
+                extra.extend(["--output-format".into(), "json".into()]);
+                if let Some(id) = conversation { extra.extend(["--conversation".into(), id.into()]); }
+            }
+            _ => anyhow::ensure!(conversation.is_none(), "conversation recovery is not supported for this CLI"),
+        }
+        let at = if self.name == "agy" { args.len()-1 } else { args.len() };
+        args.splice(at..at, extra);
+        Ok(args)
+    }
+
+    /// Only vendor metadata at the top level of a structured CLI event counts.
+    /// Never scrape IDs out of an agent's prose or a tool-result string.
+    pub fn conversation_from_log(&self, log: &str) -> anyhow::Result<Option<String>> {
+        let key = match self.name { "opencode" => "sessionID", "agy" => "conversation_id", _ => return Ok(None) };
+        let mut values = Vec::new();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(log) { values.push(value); }
+        else {
+            values.extend(log.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for value in values {
+            if let Some(id) = value[key].as_str() {
+                let valid = if self.name == "opencode" {
+                    id.starts_with("ses_") && id.len() > 8 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                } else { uuid::Uuid::parse_str(id).is_ok() };
+                anyhow::ensure!(valid, "invalid conversation metadata returned by CLI");
+                ids.insert(id.to_string());
+            }
+        }
+        anyhow::ensure!(ids.len() <= 1, "CLI log names conflicting conversation identities");
+        Ok(ids.into_iter().next())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_project_stays_stable_while_attempt_outputs_move() {
+        let root = Path::new("/tmp/run/sup");
+        let repair = root.join("attempt-2");
+        let cli = AgentCli::resolve("opencode").unwrap();
+        assert_eq!(cli.working_directory(&repair, root, Some("ses_example")), root);
+        assert_eq!(cli.working_directory(&repair, root, None), repair);
+        assert_eq!(AgentCli::resolve("agy").unwrap().working_directory(&repair, root, Some("id")), repair);
+    }
     use std::path::PathBuf;
+
+    #[test]
+    fn explicit_model_is_retained_without_consuming_the_prompt() {
+        for name in KNOWN {
+            let args = AgentCli::resolve(name).unwrap().args_with_model(Path::new("/tmp/work"), Some("exact/model")).unwrap();
+            assert!(args.windows(2).any(|a| a == ["--model", "exact/model"]));
+            if *name == "agy" { assert_eq!(args.last().unwrap(), "--print"); }
+        }
+    }
+
+    #[test]
+    fn continuation_uses_explicit_metadata_never_last_session_or_embedded_prose() {
+        let cli = AgentCli::resolve("opencode").unwrap();
+        assert_eq!(cli.conversation_from_log("{\"sessionID\":\"ses_abcdef123\",\"type\":\"text\"}\n").unwrap().as_deref(), Some("ses_abcdef123"));
+        assert!(cli.conversation_from_log("{\"text\":\"sessionID: ses_fake123\"}").unwrap().is_none());
+        assert!(cli.conversation_from_log("{\"sessionID\":\"ses_abcdef123\"}\n{\"sessionID\":\"ses_other123\"}").is_err());
+        let args = cli.call_args(Path::new("/tmp/work"), None, Some("ses_abcdef123")).unwrap();
+        assert!(args.windows(2).any(|a| a == ["--session", "ses_abcdef123"]));
+        assert!(!args.contains(&"--continue".into()));
+        let cli = AgentCli::resolve("agy").unwrap();
+        let id = "e54cb477-bc27-4ab6-9880-94f096ba6e45";
+        assert_eq!(cli.conversation_from_log(&format!("{{\"conversation_id\":\"{id}\"}}")).unwrap().as_deref(), Some(id));
+        let args = cli.call_args(Path::new("/tmp/work"), None, Some(id)).unwrap();
+        assert!(args.windows(2).any(|a| a == ["--conversation", id]));
+        assert_eq!(args.last().unwrap(), "--print");
+    }
 
     #[test]
     fn an_unknown_cli_is_refused_rather_than_guessed() {

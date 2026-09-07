@@ -9,7 +9,9 @@
 //! So the verifying agent produces a *record* — named checks with details — and this
 //! module produces *measurements*, taken by this process from the bytes on disk. An
 //! accept goes on the wire only if at least one claimed passing check is corroborated
-//! by a measurement, and none is contradicted by one.
+//! by a measurement, and none is contradicted by one. Frozen acceptance criteria,
+//! output shape, and manifest integrity are independently required as well, even
+//! when the verifier omits them. Unsupported frozen criteria block acceptance.
 //!
 //! **The one soft edge, stated plainly:** matching a free-text check name to a
 //! measurement is done by keyword. A verifier that names a check "everything looks
@@ -70,10 +72,13 @@ impl Facts {
 pub struct Corroboration {
     /// Claimed-passing checks a measurement independently confirms.
     pub backed: Vec<String>,
-    /// Claimed-passing checks a measurement refutes. Any of these is fatal.
+    /// Refuted claims or failed/unsupported frozen obligations. Any is fatal.
     pub contradicted: Vec<String>,
     /// Claims with no measurement to compare against. Never support.
     pub unmatched: Vec<String>,
+    /// Frozen obligations measured independently of the verifier's claims.
+    #[serde(default)]
+    pub requirements_backed: Vec<String>,
 }
 
 /// Compare a verifier's claimed-passing checks against measured facts.
@@ -93,10 +98,14 @@ pub fn corroborate(
         let measured = if name.contains("digest") || name.contains("sha") || name.contains("hash") {
             Some(facts.digest == manifest.digest)
         } else if name.contains("line") {
-            Some(if one_line { facts.newlines == 1 } else { facts.newlines >= 1 })
+            Some(if one_line { is_one_line(facts) } else { facts.newlines >= 1 })
         } else if name.contains("size") || name.contains("byte") {
             Some(facts.size == manifest.size)
-        } else if name.contains("empty") || name.contains("content") || name.contains("word") || name.contains("exist") {
+        } else if name.contains("content") || name.contains("word") {
+            // Nonempty bytes do not prove any particular content. Only a fully
+            // recognized predicate can support these claims.
+            measure_criterion(&check.name, facts, manifest)
+        } else if name.contains("empty") || name.contains("exist") {
             Some(facts.non_empty)
         } else {
             None
@@ -106,6 +115,73 @@ pub fn corroborate(
             Some(false) => c.contradicted.push(check.name.clone()),
             None => c.unmatched.push(check.name.clone()),
         }
+    }
+    c
+}
+
+fn is_one_line(facts: &Facts) -> bool {
+    // Counting newlines alone accepts "first\nsecond" as one line.
+    let text = facts.text();
+    !text.is_empty() && text.lines().count() == 1
+}
+
+/// Measure the deliberately small acceptance language of this runtime. Matching
+/// is whole-clause, not keyword-based: an unsupported qualifier must not disappear.
+/// Arbitrary natural language needs a dedicated evaluator, not a guessed pass.
+fn measure_criterion(criterion: &str, facts: &Facts, manifest: &Artifact) -> Option<bool> {
+    let criterion = criterion.trim().trim_end_matches('.');
+    if criterion.contains(" and ") {
+        let results: Option<Vec<bool>> = criterion.split(" and ")
+            .map(|part| measure_criterion(part, facts, manifest)).collect();
+        return results.map(|parts| parts.into_iter().all(|p| p));
+    }
+    let prefix = regex::Regex::new(r"(?i)^(?:the file|file|[a-z0-9_-]+\.[a-z0-9]+) ").unwrap();
+    let clause = prefix.replace(criterion, "");
+    match clause.to_lowercase().as_str() {
+        "exists" => return Some(true), // Facts can only be measured from an existing file.
+        "is not empty" | "is non-empty" | "non-empty" | "not empty" => return Some(facts.non_empty),
+        "is exactly one line" | "has exactly one line" | "contains exactly one line"
+        | "contains exactly 1 line" | "exactly one line" => return Some(is_one_line(facts)),
+        "the sha256 matches the submitted manifest" | "sha256 matches the submitted manifest"
+        | "digest matches the submitted manifest" => return Some(facts.digest == manifest.digest),
+        "size matches the submitted manifest" => return Some(facts.size == manifest.size),
+        _ => {}
+    }
+    let word = regex::Regex::new(
+        r#"(?i)^(contains (?:the )?word|ends with (?:the )?word|required word) ['"`]?([a-z0-9_]+)['"`]?$"#
+    ).unwrap();
+    let captures = word.captures(&clause)?;
+    let required = &captures[2];
+    let text = facts.text();
+    let found = text.split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == required);
+    if captures[1].to_lowercase().starts_with("ends with") {
+        let last = text.split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|w| !w.is_empty()).next_back();
+        Some(last == Some(required) && text.trim_end().ends_with(required))
+    } else {
+        Some(found)
+    }
+}
+
+/// Independently enumerate the frozen obligations even when a verifier omits them.
+/// Unknown criteria block acceptance; this runtime cannot certify arbitrary prose.
+pub fn corroborate_contract(
+    checks: &[Check], facts: &Facts, manifest: &Artifact, one_line: bool,
+    acceptance: &[String],
+) -> Corroboration {
+    let mut c = corroborate(checks, facts, manifest, one_line);
+    let mut require = |name: String, measured: Option<bool>| match measured {
+        Some(true) => c.requirements_backed.push(name),
+        Some(false) => c.contradicted.push(name),
+        None => c.contradicted.push(format!("unsupported frozen criterion: {name}")),
+    };
+    require("frozen artifact digest".into(), Some(facts.digest == manifest.digest));
+    require("frozen artifact size".into(), Some(facts.size == manifest.size));
+    if one_line {
+        require("frozen output: one_line".into(), Some(is_one_line(facts)));
+    }
+    for criterion in acceptance {
+        require(format!("frozen criterion: {criterion}"), measure_criterion(criterion, facts, manifest));
     }
     c
 }
@@ -121,7 +197,7 @@ pub fn gate(verdict: &Verdict, c: &Corroboration) -> anyhow::Result<()> {
     }
     if !c.contradicted.is_empty() {
         anyhow::bail!(
-            "refusing to accept: the verifier claims these checks passed, and measurement \
+            "refusing to accept: claimed checks or frozen requirements were not met, and measurement \
              says otherwise: {} (§9.4)",
             c.contradicted.join(", ")
         );
@@ -232,6 +308,37 @@ mod tests {
         let c = Corroboration::default();
         gate(&Verdict::Reject, &c).unwrap();
         gate(&Verdict::Rework { scope: "redo it".into() }, &c).unwrap();
+    }
+
+    #[test]
+    fn content_claims_measure_words_case_and_boundaries_not_nonemptiness() {
+        for (content, expected) in [("ready\n", true), ("already\n", false), ("READY\n", false), ("unfinished\n", false)] {
+            let f = facts(content);
+            let c = corroborate(&[check("required word ready", true)], &f, &manifest(&f), true);
+            assert_eq!(gate(&Verdict::Accept, &c).is_ok(), expected, "{content}");
+        }
+        let f = facts("ready\n");
+        let c = corroborate(&[check("content verified", true)], &f, &manifest(&f), true);
+        assert!(gate(&Verdict::Accept, &c).is_err());
+    }
+
+    #[test]
+    fn every_frozen_criterion_must_be_measurable_and_true() {
+        let f = facts("ready\n");
+        for requirement in ["the file is one line and brilliant", "the file contains the word done", "the file is not empty unless broken"] {
+            let c = corroborate_contract(&[check("file exists", true)], &f, &manifest(&f), true, &[requirement.into()]);
+            assert!(gate(&Verdict::Accept, &c).is_err(), "{requirement}");
+        }
+        let c = corroborate_contract(&[check("file exists", true)], &f, &manifest(&f), true, &["the file ends with the word ready".into()]);
+        gate(&Verdict::Accept, &c).unwrap();
+    }
+
+    #[test]
+    fn single_line_checks_include_an_unterminated_final_line() {
+        assert!(is_one_line(&facts("ready")));
+        assert!(is_one_line(&facts("ready\n")));
+        assert!(!is_one_line(&facts("ready\nextra")));
+        assert!(!is_one_line(&facts("")));
     }
 
     #[tokio::test]

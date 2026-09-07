@@ -99,23 +99,14 @@ impl KnowledgeGraph {
     /// created — the configured default lives under `~/.hive/`, which will not
     /// exist on a fresh machine.
     ///
-    /// The file is forced to mode 0600: conversation transcripts and extracted
+    /// The database and its SQLite sidecars are forced to mode 0600 before
+    /// schema setup: conversation transcripts and extracted
     /// knowledge land in the same database as the incident log, and flagged
     /// output is kept verbatim there deliberately (see `watchdog/incidents.rs`)
     /// — so the memory tables inherit the same lock rather than becoming the
     /// soft end of the file.
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let graph = Self::from_connection(Connection::open(path)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(graph)
+        Self::from_connection(crate::private_db::open(path.as_ref())?)
     }
 
     /// An ephemeral in-memory graph. Used by tests, and as the fallback when
@@ -651,13 +642,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_database_is_not_world_readable() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("hive-graph-mode-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hive.db");
-        KnowledgeGraph::open(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "memory db was mode {mode:o}");
+        let graph = KnowledgeGraph::open(&path).unwrap();
+        graph
+            .upsert_entity(&Entity::new("concept", "private", json!({})))
+            .unwrap();
+        crate::private_db::tests::assert_private(&path);
+        drop(graph);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

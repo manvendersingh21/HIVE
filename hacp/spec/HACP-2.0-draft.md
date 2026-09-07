@@ -1,9 +1,10 @@
 # HACP/2.0 — Heterogeneous Agent Collaboration Protocol (DRAFT)
 
-**Status:** draft skeleton, 2026-09-04. This document specifies HACP/2.0 alongside the
-**frozen** [`HACP.md`](HACP.md) (1.1), which remains the implemented reference with its 43
-conformance vectors. Nothing here is implemented yet; sections marked *(normative)* are the
-binding intent that `hacp::v2` and every conformance vector will be written against.
+**Status:** implemented draft, updated 2026-09-05. This document specifies HACP/2.0 alongside
+the **frozen** [`HACP.md`](HACP.md) (1.1), retained with its 43 conformance vectors.
+The standalone `hacp::v2` library implements protocol objects and state machines;
+transport loops, CLI hosting, authentication, and execution remain binding/runtime work.
+Sections marked *(normative)* govern the implementation and conformance vectors.
 Rationale for the boundary reset: [`docs/adr/ADR-0001`](../../docs/adr/ADR-0001-hacp-core-is-bilateral.md).
 
 **The one-sentence protocol:** two agents who do not trust, know, or understand each other's
@@ -460,6 +461,23 @@ different protocols that share a philosophy.
 
 ## 16. Changelog
 
+- 2026-09-05: correctness review and standalone packaging. §5 validation now covers
+  extension values as well as bodies; bodies must be objects and extension keys
+  cannot shadow envelope fields. §7 acceptance records bind canonical terms:
+  differing acceptances and changed freeze content are refused, including amendment
+  revisions. Amendment counteroffers consume bounded rounds. Formation requires an
+  active session. §8 downstream grants recheck every ancestor's revocation and
+  validity; conflicting reuse of grant IDs is refused, identical issuance is
+  idempotent without undoing revocation. Cyclic org declarations are refused. §10/§13
+  sibling grants preserve an exact delegable scope and parent chain; preauthorized
+  permit expiry is bounded by the chain, and admission rechecks the class and basis.
+  §9 artifacts validate revision digests; the record-aware contract API binds a
+  verification to the actual submitting counterparty, revision and artifact set.
+  An accept with any failed gate check is refused. These reference validation rules
+  and snapshot migrations are specified in §17; affected draft sections re-frozen
+  2026-09-05 with these additions. Frozen HACP/1.1 is unchanged.
+  The crate now packages without workspace-inherited dependencies or external test
+  fixtures; an in-process bilateral example and standalone integration guide are included.
 - 2026-09-04: skeleton drafted; §①–⑤ frozen at skeleton level; Phase S findings merged into
   §9.4 and §12. (W2)
 - 2026-09-04: §7.3 clarification (appendix-level, no semantics reopened): the diagram's two
@@ -492,3 +510,55 @@ different protocols that share a philosophy.
   (`profile.rs`): `hive-recursive-pairwise/1` — arity cap 2, LCA routing, sibling
   preauthorization issuance, role-independence advice — held out of Core as designed.
   Schemas committed for grant, collaboration-permit, escalation. (Phase 4)
+
+## 17. Reference validation and binding responsibilities *(normative)*
+
+These draft clarifications pin the checks that an independent implementation must
+preserve. They do not add a model, transport, or organizational topology to Core.
+
+- **Agreement (§7):** each acceptance binds the canonical digest of the accepted
+  terms. Both acceptances and the freeze must name identical canonical content.
+  Counteroffers clear prior acceptance, including during amendment negotiation;
+  amendment bounds and deadlines terminate as `NoAgreement`. A malformed or
+  mismatched acceptance does not record a vote. Formation requires an active session.
+- **Grants (§8):** a derived grant is effective only while every ancestor is open.
+  Its effective time window is the intersection of its declared window with all
+  ancestor windows. Scope names are exact strings, not implicit wildcard patterns.
+  Re-delegation requires the named upstream scope's `delegable` flag, and must retain
+  the parent grant ID. An identical grant ID/content replay is idempotent; different
+  content cannot replace the original grant. Organizational cycles are invalid.
+- **Permits (§10):** a permit records the request's `task_class`. Preauthorization
+  cannot extend beyond any backing ancestor's expiry. Before session admission,
+  the binding checks the exact pair, requested class, canonical expiry and current
+  authority basis: the recorded LCA still rules those branches, or the requester
+  still holds the named open preauthorization grant. A stored permit alone is not
+  proof that its authority remains valid.
+- **Verification (§9):** an artifact's `contract_revision` is a 64-character
+  lowercase SHA-256 digest. An accept requires artifacts and a nonempty set of
+  passing checks, with no failed check. In this record format every listed check
+  is an acceptance gate; advisory diagnostics belong in evidence. A bilateral
+  counterparty verdict applies to the pending submission's exact artifact set,
+  contract ID and revision digest, and is authored by the participant other than
+  the actual submitter. An external verifier's evidence can support that verdict
+  but does not by itself authorize a contract state transition.
+- **Envelope (§5):** `body` is a JSON object. Unknown kinds and fields round-trip,
+  but extension values obey the same canonical rules and cannot shadow reserved
+  envelope fields. Schemas describe shapes; receiving code must also perform
+  semantic validation.
+
+The library's serialized state is a trusted host snapshot, not an authenticated
+remote command. Legacy agreement snapshots without `agreed_terms_digest` must
+collect fresh acceptance from both parties; old pending submissions without
+`pending_submitter` require trusted migration before record-aware verification.
+Permits without `task_class` must be reissued before admission. These fields are
+included in the committed canonical schemas.
+
+Bindings authenticate identities and authority sources, enforce visibility and
+resource limits, and deduplicate message identities before applying transitions
+(§1 C3). Durable state and deduplication must be committed together when crash
+recovery is supported. The library's low-level `Contract::decide` assumes that the
+host has already validated a verdict; `apply_verification` performs record binding
+but cannot measure artifact contents. Similarly, a permit's `authorizes` helper
+only checks pair/expiry; use `authorize_session` for current-basis admission.
+Neither deserialization, a digest, nor a successful process exit authenticates
+a peer or establishes that work is correct.

@@ -11,6 +11,9 @@ members = [
 ]
 
 [workspace.dependencies]
+# Protocol library. HIVE consumes it; hacp has no workspace-inherited dependencies.
+hacp = { version = "1.1.0", path = "hacp" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 

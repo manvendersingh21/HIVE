@@ -2,7 +2,7 @@
   "pair": "agy x claude",
   "supervisor_cli": "agy",
   "worker_cli": "claude",
-  "run_dir": "/Users/manubaba/.hive/collab/20260905T012938Z-agyxclaude",
+  "run_dir": "~/.hive/collab/20260905T012938Z-agyxclaude",
   "session_id": "s-74488b7ec5e8",
   "contract_id": "c-74488b7e85ad",
   "task_id": "t-74488b7e0fa9",
@@ -67,5 +67,5 @@
     "contradicted": [],
     "unmatched": []
   },
-  "transcript": "/Users/manubaba/.hive/collab/20260905T012938Z-agyxclaude/agyxclaude.jsonl"
+  "transcript": "~/.hive/collab/20260905T012938Z-agyxclaude/agyxclaude.jsonl"
 }

@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use hacp::v2::{canon, Envelope};
+use hacp::v2::{canon, kinds, Envelope, Session, SessionState};
 use serde_json::Value;
 
 /// Fields that legitimately differ between two independently minted views of the same
@@ -37,19 +37,33 @@ pub struct Side {
     out_dir: PathBuf,
     in_dir: PathBuf,
     counter: u32,
+    received: u32,
+    journal: Option<super::journal::Journal>,
     pub frames: Vec<Frame>,
 }
 
 impl Side {
-    pub fn new(label: &'static str, urn: impl Into<String>, out_dir: PathBuf, in_dir: PathBuf) -> Self {
+    pub fn new(
+        label: &'static str,
+        urn: impl Into<String>,
+        out_dir: PathBuf,
+        in_dir: PathBuf,
+    ) -> Self {
         Self {
             label,
             urn: urn.into(),
             out_dir,
             in_dir,
             counter: 0,
+            received: 0,
+            journal: None,
             frames: Vec::new(),
         }
+    }
+
+    pub fn durable(mut self, journal: super::journal::Journal) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     fn peer_label(&self) -> &'static str {
@@ -80,14 +94,22 @@ impl Side {
         // not a JSON-Schema validation run, and this comment exists so nobody later
         // reads it as one — the committed schemas are enforced by `hacp`'s own drift
         // gate, against the same types.
+        self.counter += 1;
+        let env = match &self.journal {
+            Some(journal) => journal.emit(self.label, self.counter, env)?,
+            None => env,
+        };
         let bytes = serde_json::to_vec(&env)?;
         let round: Envelope = serde_json::from_slice(&bytes)?;
         anyhow::ensure!(round == env, "envelope did not survive its own wire form");
 
-        self.counter += 1;
         tokio::fs::create_dir_all(&self.out_dir).await?;
         let name = format!("{:03}-{kind}.json", self.counter);
-        tokio::fs::write(self.out_dir.join(name), &bytes).await?;
+        // Rename only complete files into the transport namespace. The journal is
+        // already committed, so interruption here is repaired by replaying the send.
+        let temporary = self.out_dir.join(format!(".{name}.tmp"));
+        tokio::fs::write(&temporary, &bytes).await?;
+        tokio::fs::rename(temporary, self.out_dir.join(name)).await?;
 
         self.frames.push(Frame {
             dir: format!("{}>{}", self.label, self.peer_label()),
@@ -107,11 +129,53 @@ impl Side {
             env.to,
             self.urn
         );
+        // At-least-once delivery must not create a second transcript event. An ID
+        // reused with different bytes is not a retry and must never be accepted.
+        if let Some(previous) = self.frames.iter().find(|f| {
+            f.envelope.session_id == env.session_id && f.envelope.message_id == env.message_id
+        }) {
+            anyhow::ensure!(previous.envelope == env, "message ID reused with different content");
+            return Ok(env);
+        }
+        if let Some(journal) = &self.journal {
+            journal.receive(&self.urn, &env)?;
+        }
+        self.received += 1;
         self.frames.push(Frame {
             dir: format!("{}>{}", self.peer_label(), self.label),
             envelope: env.clone(),
         });
         Ok(env)
+    }
+
+    /// Receive against the host's HACP session, not just an address string.
+    /// The library owns participant/observer rules; this binding checks routing.
+    pub fn receive_in_session(
+        &mut self,
+        env: Envelope,
+        session: &Session,
+    ) -> anyhow::Result<Envelope> {
+        session.authorize_author(&self.urn)?;
+        session.authorize_author(&env.from)?;
+        anyhow::ensure!(
+            env.session_id == session.session_id,
+            "envelope belongs to a different HACP session"
+        );
+        anyhow::ensure!(
+            env.from != self.urn,
+            "inbound envelope must come from the counterparty"
+        );
+        if matches!(
+            session.state,
+            SessionState::Closed | SessionState::Abandoned
+        ) {
+            // The local close transition precedes receipt of its final frame.
+            anyhow::ensure!(
+                session.state == SessionState::Closed && env.kind == kinds::SESSION_CLOSE,
+                "cannot receive traffic in a terminal HACP session"
+            );
+        }
+        self.receive(env)
     }
 
     /// The most recent message in this side's inbox.
@@ -120,10 +184,20 @@ impl Side {
     /// "most recent" means the peer's latest send, not the filesystem's opinion about
     /// modification times, which is not reliable at sub-second resolution.
     pub async fn read_latest(&self) -> anyhow::Result<Envelope> {
+        if let Some(journal) = &self.journal {
+            // Recovery consumes every committed message in sender order, not just
+            // whichever file happened to be last when the coordinator died.
+            let next = journal.outbound(self.peer_label(), self.received + 1)?;
+            let name = format!("{:03}-{}.json", self.received + 1, next.kind);
+            let wire = tokio::fs::read(self.in_dir.join(name)).await?;
+            let received: Envelope = serde_json::from_slice(&wire)?;
+            anyhow::ensure!(received == next, "transport envelope differs from committed outbox");
+            return Ok(received);
+        }
         let mut names: Vec<String> = Vec::new();
-        let mut rd = tokio::fs::read_dir(&self.in_dir).await.map_err(|e| {
-            anyhow::anyhow!("cannot read inbox {}: {e}", self.in_dir.display())
-        })?;
+        let mut rd = tokio::fs::read_dir(&self.in_dir)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot read inbox {}: {e}", self.in_dir.display()))?;
         while let Some(entry) = rd.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".json") {
@@ -211,6 +285,47 @@ mod tests {
         )
     }
 
+    #[test]
+    fn session_bound_receive_rejects_foreign_sessions_and_authors_without_recording() {
+        let (_t, ao, bo) = dirs();
+        let (_, mut b) = sides(ao, bo);
+        let mut session = Session::open("s-1", A, B).unwrap();
+        session.accept(B).unwrap();
+        let valid = Envelope::new("s-1", A, B, kinds::HEARTBEAT, json!({}));
+        let mut foreign = valid.clone();
+        foreign.session_id = "s-foreign".into();
+        let mut outsider = valid.clone();
+        outsider.from = "urn:hacp:agent:outsider".into();
+        let mut self_authored = valid.clone();
+        self_authored.from = B.into();
+        for env in [foreign, outsider, self_authored] {
+            assert!(b.receive_in_session(env, &session).is_err());
+            assert!(b.frames.is_empty());
+        }
+        b.receive_in_session(valid.clone(), &session).unwrap();
+        session.close(A, "done").unwrap();
+        assert!(b.receive_in_session(valid, &session).is_err());
+        assert_eq!(b.frames.len(), 1);
+    }
+
+    #[test]
+    fn redelivery_is_idempotent_but_id_reuse_with_changed_content_is_refused() {
+        let (_t, ao, bo) = dirs();
+        let (_, mut b) = sides(ao, bo);
+        let env = Envelope::new("s-1", A, B, kinds::HEARTBEAT, json!({}));
+        b.receive(env.clone()).unwrap();
+        b.receive(env.clone()).unwrap();
+        assert_eq!(b.frames.len(), 1);
+        let mut changed = env.clone();
+        changed.body = json!({"changed": true});
+        assert!(b.receive(changed).is_err());
+        assert_eq!(b.frames.len(), 1);
+        let mut another_session = env;
+        another_session.session_id = "s-2".into();
+        b.receive(another_session).unwrap();
+        assert_eq!(b.frames.len(), 2);
+    }
+
     #[tokio::test]
     async fn a_message_crosses_the_edge_and_both_views_agree() {
         let (_t, ao, bo) = dirs();
@@ -227,9 +342,14 @@ mod tests {
     async fn a_message_addressed_elsewhere_is_refused() {
         let (_t, ao, bo) = dirs();
         let (mut a, mut b) = sides(ao, bo);
-        a.emit("s-1", "urn:hacp:agent:someone-else", kinds::HEARTBEAT, json!({}))
-            .await
-            .unwrap();
+        a.emit(
+            "s-1",
+            "urn:hacp:agent:someone-else",
+            kinds::HEARTBEAT,
+            json!({}),
+        )
+        .await
+        .unwrap();
         let got = b.read_latest().await.unwrap();
         let e = b.receive(got).unwrap_err().to_string();
         assert!(e.contains("arrived at"), "{e}");
@@ -245,7 +365,9 @@ mod tests {
         let mut got = b.read_latest().await.unwrap();
         got.body = json!({"prospective": false}); // a message tampered with in flight
         b.receive(got).unwrap();
-        let e = transcripts_agree(&a.frames, &b.frames).unwrap_err().to_string();
+        let e = transcripts_agree(&a.frames, &b.frames)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("divergence at frame 0"), "{e}");
     }
 
@@ -258,7 +380,9 @@ mod tests {
         a.emit("s-1", B, kinds::SESSION_OPEN, json!({}))
             .await
             .unwrap();
-        let e = transcripts_agree(&a.frames, &b.frames).unwrap_err().to_string();
+        let e = transcripts_agree(&a.frames, &b.frames)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("length divergence"), "{e}");
     }
 

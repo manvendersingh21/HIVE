@@ -16,6 +16,7 @@ pub mod collab;
 pub mod finetune;
 pub mod llm;
 pub mod memory;
+mod private_db;
 pub mod runtime;
 pub mod skills;
 pub mod tools;

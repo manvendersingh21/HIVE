@@ -8,7 +8,7 @@ edition = "2021"
 # transport, and MUST NOT depend on hive-core or hive-common — an adapter that knew
 # about a particular master would not be an adapter.
 [dependencies]
-hacp = { path = "../hacp" }
+hacp = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

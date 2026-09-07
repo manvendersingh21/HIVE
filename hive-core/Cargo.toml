@@ -5,7 +5,7 @@ edition = "2021"
 description = "Master agent brain — LLM routing, task planning, worker delegation, memory, and watchdog"
 
 [dependencies]
-hacp = { path = "../hacp" }
+hacp = { workspace = true }
 hive-common = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

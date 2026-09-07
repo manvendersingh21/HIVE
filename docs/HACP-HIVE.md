@@ -1,7 +1,8 @@
 # HACP in Hive — the binding, and where it actually stands
 
-The protocol is specified in [`hacp/spec/HACP.md`](../hacp/spec/HACP.md) and implemented
-as types in the standalone [`hacp`](../hacp) crate. **Neither names Hive.** That is
+The protocol is specified in [`HACP/1.1`](../hacp/spec/HACP.md) and the separate
+[`HACP/2.0 draft`](../hacp/spec/HACP-2.0-draft.md), and implemented in the standalone
+[`hacp`](../hacp) library. **The library does not depend on Hive.** That is
 deliberate: HACP describes how heterogeneous agents collaborate, and Hive is *a*
 reference implementation of it, not the definition of its limits. A second implementation,
 in another language, is meant to be possible from the spec and the conformance vectors
@@ -9,6 +10,54 @@ alone.
 
 This document is the other half: how Hive binds that protocol to a real transport, a real
 filesystem, and real agentic CLIs — and an honest account of how much of it exists.
+
+## Library integration (2026-09-05)
+
+Hive consumes `hacp` through the workspace dependency in the root `Cargo.toml`;
+`hive-core` and `hive-adapter` both use that single dependency definition. It points
+to the local standalone library with an explicit package version. Keeping it in
+the workspace does not make HACP depend on Hive: HACP's own manifest, tests, and
+package remain independently usable. See the [standalone guide](../hacp/README.md).
+
+The bindings intentionally use different namespaces:
+
+- `hive-core/src/collab` and `hive-adapter` use the frozen HACP 1.1 APIs.
+- `hive-core/src/runtime`, invoked by `hive collab run`, uses `hacp::v2`.
+  This is not an implicit upgrade of the 1.1 bus or adapter's wire protocol.
+
+The v2 runtime now transports the full `Verification` library type, including
+verification ID, verifier, contract ID, frozen revision, artifacts, evidence,
+checks and attestations. On receipt it validates envelope context and authorship,
+deserializes that record, and calls `Contract::apply_verification`. It no longer
+reimplements a partial acceptance rule or applies the sender's in-memory verdict
+through the low-level `Contract::decide`. Agent-authored checks are parsed as a
+complete `Vec<Check>`; malformed entries fail instead of disappearing. All runtime
+receives are checked against the HACP session's participants and session ID.
+
+HACP owns protocol state transitions. Hive owns CLI invocation, local artifact
+measurement, transport, and reports. The single-pass runtime reports:
+
+- Accept → `Settled`, exit 0, session closed.
+- Reject → `Rejected`, exit 1, session closed.
+- Rework → `ReworkRequired`, exit 2, contract remains `Executing`, session remains
+  `Active`. `rework-state.json` preserves both library snapshots for trusted
+  inspection or future migration. **Automatic rework/resume is not implemented**;
+  this outcome does not launch extra model calls or claim completion.
+- Declined negotiation → `NoAgreement`, exit 0 (a valid protocol outcome).
+
+The state file is a local host snapshot, not a remote command or a supported resume
+API. Transport authentication, persistent replay protection and verification of
+every task-specific acceptance criterion remain runtime responsibilities; using
+the library alone does not establish those guarantees. Recursive delegation,
+cross-branch permit admission and escalation orchestration remain separate runtime
+milestones—this integration does not claim to enable them automatically.
+
+Verification commands (no live models or production data):
+
+```sh
+cargo test -p hacp -p hive-core -p hive-adapter --offline
+cargo build -p hive-cli -p hive-adapter --offline
+```
 
 ---
 

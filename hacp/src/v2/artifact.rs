@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 /// Who may see an artifact (§9.1), as a widening ladder: an artifact with
 /// visibility V is visible to every audience at or below V.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Visibility {
     /// The contract's two participants only.
@@ -65,6 +67,8 @@ pub enum ArtifactError {
     BadId { found: String },
     #[error("digest must be 64 lowercase hex characters, found {found:?}")]
     BadDigest { found: String },
+    #[error("contract_revision must be a 64-hex digest, found {found:?}")]
+    BadRevision { found: String },
     #[error("media_type {found:?} must be type/subtype with non-empty tokens")]
     BadMediaType { found: String },
     #[error("producer: {0}")]
@@ -135,6 +139,11 @@ impl Artifact {
 
     pub fn validate(&self) -> Result<(), ArtifactError> {
         validate_artifact_id(&self.artifact_id)?;
+        if !is_digest_shape(&self.contract_revision) {
+            return Err(ArtifactError::BadRevision {
+                found: self.contract_revision.clone(),
+            });
+        }
         if !is_digest_shape(&self.digest) {
             return Err(ArtifactError::BadDigest {
                 found: self.digest.clone(),
@@ -176,7 +185,10 @@ impl Artifact {
 /// `derived_from`, in discovery order. Cycles are refused — carried from
 /// 1.1's dependency validation, because a provenance cycle is the same lie.
 /// Diamonds (two paths to one ancestor) are ordinary and yield one visit.
-pub fn ancestry<'a>(artifacts: &'a [Artifact], id: &str) -> Result<Vec<&'a Artifact>, ArtifactError> {
+pub fn ancestry<'a>(
+    artifacts: &'a [Artifact],
+    id: &str,
+) -> Result<Vec<&'a Artifact>, ArtifactError> {
     let mut colors: std::collections::BTreeMap<String, Color> = Default::default();
     let mut order: Vec<&Artifact> = Vec::new();
     let start = artifacts
@@ -228,7 +240,9 @@ fn visit<'a>(
 fn validate_artifact_id(id: &str) -> Result<(), ArtifactError> {
     let rest = id
         .strip_prefix("urn:hacp:artifact:")
-        .ok_or_else(|| ArtifactError::BadId { found: id.to_string() })?;
+        .ok_or_else(|| ArtifactError::BadId {
+            found: id.to_string(),
+        })?;
     // uuid4 shape: 8-4-4-4-12 hex, version nibble 4, variant nibble 8/9/a/b.
     let bytes = rest.as_bytes();
     if bytes.len() != 36
@@ -237,21 +251,33 @@ fn validate_artifact_id(id: &str) -> Result<(), ArtifactError> {
         || bytes[18] != b'-'
         || bytes[23] != b'-'
     {
-        return Err(ArtifactError::BadId { found: id.to_string() });
+        return Err(ArtifactError::BadId {
+            found: id.to_string(),
+        });
     }
     let hex: String = rest.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
-        return Err(ArtifactError::BadId { found: id.to_string() });
+    if hex.len() != 32
+        || !hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(ArtifactError::BadId {
+            found: id.to_string(),
+        });
     }
     let nibbles: Vec<char> = hex.chars().collect();
     if nibbles[12] != '4' || !matches!(nibbles[16], '8' | '9' | 'a' | 'b') {
-        return Err(ArtifactError::BadId { found: id.to_string() });
+        return Err(ArtifactError::BadId {
+            found: id.to_string(),
+        });
     }
     Ok(())
 }
 
 pub(crate) fn is_digest_shape(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    s.len() == 64
+        && s.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -299,7 +325,10 @@ mod tests {
         assert!(matches!(a.validate(), Err(ArtifactError::BadDigest { .. })));
         let mut a = artifact("00000000");
         a.media_type = "text".into();
-        assert!(matches!(a.validate(), Err(ArtifactError::BadMediaType { .. })));
+        assert!(matches!(
+            a.validate(),
+            Err(ArtifactError::BadMediaType { .. })
+        ));
         let mut a = artifact("00000000");
         a.producer = "codex".into();
         assert!(matches!(a.validate(), Err(ArtifactError::BadProducer(_))));
@@ -327,16 +356,27 @@ mod tests {
         let mut top = artifact("00000002");
         mid.derive(&mut top);
         let all = [base.clone(), mid, top];
-        let chain = ancestry(&all, &format!("urn:hacp:artifact:00000002-1111-4222-8333-444444444444")).unwrap();
+        let chain = ancestry(
+            &all,
+            &format!("urn:hacp:artifact:00000002-1111-4222-8333-444444444444"),
+        )
+        .unwrap();
         assert_eq!(chain.len(), 2, "base and mid, not just the direct parent");
         // A cycle: base and top claim to derive from each other.
         let mut cyclic = base;
-        cyclic.derived_from = vec![format!("urn:hacp:artifact:00000002-1111-4222-8333-444444444444")];
+        cyclic.derived_from = vec![format!(
+            "urn:hacp:artifact:00000002-1111-4222-8333-444444444444"
+        )];
         let mut top = artifact("00000002");
-        top.derived_from = vec![format!("urn:hacp:artifact:00000000-1111-4222-8333-444444444444")];
+        top.derived_from = vec![format!(
+            "urn:hacp:artifact:00000000-1111-4222-8333-444444444444"
+        )];
         let all = [cyclic, artifact("00000001"), top];
         assert!(matches!(
-            ancestry(&all, &format!("urn:hacp:artifact:00000000-1111-4222-8333-444444444444")),
+            ancestry(
+                &all,
+                &format!("urn:hacp:artifact:00000000-1111-4222-8333-444444444444")
+            ),
             Err(ArtifactError::Cycle(_))
         ));
     }

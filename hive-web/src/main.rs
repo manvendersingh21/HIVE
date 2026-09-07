@@ -194,7 +194,15 @@ async fn main() -> anyhow::Result<()> {
         incidents: incidents::IncidentReview::from_env(),
     };
 
-    let app = Router::new()
+    let app = app_router(state, &static_dir);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    info!(%bind_addr, static_dir = %static_dir, "Hive Web listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn app_router(state: AppState, static_dir: &str) -> Router {
+    Router::new()
         .route("/", get(dashboard))
         .route("/sessions", get(sessions_page))
         .route("/machines", get(machines_page))
@@ -229,17 +237,57 @@ async fn main() -> anyhow::Result<()> {
         // `/api/` route, but the markup was public and the review page made that
         // worth fixing rather than noting. `require_auth` keeps `.css`/`.js` and
         // `/assets/` open, so the login page still styles itself.
-        .fallback_service(ServeDir::new(&static_dir))
+        .fallback_service(ServeDir::new(static_dir))
         .layer(middleware::from_fn_with_state(
             state.auth.clone(),
             auth::require_auth,
         ))
-        .with_state(state);
+        .with_state(state)
+}
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    info!(%bind_addr, static_dir = %static_dir, "Hive Web listening");
-    axum::serve(listener, app).await?;
-    Ok(())
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use axum::{body::Body, http::{header, Request}};
+    use hive_core::watchdog::incidents::IncidentStore;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn actual_router_gates_static_pages_and_apis() {
+        let auth = auth::Auth::new("test-password".into());
+        let state = AppState {
+            auth,
+            agent: chat::AgentHandle::disabled(),
+            workers: workers::WorkerIngest::from_env(),
+            incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()),
+        };
+        let app = app_router(state, concat!(env!("CARGO_MANIFEST_DIR"), "/static"));
+        for path in ["/", "/sessions", "/incidents", "/index.html", "/chat.html", "/incidents.html", "/machines.html", "/terminal.html"] {
+            let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+            assert_eq!(response.headers()[header::LOCATION], "/login", "{path}");
+        }
+        for path in ["/api/sessions", "/api/incidents", "/api/machines", "/ws/test"] {
+            let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        for path in ["/login", "/api/health"] {
+            let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        let login = app.clone().oneshot(Request::post("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("password=test-password")).unwrap()).await.unwrap();
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        let cookie = login.headers()[header::SET_COOKIE].to_str().unwrap()
+            .split(';').next().unwrap();
+        for path in ["/index.html", "/chat.html", "/incidents.html"] {
+            let response = app.clone().oneshot(Request::get(path)
+                .header(header::COOKIE, cookie)
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "authenticated {path}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------- pages

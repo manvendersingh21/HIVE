@@ -2,7 +2,7 @@
   "pair": "claude x codex",
   "supervisor_cli": "claude",
   "worker_cli": "codex",
-  "run_dir": "/Users/manubaba/.hive/collab/20260905T012837Z-claudexcodex",
+  "run_dir": "~/.hive/collab/20260905T012837Z-claudexcodex",
   "session_id": "s-70479c67e1f2",
   "contract_id": "c-70479c67acc2",
   "task_id": "t-70479c6766b2",
@@ -68,5 +68,5 @@
     "contradicted": [],
     "unmatched": []
   },
-  "transcript": "/Users/manubaba/.hive/collab/20260905T012837Z-claudexcodex/claudexcodex.jsonl"
+  "transcript": "~/.hive/collab/20260905T012837Z-claudexcodex/claudexcodex.jsonl"
 }

@@ -133,8 +133,13 @@ pub mod agent_urn {
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum EnvelopeError {
     #[error("protocol must be {required}, found {found:?}")]
-    WrongProtocol { required: &'static str, found: String },
-    #[error("message_id {found:?} must be \"m-\" followed by at least 12 lowercase hex characters")]
+    WrongProtocol {
+        required: &'static str,
+        found: String,
+    },
+    #[error(
+        "message_id {found:?} must be \"m-\" followed by at least 12 lowercase hex characters"
+    )]
     BadMessageId { found: String },
     #[error("session_id must be a non-empty string")]
     BadSessionId,
@@ -150,6 +155,8 @@ pub enum EnvelopeError {
     BadInReplyTo { found: String },
     #[error("body: {0}")]
     BadBody(String),
+    #[error("extension field {field:?}: {reason}")]
+    BadExtension { field: String, reason: String },
 }
 
 /// The HACP/2.0 wire unit (§5.2).
@@ -178,9 +185,14 @@ pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
     /// Kind-specific body; must be canonicalizable (integers only, §5.1).
+    #[schemars(with = "std::collections::BTreeMap<String, Value>")]
     pub body: Value,
     /// Fields this build does not know, preserved on re-serialization (§5.2).
-    #[serde(flatten, skip_serializing_if = "std::collections::BTreeMap::is_empty", default)]
+    #[serde(
+        flatten,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty",
+        default
+    )]
     pub extra: std::collections::BTreeMap<String, Value>,
 }
 
@@ -246,9 +258,35 @@ impl Envelope {
                 });
             }
         }
-        canon::canonical_json(&self.body)
-            .map(|_| ())
-            .map_err(|e| EnvelopeError::BadBody(e.to_string()))
+        if !self.body.is_object() {
+            return Err(EnvelopeError::BadBody("must be a JSON object".into()));
+        }
+        canon::canonical_json(&self.body).map_err(|e| EnvelopeError::BadBody(e.to_string()))?;
+        for (field, value) in &self.extra {
+            if [
+                "protocol",
+                "message_id",
+                "session_id",
+                "from",
+                "to",
+                "kind",
+                "timestamp",
+                "in_reply_to",
+                "body",
+            ]
+            .contains(&field.as_str())
+            {
+                return Err(EnvelopeError::BadExtension {
+                    field: field.clone(),
+                    reason: "collides with a reserved field".into(),
+                });
+            }
+            canon::canonical_json(value).map_err(|e| EnvelopeError::BadExtension {
+                field: field.clone(),
+                reason: e.to_string(),
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -256,7 +294,10 @@ fn is_message_id_shape(s: &str) -> bool {
     let Some(hex) = s.strip_prefix("m-") else {
         return false;
     };
-    hex.len() >= 12 && hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    hex.len() >= 12
+        && hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -283,14 +324,26 @@ mod tests {
     fn message_ids_and_replies_must_have_the_registry_shape() {
         let mut e = valid();
         e.message_id = "m-Short".into();
-        assert!(matches!(e.validate(), Err(EnvelopeError::BadMessageId { .. })));
+        assert!(matches!(
+            e.validate(),
+            Err(EnvelopeError::BadMessageId { .. })
+        ));
         e.message_id = "x-000000000000".into();
-        assert!(matches!(e.validate(), Err(EnvelopeError::BadMessageId { .. })));
+        assert!(matches!(
+            e.validate(),
+            Err(EnvelopeError::BadMessageId { .. })
+        ));
         e.message_id = "m-000000000ABC".into();
-        assert!(matches!(e.validate(), Err(EnvelopeError::BadMessageId { .. })));
+        assert!(matches!(
+            e.validate(),
+            Err(EnvelopeError::BadMessageId { .. })
+        ));
         e.message_id = "m-000000000000".into();
         e.in_reply_to = Some("not-an-id".into());
-        assert!(matches!(e.validate(), Err(EnvelopeError::BadInReplyTo { .. })));
+        assert!(matches!(
+            e.validate(),
+            Err(EnvelopeError::BadInReplyTo { .. })
+        ));
     }
 
     #[test]
@@ -325,9 +378,15 @@ mod tests {
         });
         let envelope: Envelope = serde_json::from_value(raw.clone()).unwrap();
         envelope.validate().unwrap();
-        assert_eq!(envelope.extra.get("shimmer"), Some(&json!({"future": [1, 2]})));
+        assert_eq!(
+            envelope.extra.get("shimmer"),
+            Some(&json!({"future": [1, 2]}))
+        );
         let reserialized = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(reserialized, raw, "re-serialization must not lose the future");
+        assert_eq!(
+            reserialized, raw,
+            "re-serialization must not lose the future"
+        );
     }
 
     #[test]

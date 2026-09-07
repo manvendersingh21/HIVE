@@ -67,6 +67,8 @@ impl SshWorker {
         let status = self
             .session
             .command("true")
+            // SSH otherwise drains piped chat input while probing workers.
+            .stdin(Stdio::null())
             .status()
             .await
             .map_err(|e| anyhow::anyhow!("ping failed: {e}"))?;
@@ -75,6 +77,13 @@ impl SshWorker {
         } else {
             anyhow::bail!("ping command exited non-zero")
         }
+    }
+
+    /// Read-only execution prerequisite check in the same non-login environment
+    /// used by spawn_tmux. Reachable SSH alone does not make a worker schedulable.
+    /// This deliberately does not claim agent credentials or models are usable.
+    pub async fn execution_ready(&self) -> anyhow::Result<()> {
+        self.run(EXECUTION_PROBE).await.map(|_| ())
     }
 
     /// Suspend a session's foreground job with SIGSTOP.
@@ -124,7 +133,11 @@ echo "stopped $pgid""#
         }
 
         let out = self.run(&script).await?;
-        tracing::debug!(session = session_name, result = out.trim(), "session suspended");
+        tracing::debug!(
+            session = session_name,
+            result = out.trim(),
+            "session suspended"
+        );
         Ok(PauseOutcome::Suspended)
     }
 
@@ -132,6 +145,7 @@ echo "stopped $pgid""#
     pub async fn session_exists(&self, session_name: &str) -> bool {
         self.session
             .command("tmux")
+            .stdin(Stdio::null())
             .args(["has-session", "-t", &format!("={session_name}")])
             .status()
             .await
@@ -158,7 +172,11 @@ done
 echo "resumed $resumed""#
         );
         let out = self.run(&script).await?;
-        tracing::debug!(session = session_name, result = out.trim(), "session resumed");
+        tracing::debug!(
+            session = session_name,
+            result = out.trim(),
+            "session resumed"
+        );
         Ok(())
     }
 
@@ -169,6 +187,7 @@ echo "resumed $resumed""#
         let output = self
             .session
             .command("sh")
+            .stdin(Stdio::null())
             .arg("-c")
             .arg(command)
             .output()
@@ -213,10 +232,12 @@ echo "resumed $resumed""#
         // in a group of its own, tmux is never told anything stopped, and the stop holds.
         // Measured on tmux 3.7c: without this, every process was back in `S` a moment
         // after a `kill -STOP` that returned 0.
-        let inner = format!("set -m; {{ ( {command} ); echo \"__HIVE_DONE__$?\"; }} 2>&1 | tee {log_path}");
+        let inner =
+            format!("set -m; {{ ( {command} ); echo \"__HIVE_DONE__$?\"; }} 2>&1 | tee {log_path}");
         let status = self
             .session
             .command("tmux")
+            .stdin(Stdio::null())
             .args([
                 "new-session",
                 "-d",
@@ -240,6 +261,7 @@ echo "resumed $resumed""#
     /// state for a human to inspect on reattach.
     pub async fn send_keys(&self, session_name: &str, keys: &[&str]) -> anyhow::Result<()> {
         let mut cmd = self.session.command("tmux");
+        cmd.stdin(Stdio::null());
         cmd.args(["send-keys", "-t", &pane_target(session_name)]);
         cmd.args(keys.iter().copied());
         let status = cmd
@@ -258,6 +280,7 @@ echo "resumed $resumed""#
         let output = self
             .session
             .command("tmux")
+            .stdin(Stdio::null())
             .args([
                 "capture-pane",
                 "-p",
@@ -280,6 +303,8 @@ echo "resumed $resumed""#
     }
 }
 
+const EXECUTION_PROBE: &str = "command -v tmux >/dev/null && command -v bash >/dev/null && command -v tee >/dev/null && command -v tail >/dev/null && tmux -V >/dev/null && bash --version >/dev/null";
+
 /// A live line-by-line stream of a remote log file (`tail -f` over SSH).
 pub struct LogTail {
     // Held to keep the remote process (and its SSH channel) alive for as
@@ -291,6 +316,7 @@ pub struct LogTail {
 impl LogTail {
     async fn start(session: Arc<Session>, log_path: &str) -> anyhow::Result<Self> {
         let mut cmd = session.arc_command("tail");
+        cmd.stdin(Stdio::null());
         cmd.args(["-f", "-n", "+1", log_path]);
         cmd.stdout(Stdio::piped());
         let mut child = cmd
@@ -325,4 +351,95 @@ mod tests {
         // The `=` keeps `hive-1` from matching `hive-10`.
         assert!(pane_target("hive-1").starts_with('='));
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_commands_leave_piped_stdin_for_the_caller() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncWriteExt;
+
+        const INPUT: &str = "a piped chat turn\nand another line\n";
+        if let Some(dir) = std::env::var_os("HIVE_SSH_STDIN_PROBE") {
+            // Resume avoids a real connection. Only this subprocess has the
+            // fake ssh on PATH, so parallel tests and live workers are untouched.
+            let worker = SshWorker {
+                session: Arc::new(Session::resume(
+                    std::path::PathBuf::from(dir)
+                        .join("socket")
+                        .into_boxed_path(),
+                    None,
+                )),
+            };
+            worker.ping().await.unwrap();
+            worker.execution_ready().await.unwrap();
+            assert!(worker.session_exists("stdin-test").await);
+            worker.run("true").await.unwrap();
+            worker
+                .spawn_tmux("stdin-test", "true", "/unused")
+                .await
+                .unwrap();
+            worker.send_keys("stdin-test", &["Enter"]).await.unwrap();
+            worker.capture_pane("stdin-test", 1).await.unwrap();
+            let mut tail = worker.tail("/unused").await.unwrap();
+            assert_eq!(
+                tail.next_line().await.unwrap().as_deref(),
+                Some("fake-ssh-output")
+            );
+            let mut remaining = String::new();
+            std::io::stdin().read_to_string(&mut remaining).unwrap();
+            assert_eq!(remaining, INPUT, "worker SSH stole the caller's stdin");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hive-ssh-stdin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ssh = dir.join("ssh");
+        // Model the problematic SSH behavior: drain everything inherited on fd 0.
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\n/bin/cat >/dev/null\nprintf 'fake-ssh-output\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workers::ssh::tests::worker_commands_leave_piped_stdin_for_the_caller",
+            ])
+            .env("HIVE_SSH_STDIN_PROBE", &dir)
+            .env("PATH", &dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(INPUT.as_bytes())
+            .await
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+            .await
+            .expect("SSH stdin regression subprocess hung")
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
+    #[test]
+    fn execution_probe_requires_working_tmux_not_just_a_reachable_shell() {
+        for (tmux_body, expected) in [("return 0", true), ("return 1", false)] {
+            let script = format!("tmux() {{ {tmux_body}; }}; bash() {{ return 0; }}; {EXECUTION_PROBE}");
+            let result = std::process::Command::new("sh").args(["-c", &script]).status().unwrap();
+            assert_eq!(result.success(), expected);
+        }
+    }

@@ -5,7 +5,7 @@
 //! rules are enforced by construction rather than by review:
 //!
 //! * **Evidence over signals** (§9.4, Phase S finding 2): an Accept verdict
-//!   requires subject artifacts and at least one passing check. A process exit
+//!   requires subject artifacts and nonempty checks, all passing. A process exit
 //!   code, an exit file, or a self-report is a signal; a verdict built on
 //!   signals alone is refused here, mechanically.
 //! * **Attestation composes, authority does not** (§9.3, ADR-0001 §5): a
@@ -55,7 +55,9 @@ pub struct Verification {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum VerificationError {
-    #[error("verification_id {found:?} must be \"v-\" followed by at least 12 lowercase hex characters")]
+    #[error(
+        "verification_id {found:?} must be \"v-\" followed by at least 12 lowercase hex characters"
+    )]
     BadId { found: String },
     #[error("verifier: {0}")]
     BadVerifier(String),
@@ -63,6 +65,8 @@ pub enum VerificationError {
     BadRevision { found: String },
     #[error("cannot accept on signals alone (§9.4): a verdict of Accept requires subject artifacts and at least one passing check — measured: a blocked stock CLI exited 0 having produced nothing")]
     SignalsAreNotEvidence,
+    #[error("cannot accept with failed checks; use rework or reject")]
+    FailedChecks,
     #[error("attestation cycle detected involving {0:?}")]
     Cycle(String),
     #[error("unknown verification {0:?} in attestation closure")]
@@ -107,7 +111,10 @@ impl Verification {
                 found: self.verification_id.clone(),
             });
         };
-        if hex.len() < 12 || !hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        if hex.len() < 12
+            || !hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         {
             return Err(VerificationError::BadId {
                 found: self.verification_id.clone(),
@@ -124,6 +131,9 @@ impl Verification {
             && (self.artifacts.is_empty() || !self.checks.iter().any(|c| c.passed))
         {
             return Err(VerificationError::SignalsAreNotEvidence);
+        }
+        if matches!(self.verdict, Verdict::Accept) && self.checks.iter().any(|c| !c.passed) {
+            return Err(VerificationError::FailedChecks);
         }
         Ok(())
     }
@@ -154,7 +164,7 @@ fn visit<'a>(
     order: &mut Vec<&'a Verification>,
 ) -> Result<(), VerificationError> {
     match colors.get(id) {
-        Some(true) => return Ok(()),      // diamond
+        Some(true) => return Ok(()), // diamond
         Some(false) => return Err(VerificationError::Cycle(id.to_string())),
         None => {}
     }
@@ -185,7 +195,11 @@ mod tests {
         (artifacts, checks)
     }
 
-    fn record(verdict: Verdict, artifacts: Vec<String>, checks: Vec<Check>) -> Result<Verification, VerificationError> {
+    fn record(
+        verdict: Verdict,
+        artifacts: Vec<String>,
+        checks: Vec<Check>,
+    ) -> Result<Verification, VerificationError> {
         let reasons = match &verdict {
             Verdict::Accept => vec![],
             _ => vec!["reasons accompany refusals".to_string()],
@@ -238,15 +252,18 @@ mod tests {
             &"d".repeat(64),
             artifacts.clone(),
             vec![],
-            vec![Check { name: "integration".into(), passed: true, detail: "children settled".into() }],
+            vec![Check {
+                name: "integration".into(),
+                passed: true,
+                detail: "children settled".into(),
+            }],
             Verdict::Accept,
             vec!["attests child verification".into()],
             vec![child.verification_id.clone()],
         )
         .unwrap();
         let records = [child, parent];
-        let closure =
-            attestation_closure(&records, "v-0000000000000002").unwrap();
+        let closure = attestation_closure(&records, "v-0000000000000002").unwrap();
         assert_eq!(closure.len(), 1, "the child stands under the parent");
         // A cycle: the child attests the parent.
         let mut cyclic = records[0].clone();
@@ -267,10 +284,16 @@ mod tests {
         let (artifacts, checks) = accept_inputs();
         let mut v = record(Verdict::Accept, artifacts, checks).unwrap();
         v.against_revision = "latest".into();
-        assert!(matches!(v.validate(), Err(VerificationError::BadRevision { .. })));
+        assert!(matches!(
+            v.validate(),
+            Err(VerificationError::BadRevision { .. })
+        ));
         let (artifacts, checks) = accept_inputs();
         let mut v = record(Verdict::Accept, artifacts, checks).unwrap();
         v.verifier = "codex".into();
-        assert!(matches!(v.validate(), Err(VerificationError::BadVerifier(_))));
+        assert!(matches!(
+            v.validate(),
+            Err(VerificationError::BadVerifier(_))
+        ));
     }
 }

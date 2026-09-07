@@ -68,6 +68,10 @@ pub enum GrantError {
     BadUrn(String),
     #[error("bad timestamp in grant: {0}")]
     BadTimestamp(String),
+    #[error("grant id {0:?} already names different content")]
+    DuplicateGrant(String),
+    #[error("organizational or grant chain contains a cycle at {0:?}")]
+    Cycle(String),
 }
 
 fn fresh_permit_id() -> String {
@@ -78,7 +82,11 @@ fn hex_id(prefix: &str, id: &str) -> Result<(), GrantError> {
     let rest = id
         .strip_prefix(prefix)
         .ok_or_else(|| GrantError::BadId(id.to_string()))?;
-    if rest.len() >= 12 && rest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+    if rest.len() >= 12
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
         Ok(())
     } else {
         Err(GrantError::BadId(id.to_string()))
@@ -116,8 +124,10 @@ impl CapabilityGrant {
             .map_err(|_| GrantError::BadUrn(self.grantor.clone()))?;
         super::envelope::agent_urn::parse(&self.grantee)
             .map_err(|_| GrantError::BadUrn(self.grantee.clone()))?;
-        validate_timestamp(&self.valid_from).map_err(|_| GrantError::BadTimestamp(self.valid_from.clone()))?;
-        validate_timestamp(&self.valid_until).map_err(|_| GrantError::BadTimestamp(self.valid_until.clone()))?;
+        validate_timestamp(&self.valid_from)
+            .map_err(|_| GrantError::BadTimestamp(self.valid_from.clone()))?;
+        validate_timestamp(&self.valid_until)
+            .map_err(|_| GrantError::BadTimestamp(self.valid_until.clone()))?;
         if self.valid_from > self.valid_until {
             return Err(GrantError::BadWindow {
                 from: self.valid_from.clone(),
@@ -155,12 +165,20 @@ impl GrantLedger {
     /// delegable upstream. Every layer of a chain passes the same test.
     pub fn issue(&mut self, grant: CapabilityGrant, at: &str) -> Result<(), GrantError> {
         grant.check_shape()?;
+        validate_timestamp(at).map_err(|_| GrantError::BadTimestamp(at.into()))?;
+        if let Some(existing) = self.grants.get(&grant.grant_id) {
+            return if existing == &grant {
+                Ok(())
+            } else {
+                Err(GrantError::DuplicateGrant(grant.grant_id))
+            };
+        }
         if let Some(parent_id) = &grant.parent {
             let parent = self
                 .grants
                 .get(parent_id)
                 .ok_or_else(|| GrantError::UnknownGrant(parent_id.clone()))?;
-            if self.revoked.contains(parent_id) || !parent.window_open(at) {
+            if !self.is_open(parent_id, at)? {
                 return Err(GrantError::ClosedGrant(parent_id.clone()));
             }
             if parent.grantee != grant.grantor {
@@ -195,18 +213,30 @@ impl GrantLedger {
 
     /// Is the grant open (unrevoked, inside its window) at `at`?
     pub fn is_open(&self, grant_id: &str, at: &str) -> Result<bool, GrantError> {
-        let g = self
-            .grants
-            .get(grant_id)
-            .ok_or_else(|| GrantError::UnknownGrant(grant_id.to_string()))?;
-        Ok(!self.revoked.contains(grant_id) && g.window_open(at))
+        validate_timestamp(at).map_err(|_| GrantError::BadTimestamp(at.into()))?;
+        let mut current = Some(grant_id);
+        let mut seen = BTreeSet::new();
+        while let Some(id) = current {
+            if !seen.insert(id) {
+                return Err(GrantError::Cycle(id.into()));
+            }
+            let grant = self
+                .grants
+                .get(id)
+                .ok_or_else(|| GrantError::UnknownGrant(id.into()))?;
+            if self.revoked.contains(id) || !grant.window_open(at) {
+                return Ok(false);
+            }
+            current = grant.parent.as_deref();
+        }
+        Ok(true)
     }
 
     /// The open grants held by `agent` at `at`.
     pub fn held_by(&self, agent: &str, at: &str) -> Vec<&CapabilityGrant> {
         self.grants
             .values()
-            .filter(|g| g.grantee == agent && !self.revoked.contains(&g.grant_id) && g.window_open(at))
+            .filter(|g| g.grantee == agent && self.is_open(&g.grant_id, at).unwrap_or(false))
             .collect()
     }
 
@@ -242,27 +272,47 @@ impl OrgChart {
     /// The declared chain from `agent` up to its root, inclusive of both.
     /// §11 and §10 walk this; it never implies session or artifact edges.
     pub fn chain(&self, agent: &str) -> Vec<String> {
+        self.checked_chain(agent).unwrap_or_default()
+    }
+
+    /// Checked traversal for untrusted declared charts. A cycle must terminate
+    /// with an error, never loop while accumulating an unbounded path.
+    pub fn checked_chain(&self, agent: &str) -> Result<Vec<String>, GrantError> {
         let mut path = vec![agent.to_string()];
+        let mut seen = BTreeSet::from([agent.to_string()]);
         let mut current = agent;
         while let Some(parent) = self.parent_of.get(current) {
+            if !seen.insert(parent.clone()) {
+                return Err(GrantError::Cycle(parent.clone()));
+            }
             path.push(parent.clone());
             current = parent;
         }
-        path
+        Ok(path)
+    }
+
+    pub fn validate(&self) -> Result<(), GrantError> {
+        for (child, parent) in &self.parent_of {
+            for urn in [child, parent] {
+                super::envelope::agent_urn::parse(urn).map_err(GrantError::BadUrn)?;
+            }
+            self.checked_chain(child)?;
+        }
+        Ok(())
     }
 
     /// The lowest common supervisor of `a` and `b` (§10.2): the first agent
     /// appearing in both declared chains, nearest to the leaves.
     pub fn lca(&self, a: &str, b: &str) -> Option<String> {
         let chain_b: BTreeSet<String> = self.chain(b).into_iter().collect();
-        self.chain(a).into_iter().find(|node| chain_b.contains(node))
+        self.chain(a)
+            .into_iter()
+            .find(|node| chain_b.contains(node))
     }
 
     /// Do `a` and `b` report to the same direct supervisor? (§11's stage one.)
     pub fn shares_parent(&self, a: &str, b: &str) -> bool {
-        a != b
-            && self.parent_of.get(a).is_some()
-            && self.parent_of.get(a) == self.parent_of.get(b)
+        a != b && self.parent_of.get(a).is_some() && self.parent_of.get(a) == self.parent_of.get(b)
     }
 
     /// Direct reports of `agent` (§13 arity checks).
@@ -307,6 +357,10 @@ pub struct CollaborationPermit {
     /// `cp-` + 12+ lowercase hex.
     pub permit_id: String,
     pub request_id: String,
+    /// Task class from the request; admission must use the same class.
+    /// Old snapshots without it require a newly issued permit.
+    #[serde(default)]
+    pub task_class: String,
     /// The pair this permit authorizes, from the §10.1 request.
     pub requester: String,
     pub peer: String,
@@ -318,7 +372,11 @@ pub struct CollaborationPermit {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CrossBranchError {
     #[error("issuer {issuer:?} is not the lowest common supervisor of {a:?} and {b:?} (§10.2)")]
-    NotLca { issuer: String, a: String, b: String },
+    NotLca {
+        issuer: String,
+        a: String,
+        b: String,
+    },
     #[error("no common supervisor for {0:?} and {1:?}")]
     NoLca(String, String),
     #[error("preauthorization missing or closed for {requester:?}/{class:?}")]
@@ -338,9 +396,11 @@ impl CollaborationPermit {
         request: &CollaborationRequest,
         issuer: &str,
     ) -> Result<Self, CrossBranchError> {
-        let lca = org
-            .lca(&request.requester, &request.peer)
-            .ok_or_else(|| CrossBranchError::NoLca(request.requester.clone(), request.peer.clone()))?;
+        org.validate()?;
+        request.validate()?;
+        let lca = org.lca(&request.requester, &request.peer).ok_or_else(|| {
+            CrossBranchError::NoLca(request.requester.clone(), request.peer.clone())
+        })?;
         if issuer != lca {
             return Err(CrossBranchError::NotLca {
                 issuer: issuer.to_string(),
@@ -351,6 +411,7 @@ impl CollaborationPermit {
         Ok(CollaborationPermit {
             permit_id: fresh_permit_id(),
             request_id: request.request_id.clone(),
+            task_class: request.task_class.clone(),
             requester: request.requester.clone(),
             peer: request.peer.clone(),
             issued_by: issuer.to_string(),
@@ -366,31 +427,47 @@ impl CollaborationPermit {
         request: &CollaborationRequest,
         at: &str,
     ) -> Result<Self, CrossBranchError> {
+        request.validate()?;
+        validate_timestamp(at).map_err(|_| GrantError::BadTimestamp(at.into()))?;
         let grant_id = ledger
             .preauthorizes(&request.requester, &request.task_class, at)
             .ok_or_else(|| CrossBranchError::NoPreauthorization {
                 requester: request.requester.clone(),
                 class: request.task_class.clone(),
             })?;
+        let mut expires = request.expires.clone();
+        let mut current = Some(grant_id.as_str());
+        while let Some(id) = current {
+            let grant = &ledger.grants[id];
+            expires = expires.min(grant.valid_until.clone());
+            current = grant.parent.as_deref();
+        }
+        if at > expires.as_str() {
+            return Err(CrossBranchError::Expired(expires));
+        }
         Ok(CollaborationPermit {
             permit_id: fresh_permit_id(),
             request_id: request.request_id.clone(),
+            task_class: request.task_class.clone(),
             requester: request.requester.clone(),
             peer: request.peer.clone(),
             issued_by: request.requester.clone(),
             basis: PermitBasis::Preauthorization { grant_id },
-            expires: request.expires.clone(),
+            expires,
         })
     }
 
-    /// Does this permit authorize a session between exactly these two agents,
-    /// unexpired at `at`? The permit authorizes the session, not the outcome.
+    /// Pair/expiry shape check only. Use `authorize_session` at admission to
+    /// recheck the authority basis and the requested task class as well.
     pub fn authorizes(&self, a: &str, b: &str, at: &str) -> Result<(), CrossBranchError> {
+        validate_timestamp(at).map_err(|_| GrantError::BadTimestamp(at.into()))?;
+        validate_timestamp(&self.expires)
+            .map_err(|_| GrantError::BadTimestamp(self.expires.clone()))?;
         if at > self.expires.as_str() {
             return Err(CrossBranchError::Expired(self.expires.clone()));
         }
-        let pair_matches = (a == self.requester && b == self.peer)
-            || (a == self.peer && b == self.requester);
+        let pair_matches =
+            (a == self.requester && b == self.peer) || (a == self.peer && b == self.requester);
         if pair_matches {
             Ok(())
         } else {
@@ -400,6 +477,70 @@ impl CollaborationPermit {
                 b.to_string(),
             ))
         }
+    }
+
+    /// Admission check for a stored permit: also recheck the basis against the
+    /// current org chart or grant ledger, including ancestor revocation.
+    pub fn authorize_session(
+        &self,
+        org: &OrgChart,
+        ledger: &GrantLedger,
+        a: &str,
+        b: &str,
+        task_class: &str,
+        at: &str,
+    ) -> Result<(), CrossBranchError> {
+        self.authorizes(a, b, at)?;
+        if task_class.is_empty() || self.task_class != task_class {
+            return Err(CrossBranchError::NoPreauthorization {
+                requester: self.requester.clone(),
+                class: task_class.into(),
+            });
+        }
+        match &self.basis {
+            PermitBasis::Lca { supervisor } => {
+                org.validate()?;
+                if self.issued_by != *supervisor
+                    || org.lca(a, b).as_deref() != Some(supervisor.as_str())
+                {
+                    return Err(CrossBranchError::NotLca {
+                        issuer: self.issued_by.clone(),
+                        a: a.into(),
+                        b: b.into(),
+                    });
+                }
+            }
+            PermitBasis::Preauthorization { grant_id } => {
+                if self.issued_by != self.requester
+                    || !ledger.is_open(grant_id, at)?
+                    || !ledger.held_by(&self.requester, at).iter().any(|g| {
+                        g.grant_id == *grant_id
+                            && g.scopes
+                                .iter()
+                                .any(|s| s.name == format!("cross-branch/{task_class}"))
+                    })
+                {
+                    return Err(GrantError::ClosedGrant(grant_id.clone()).into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CollaborationRequest {
+    fn validate(&self) -> Result<(), GrantError> {
+        hex_id("cr-", &self.request_id)?;
+        for urn in [&self.requester, &self.peer] {
+            super::envelope::agent_urn::parse(urn).map_err(GrantError::BadUrn)?;
+        }
+        if self.requester == self.peer || self.task_class.is_empty() {
+            return Err(GrantError::NotDelegable(
+                "distinct peers and a task class are required".into(),
+            ));
+        }
+        validate_timestamp(&self.expires)
+            .map_err(|_| GrantError::BadTimestamp(self.expires.clone()))
     }
 }
 
@@ -430,7 +571,16 @@ mod tests {
     fn a_charter_is_valid_ab_initio() {
         let mut ledger = GrantLedger::default();
         ledger
-            .issue(root_grant(&urn("boss"), vec![ScopeElement { name: "work/all".into(), delegable: true }]), T0)
+            .issue(
+                root_grant(
+                    &urn("boss"),
+                    vec![ScopeElement {
+                        name: "work/all".into(),
+                        delegable: true,
+                    }],
+                ),
+                T0,
+            )
             .unwrap();
         assert!(ledger.covers(&urn("boss"), "work/all", "2026-10-01T00:00:00Z"));
     }
@@ -440,7 +590,13 @@ mod tests {
         let mut ledger = GrantLedger::default();
         ledger
             .issue(
-                root_grant(&urn("boss"), vec![ScopeElement { name: "work/a".into(), delegable: false }]),
+                root_grant(
+                    &urn("boss"),
+                    vec![ScopeElement {
+                        name: "work/a".into(),
+                        delegable: false,
+                    }],
+                ),
                 T0,
             )
             .unwrap();
@@ -448,34 +604,58 @@ mod tests {
             grant_id: "g-000000000002".into(),
             grantor: urn("boss"),
             grantee: urn("kid"),
-            scopes: vec![ScopeElement { name: "work/a".into(), delegable: false }],
+            scopes: vec![ScopeElement {
+                name: "work/a".into(),
+                delegable: false,
+            }],
             valid_from: T0.into(),
             valid_until: T1.into(),
             parent: Some("g-000000000001".into()),
         };
-        assert_eq!(ledger.issue(child, T0), Err(GrantError::NotDelegable("work/a".into())));
+        assert_eq!(
+            ledger.issue(child, T0),
+            Err(GrantError::NotDelegable("work/a".into()))
+        );
     }
 
     #[test]
     fn every_layer_of_a_chain_passes_the_same_test() {
         let mut ledger = GrantLedger::default();
         ledger
-            .issue(root_grant(&urn("root"), vec![
-                ScopeElement { name: "work/all".into(), delegable: true },
-                ScopeElement { name: "work/secret".into(), delegable: false },
-            ]), T0)
+            .issue(
+                root_grant(
+                    &urn("root"),
+                    vec![
+                        ScopeElement {
+                            name: "work/all".into(),
+                            delegable: true,
+                        },
+                        ScopeElement {
+                            name: "work/secret".into(),
+                            delegable: false,
+                        },
+                    ],
+                ),
+                T0,
+            )
             .unwrap();
         // Layer 1: root delegates work/all (delegable) down.
         ledger
-            .issue(CapabilityGrant {
-                grant_id: "g-000000000002".into(),
-                grantor: urn("root"),
-                grantee: urn("mid"),
-                scopes: vec![ScopeElement { name: "work/all".into(), delegable: true }],
-                valid_from: T0.into(),
-                valid_until: T1.into(),
-                parent: Some("g-000000000001".into()),
-            }, T0)
+            .issue(
+                CapabilityGrant {
+                    grant_id: "g-000000000002".into(),
+                    grantor: urn("root"),
+                    grantee: urn("mid"),
+                    scopes: vec![ScopeElement {
+                        name: "work/all".into(),
+                        delegable: true,
+                    }],
+                    valid_from: T0.into(),
+                    valid_until: T1.into(),
+                    parent: Some("g-000000000001".into()),
+                },
+                T0,
+            )
             .unwrap();
         // Layer 2 tries to smuggle work/secret in: refused, and delegable
         // cannot be re-marked either.
@@ -483,30 +663,51 @@ mod tests {
             grant_id: "g-000000000003".into(),
             grantor: urn("mid"),
             grantee: urn("leaf"),
-            scopes: vec![ScopeElement { name: "work/secret".into(), delegable: true }],
+            scopes: vec![ScopeElement {
+                name: "work/secret".into(),
+                delegable: true,
+            }],
             valid_from: T0.into(),
             valid_until: T1.into(),
             parent: Some("g-000000000002".into()),
         };
-        assert_eq!(ledger.issue(bad, T0), Err(GrantError::NotDelegable("work/secret".into())));
+        assert_eq!(
+            ledger.issue(bad, T0),
+            Err(GrantError::NotDelegable("work/secret".into()))
+        );
     }
 
     #[test]
     fn revocation_closes_the_grant_and_everything_downstream_of_it() {
         let mut ledger = GrantLedger::default();
         ledger
-            .issue(root_grant(&urn("root"), vec![ScopeElement { name: "work/all".into(), delegable: true }]), T0)
+            .issue(
+                root_grant(
+                    &urn("root"),
+                    vec![ScopeElement {
+                        name: "work/all".into(),
+                        delegable: true,
+                    }],
+                ),
+                T0,
+            )
             .unwrap();
         ledger
-            .issue(CapabilityGrant {
-                grant_id: "g-000000000002".into(),
-                grantor: urn("root"),
-                grantee: urn("mid"),
-                scopes: vec![ScopeElement { name: "work/all".into(), delegable: false }],
-                valid_from: T0.into(),
-                valid_until: T1.into(),
-                parent: Some("g-000000000001".into()),
-            }, T0)
+            .issue(
+                CapabilityGrant {
+                    grant_id: "g-000000000002".into(),
+                    grantor: urn("root"),
+                    grantee: urn("mid"),
+                    scopes: vec![ScopeElement {
+                        name: "work/all".into(),
+                        delegable: false,
+                    }],
+                    valid_from: T0.into(),
+                    valid_until: T1.into(),
+                    parent: Some("g-000000000001".into()),
+                },
+                T0,
+            )
             .unwrap();
         ledger.revoke("g-000000000001").unwrap();
         assert!(!ledger.is_open("g-000000000001", T0).unwrap());
@@ -515,12 +716,18 @@ mod tests {
             grant_id: "g-000000000003".into(),
             grantor: urn("root"),
             grantee: urn("late"),
-            scopes: vec![ScopeElement { name: "work/all".into(), delegable: false }],
+            scopes: vec![ScopeElement {
+                name: "work/all".into(),
+                delegable: false,
+            }],
             valid_from: T0.into(),
             valid_until: T1.into(),
             parent: Some("g-000000000001".into()),
         };
-        assert_eq!(ledger.issue(child, T0), Err(GrantError::ClosedGrant("g-000000000001".into())));
+        assert_eq!(
+            ledger.issue(child, T0),
+            Err(GrantError::ClosedGrant("g-000000000001".into()))
+        );
     }
 
     #[test]
@@ -531,7 +738,10 @@ mod tests {
             "g-000000000009",
             "urn:hacp:agent:charter-1",
             &urn("x"),
-            vec![ScopeElement { name: "s".into(), delegable: true }],
+            vec![ScopeElement {
+                name: "s".into(),
+                delegable: true,
+            }],
             T1,
             T0,
         );
@@ -588,7 +798,12 @@ mod tests {
             Err(CrossBranchError::NotLca { .. })
         ));
         let permit = CollaborationPermit::by_lca(&org, &request, &urn("root")).unwrap();
-        assert_eq!(permit.basis, PermitBasis::Lca { supervisor: urn("root") });
+        assert_eq!(
+            permit.basis,
+            PermitBasis::Lca {
+                supervisor: urn("root")
+            }
+        );
 
         // Preauthorization: a standing cross-branch/review grant for c1.
         let mut ledger = GrantLedger::default();
@@ -597,10 +812,22 @@ mod tests {
             Err(CrossBranchError::NoPreauthorization { .. })
         ));
         ledger
-            .issue(root_grant(&urn("c1"), vec![ScopeElement { name: "cross-branch/review".into(), delegable: false }]), T0)
+            .issue(
+                root_grant(
+                    &urn("c1"),
+                    vec![ScopeElement {
+                        name: "cross-branch/review".into(),
+                        delegable: false,
+                    }],
+                ),
+                T0,
+            )
             .unwrap();
         let preauth = CollaborationPermit::by_preauthorization(&ledger, &request, T0).unwrap();
-        assert!(matches!(preauth.basis, PermitBasis::Preauthorization { .. }));
+        assert!(matches!(
+            preauth.basis,
+            PermitBasis::Preauthorization { .. }
+        ));
 
         // A permit authorizes exactly its pair, until it expires.
         assert!(permit.authorizes(&urn("c1"), &urn("c3"), T0).is_ok());

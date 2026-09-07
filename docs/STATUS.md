@@ -8,6 +8,63 @@ order, with the gate and the traps — is [`HANDOFF.md`](HANDOFF.md).
 
 ---
 
+## P1 security fixes — verified 2026-09-05
+
+The running web service still used the September 3 release, predating the static
+fallback authentication fix. Rebuilt both `hive-web` and the CLI, restarted the
+master's `dev.hive.web` launchd job, and checked the actual tailnet listener.
+The new PID is 35829 (previously 63754); existing login sessions were invalidated.
+A regression test now exercises the production router, including static pages,
+API rejection, and successful login followed by authenticated static requests.
+
+Every worker SSH command, including `tail`, explicitly uses null stdin. A
+subprocess regression runs all seven command paths against a fake SSH executable
+that drains inherited stdin, then verifies the caller still has its entire input.
+The rebuilt CLI was also checked against the configured real workers with a blank
+line followed by `exit`; the two prompts prove input survived startup health checks.
+
+Memory and incident storage share a private SQLite opener. It creates the main
+file with mode `0600`, repairs existing database and WAL/SHM/rollback-journal
+permissions **before SQLite opens**, and propagates permission failures. SQLite
+then inherits the private database mode when creating sidecars. Tests check live
+WAL/SHM files after writes, legacy `0644` sidecar repair without losing records,
+and sidecar recreation after the last connection closes. No process-wide umask
+change is needed. The live database and its existing WAL/SHM files were also
+immediately restricted to `0600`; after restart and the CLI check, SQLite had
+checkpointed and removed the sidecars, leaving the main database at `0600`.
+
+```text
+$ cargo build --workspace
+Finished `dev` profile — zero warnings
+$ cargo test --workspace --no-run
+Finished `test` profile — zero warnings
+$ cargo test --workspace
+TOTAL: 493 passed, 0 failed, 5 ignored
+$ interop/run-interop.sh
+test an_independent_peer_interoperates_over_the_file_edge ... ok
+$ cargo build --release -p hive-web -p hive-cli
+Finished `release` profile [optimized] — zero warnings
+$ printf '\nexit\n' | target/release/hive chat --local
+Type a task, or 'exit' to quit.
+> >
+
+Unauthenticated live HTTP probes after restart:
+/index.html       303 -> /login   (200 before restart)
+/chat.html        303 -> /login
+/incidents.html   303 -> /login
+/machines.html    303 -> /login
+/terminal.html    303 -> /login
+/api/incidents    401
+/api/sessions     401
+/login            200
+/api/health       200
+```
+
+This pass addresses the three P1 findings. The P2/P3 findings and the audit
+project's existing conversations are unchanged.
+
+---
+
 ## RT-0: the runtime re-verified live, as the gate before M4/M5 — 2026-09-05
 
 Before starting Phase 9 memory, the landed HACP/2.0 runtime was re-proven from the
@@ -134,7 +191,7 @@ $ hive search "orion"
 [0.59] user: Remember this decision: our production database is called orion-prod…
 
 $ hive memory
-database  /Users/manubaba/.hive/hive.db      # mode 0600 (ls -l: -rw-------)
+database  ~/.hive/hive.db      # mode 0600 (ls -l: -rw-------)
 projects  1   conversations  3   messages  6
 rag       3 chunks   knowledge graph  36 fleet entities
 
@@ -965,3 +1022,207 @@ from claude" badge in the agent UI.
 **The decision this leaves open.** If Tier-2 verdicts are ever promoted from
 advisory to blocking, route `review` through `route_and_execute` first. An
 advisory signal is allowed to be cheap and noisy; a blocking one is not.
+
+---
+
+## Distributed collaboration audit fixes — 2026-09-05
+
+Implemented receipt deduplication, independent frozen acceptance checks, bounded
+JSON-record retry, no retry beside a timed-out session, complete CLI inventory,
+host-reported Mac page sizes, task-launch readiness and completion load release.
+The [fix report](findings/collaboration-fixes-2026-09-05.md) records scope and
+remaining gaps. No native distributed orchestration milestone is marked complete.
+
+```text
+cargo build --workspace --offline          PASS, zero warnings
+cargo test --workspace --offline --no-run   PASS, zero warnings
+cargo test --workspace --offline --quiet    544 passed, 0 failed, 5 ignored
+interop/run-interop.sh                     independent file-edge peer: ok
+Independent functional audit              17 passed, 0 failed (was 14/3)
+Live rebuilt inventory diagnostic          mini: opencode; Air: agy
+Live Air worker selection                  Unhealthy; selected = None (tmux absent)
+```
+
+Only read-only fleet checks were made during fix verification; the earlier
+43-test-per-device agent collaboration was not rerun through a native distributed
+host. Production services and device setup were left unchanged.
+
+## Release 1 durable-runtime foundation — 2026-09-05
+
+Release 1 is in progress, not released. The scope and remaining acceptance gates
+are recorded in [RELEASE-1.md](RELEASE-1.md).
+
+```text
+cargo build --workspace --offline                        -> zero warnings
+cargo test --workspace --offline --no-run                -> zero warnings
+cargo test --workspace --offline --quiet                 -> 550 passed, 0 failed, 6 ignored
+interop/run-interop.sh                                  -> 1 independent peer test passed
+cargo test -p hive-core --offline runtime::lifecycle::tests::restart_at_every_durable_boundary -- --nocapture
+  -> 31 durable-boundary recoveries; 4 ambiguous launches refused; no repeated effects
+cargo test -p hive-core --offline collab::session::tests::live_recovery_reattaches -- --ignored --test-threads=1 --nocapture
+  -> 1 passed; real detached tmux invocation recovered without relaunch
+git diff --check                                        -> exit 0
+```
+
+The private v2 journal now retains protocol messages, receiver receipts, stable
+identities, state projections and invocation intent/result records. CLI `inspect`
+and `resume` are wired to it. Recovery refuses changed completed output or an
+uncertain launch with no host evidence. This does not yet prove the two-device
+Release 1 gate: native SSH hosting, richer coding/rework and explicit continuation
+of recorded safety pauses remain open. No production service was restarted.
+
+Air prerequisite setup during this milestone: installed tmux using Homebrew.
+The package manager also upgraded OpenSSL/CA certificates and removed cached
+packages and superseded dependency versions. Login-shell SSH probes now return
+`tmux 3.7b` and resolve AGY. The non-login SSH environment still does not resolve
+tmux, so the new remote host must explicitly select the working login environment;
+the legacy worker readiness probe is not claimed fixed by this installation.
+
+## Release 1 native hosting and multi-file binding — 2026-09-05
+
+Implemented per-role SSH/local hosts and explicit model selection, checked
+workspace transfers, remote invocation recovery, and multiple separately bound
+HACP artifacts. [Release 1 evidence](RELEASE-1.md) distinguishes implemented
+interfaces from outstanding live acceptance gates.
+
+```text
+cargo build --workspace --offline                     -> zero warnings
+cargo test --workspace --offline --no-run             -> zero warnings
+cargo test --workspace --offline --quiet              -> 557 passed, 0 failed, 9 ignored
+cargo test -p hive-core --offline runtime::hosting::tests::local_remote_host -- --ignored --test-threads=1 --nocapture
+  -> 2 passed: real local tmux, injected disconnect, stale-mirror protection,
+     timeout/watchdog SIGSTOP and subsequent SIGCONT
+interop/run-interop.sh                               -> 1 independent peer test passed
+git diff --check                                     -> exit 0
+HIVE_TEST_SSH_HOST=mac-air cargo test -p hive-core --offline runtime::hosting::tests::live_ssh_invocation -- --ignored --nocapture
+  -> FAILED before task launch: SSH connection timed out
+```
+
+The Air was reachable during prerequisite installation but its port 22 stopped
+responding during this implementation. Repeated direct probes confirmed the
+timeout; no agent authentication or native two-device completion is inferred.
+The user was asked to keep the Air awake/on the tailnet while local implementation
+continued. No model calls, production restarts or additional package installs
+were performed in this step. Executable tests, rework/negotiation loops and
+operator continuation remain work in progress.
+
+## Release 1 executable collaboration — 2026-09-05
+
+Frozen executable fixtures/commands, checks on both selected role hosts, bounded
+HACP rework with immutable prior attempts, counteroffers/clarification and
+explicit OpenCode/AGY conversation handles are implemented. An audited
+`collab resume --continue-session ... --reason ...` path retains the original
+invocation and applies approval before SIGCONT; new output stays supervised.
+
+```text
+cargo build --workspace --offline                      -> zero warnings
+cargo test --workspace --offline --no-run              -> zero warnings
+cargo test --workspace --offline --quiet               -> 563 passed, 0 failed, 10 ignored
+interop/run-interop.sh                                -> 1 independent peer test passed
+durable commit interruption matrix                    -> 35 recovered, 4 uncertain launches refused
+live approved-log-cursor test                         -> passed, including a second new violation
+live short-command exit-code test                     -> passed
+native local OpenCode/OpenCode coding run              -> SETTLED, 4 model calls, 10 HACP frames
+native frozen unittest commands                       -> 3 cases passed on each local role host
+native settled replay                                 -> all six execution-log digests unchanged
+```
+
+The local native run retained two distinct CLI conversations across their role
+invocations. It required two inspected, audited continuations after the verifier
+attempted scratch cleanup; it is not represented as unattended, multi-device or
+the hard reconciler acceptance run. The [Release 1 evidence](RELEASE-1.md) records
+the observed errors, retained scratch evidence and remaining gates. Air SSH still
+times out; no remote model authentication result is inferred. No production
+service was restarted and no additional package installation was performed.
+
+## Release 1 empty-suite and process-crash checks — 2026-09-05
+
+Python unittest exit zero is no longer sufficient when no tests were exercised:
+empty discovery, all-skipped suites and incomplete summaries fail acceptance.
+Real Python lifecycle regressions preserve those failures across replay. CLI
+summaries now distinguish exit statuses from acceptance results.
+
+```text
+cargo build --workspace --offline                         -> zero warnings
+cargo test --workspace --offline --no-run                 -> zero warnings
+cargo test --workspace --offline --quiet                  -> 565 passed, 0 failed, 13 ignored
+interop/run-interop.sh                                   -> independent peer passed
+cargo test -p hive-core --offline sigkill_at_every_commit -- --ignored --nocapture
+  -> 50 separate-process SIGKILL boundary recoveries; 10 uncertain intents refused
+     accepted envelopes unchanged; no repeated effects, including repair/test calls
+cargo test -p hive-core --offline local_remote_host -- --ignored --test-threads=1 --nocapture
+  -> 3 passed using real tmux and the remote helper behind a loopback SSH shim
+cargo test -p hive-core --offline real_empty_or_fully_skipped -- --nocapture
+  -> 1 passed: two real Python scenarios checked through both role hosts
+```
+
+[Release 1 evidence](RELEASE-1.md) records the exact scope: the crash matrix has
+scripted model outputs and durable file-backed host evidence, while the remote
+host tests are local transport simulations. A real Air run, live-task recovery
+after coordinator death and the hard two-device acceptance remain outstanding.
+Air SSH still times out before authentication. No completion or publication is
+claimed, and production services remain untouched.
+
+## Release 1 live-task coordinator recovery — 2026-09-05
+
+```text
+cargo build --workspace --offline                         -> zero warnings
+cargo test --workspace --offline --no-run                 -> zero warnings
+cargo test --workspace --offline --quiet                  -> 565 passed, 0 failed, 14 ignored
+interop/run-interop.sh                                   -> independent peer passed
+cargo test -p hive-core --offline live_tasks_survive_coordinator -- --ignored --nocapture
+  -> 10 invocation stages passed; actual task PID/tmux session survived coordinator
+     SIGKILL and reattachment, before continuation; no duplicate launches
+cargo test -p hive-core --offline sigkill_at_every_commit -- --ignored --nocapture
+  -> 50 recovered boundaries; 10 uncertain intents refused; receipts unchanged
+cargo package --manifest-path hacp/Cargo.toml --allow-dirty --offline
+  -> 51-file standalone package built and verified
+cargo test --manifest-path target/package/hacp-1.1.0/Cargo.toml --offline --quiet
+  -> 146 passed from packaged source; no HIVE runtime required
+```
+
+These local process tests use deterministic model fixtures and real tmux/Python
+through the production session host. No real provider authentication is inferred.
+Read-only Tailscale status now confirms the mini online and the Air offline;
+SSH times out before login. [Release 1](RELEASE-1.md) still requires actual Air
+continuity/recovery and hard two-device collaboration. No production services,
+network configuration or software installation changed; no release was pushed.
+
+## Release 1 complete — native mini/Air acceptance, 2026-09-07
+
+The [final Release 1 audit](RELEASE-1.md#final-acceptance-audit--complete-2026-09-07)
+records all four gates as verified. Actual SSH hosting, checked transfers, AGY
+authentication/conversation continuity, audited continuation and interruption of
+an established SSH observation channel were tested against the reachable Air.
+
+The live runs exposed and fixed two additional integration bugs: long contract
+prompts exceeding tmux's command-message limit (now launched via private scripts),
+and OpenCode completion events being lost after changing its conversation's
+directory for repair attempts (now a stable role project with separate output
+paths). Existing recorded invocations retain their original specifications.
+
+```text
+Hard native coding run: s-5adfd5e19ad4
+  OpenCode mini / AGY Air; two source files; 61 tests pass per device
+  SETTLED accept; one inspected watchdog continuation; replay logs unchanged
+Controlled native repair run: s-0f7b3fd7e70e
+  initial: 61 tests / 2 failures on each device
+  HACP rework -> same worker conversation repairs -> 61/61 pass on each device
+  SETTLED accept; 6 model calls, 12 frames and receipts; zero operator continuations
+  same frozen revision, new artifact identities; all ten replay log digests unchanged
+cargo build --workspace --offline                         -> zero warnings
+cargo test --workspace --offline --no-run                 -> zero warnings
+cargo test --workspace --offline --quiet                  -> 566 passed, 0 failed, 17 ignored
+interop/run-interop.sh                                   -> independent peer passed
+```
+
+The repair defect was explicitly seeded, not a natural worker mistake. Independent
+fixtures stayed unchanged and exercise 432 deterministic cases. Both devices'
+final source hashes match. The standalone HACP package also compiled and passed
+its 146 tests, as recorded earlier.
+
+One obsolete scratch verifier from the pre-fix directory-hang diagnostic remains
+paused on the mini (`hive-a18c668f-04-verify-a2`); its history is preserved, not
+silently rerun or killed. Final acceptance sessions completed. This milestone is
+implemented and verified in the working tree, not committed/pushed/published or
+deployed to production. Release 2 scheduling/discovery remains out of scope.

@@ -32,8 +32,9 @@
 //! Supervision only lasts as long as [`SessionHost::wait`] is being polled. The tmux
 //! session itself is detached and survives this process, but nothing scans its output
 //! once the future is dropped — the same limitation `docs/STATUS.md` records for the SSH
-//! path. Recovering supervision of an already-running session after a restart would need
-//! the per-session state below to be persisted; today it is in-memory.
+//! path. The v2 runtime now journals the launch spec and start time; `recover` restores
+//! the original deadline and reattaches to the existing handle or its completion log.
+//! This restores supervision when recovery starts, not during coordinator downtime.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -69,12 +70,11 @@ const UNKNOWN_HANDLE_TIMEOUT_SECS: u64 = 3600;
 
 /// Refuse to build a command line longer than this.
 ///
-/// The whole shell line is passed to tmux as a *single* argv entry, and Linux caps one
-/// argument at `MAX_ARG_STRLEN` (128 KiB). A brief that exceeds it fails inside `execve`
+/// Linux caps one argument at `MAX_ARG_STRLEN` (128 KiB). A brief that exceeds it fails inside `execve`
 /// with a message that says nothing about the brief being too long, so we refuse first
 /// and name the actual cause. If briefs ever get this big the fix is to hand the prompt
-/// through a file rather than argv — which is a change to `SessionSpec`, not to this
-/// guard.
+/// through a file rather than the agent's argv. The launch shell itself is already
+/// file-backed to avoid tmux's smaller command-message limit.
 const MAX_COMMAND_BYTES: usize = 100 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ fn pane_target(session: &str) -> String {
 /// (This is also why `hive-worker`'s executor can pause and the SSH path's
 /// `bash -c '<command>'` cannot: the worker daemon sends its command to an *interactive*
 /// shell, which gives the job its own group for the same reason.)
-fn build_command(spec: &SessionSpec) -> Result<String> {
+pub(crate) fn build_command(spec: &SessionSpec) -> Result<String> {
     let mut program = shq(&spec.program);
     for arg in &spec.args {
         program.push(' ');
@@ -435,9 +435,9 @@ struct LogTail {
 }
 
 impl LogTail {
-    async fn start(log: &Path) -> Result<Self> {
+    async fn start(log: &Path, approved_bytes: u64) -> Result<Self> {
         let mut child = Command::new("tail")
-            .args(["-f", "-n", "+1"])
+            .args(["-f", "-c", &format!("+{}", approved_bytes.saturating_add(1))])
             .arg(log)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -482,6 +482,7 @@ enum Suspended {
 /// It exists because [`SessionHandle`] carries only a name and a log path, so neither the
 /// timeout nor the pgid stopped at pause time can be recovered from the handle later.
 struct SessionRecord {
+    approved_bytes: u64,
     started: Instant,
     timeout_secs: u64,
     /// Recorded at pause so [`SessionHost::resume`] signals the group that was actually
@@ -576,6 +577,38 @@ impl Default for LocalSessionHost {
 
 #[async_trait]
 impl SessionHost for LocalSessionHost {
+    async fn recover_at(&self, spec: &SessionSpec, started_unix: i64, approved_bytes: u64) -> Result<SessionHandle> {
+        let handle = self.recover(spec, started_unix).await?;
+        anyhow::ensure!(tokio::fs::metadata(&spec.log).await?.len() >= approved_bytes, "approved log was truncated");
+        if let Some(record) = self.sessions.lock().await.get_mut(&spec.name) { record.approved_bytes = approved_bytes; }
+        Ok(handle)
+    }
+
+    async fn continue_approved(&self, handle: &SessionHandle) -> Result<()> {
+        // Retrying after a crash between SIGCONT and its database receipt is safe.
+        // The target remains the same pane; no stopped process means no signal.
+        if !session_exists(&handle.name).await || stopped_pgids(&handle.name).await.is_empty() { return Ok(()); }
+        self.resume(handle).await
+    }
+
+    async fn recover(&self, spec: &SessionSpec, started_unix: i64) -> Result<SessionHandle> {
+        let handle = SessionHandle { name: spec.name.clone(), log: spec.log.clone() };
+        if !session_exists(&spec.name).await {
+            // This also rejects the ambiguous intent-before-launch window. No log
+            // or no sentinel is not proof that re-executing the task is safe.
+            self.outcome_from_log(&handle).await?;
+            return Ok(handle);
+        }
+        let elapsed = chrono::Utc::now().timestamp().saturating_sub(started_unix).max(0) as u64;
+        self.sessions.lock().await.insert(spec.name.clone(), SessionRecord {
+            approved_bytes: 0,
+            started: Instant::now().checked_sub(Duration::from_secs(elapsed)).unwrap_or_else(Instant::now),
+            timeout_secs: spec.timeout_secs,
+            paused_pgid: None,
+        });
+        Ok(handle)
+    }
+
     async fn launch(&self, spec: &SessionSpec) -> Result<SessionHandle> {
         if session_exists(&spec.name).await {
             anyhow::bail!("tmux session '{}' already exists", spec.name);
@@ -603,6 +636,18 @@ impl SessionHost for LocalSessionHost {
             .await
             .map_err(|e| anyhow::anyhow!("could not create log '{}': {e}", spec.log.display()))?;
 
+        // tmux's command message can be much smaller than the OS argv limit.
+        // Keep the complete invocation in a private script and send only its path.
+        // A unique name avoids overwriting a script a prior shell may still read.
+        let script = spec.log.with_extension(format!("{}.launch.sh", uuid::Uuid::new_v4().simple()));
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&script)?;
+            file.write_all(command.as_bytes())?;
+            file.sync_all()?;
+        }
+
         // `bash -l` so tools installed under `~/.local/bin` resolve — the same reason
         // hive-web and the worker daemon start login shells.
         tmux(&[
@@ -613,8 +658,8 @@ impl SessionHost for LocalSessionHost {
             "-c",
             &spec.cwd.to_string_lossy(),
             "bash",
-            "-lc",
-            &command,
+            "-l",
+            &script.to_string_lossy(),
         ])
         .await?;
 
@@ -623,16 +668,16 @@ impl SessionHost for LocalSessionHost {
         // log — which is where the diagnosis belongs anyway, since naming the program in a
         // returned error would put a vendor name somewhere it can travel (§3).
         if !session_exists(&spec.name).await {
-            anyhow::bail!(
-                "session '{}' did not survive launch; see {}",
-                spec.name,
-                spec.log.display()
-            );
+            // Fast acceptance tests can finish before this observation. Their
+            // completion evidence distinguishes a real exit from a failed launch;
+            // absence of a still-live tmux session alone does not mean failure.
+            self.outcome_from_log(&SessionHandle { name:spec.name.clone(), log:spec.log.clone() }).await?;
         }
 
         self.sessions.lock().await.insert(
             spec.name.clone(),
             SessionRecord {
+                approved_bytes: 0,
                 started: Instant::now(),
                 timeout_secs: spec.timeout_secs,
                 paused_pgid: None,
@@ -657,7 +702,8 @@ impl SessionHost for LocalSessionHost {
 
     async fn wait(&self, handle: &SessionHandle) -> Result<SessionOutcome> {
         let deadline = self.deadline_for(&handle.name).await;
-        let mut tail = LogTail::start(&handle.log).await?;
+        let approved_bytes = self.sessions.lock().await.get(&handle.name).map(|r| r.approved_bytes).unwrap_or(0);
+        let mut tail = LogTail::start(&handle.log, approved_bytes).await?;
 
         loop {
             // Bounded so a session that produces no output for a while still has its
@@ -990,6 +1036,53 @@ mod tests {
             .stderr(Stdio::null())
             .status()
             .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live tmux; see the module note above"]
+    async fn live_approved_cursor_skips_reviewed_output_but_still_stops_new_violations() {
+        let name = format!("hive-live-cursor-{}", uuid::Uuid::new_v4().simple());
+        let spec = live_spec(&name, "sh", &["-c"], "echo 'rm -rf /'; sleep 1; echo 'rm -rf /'; sleep 1; echo survived");
+        let first = LocalSessionHost::new();
+        let handle = first.launch(&spec).await.unwrap();
+        assert!(matches!(first.wait(&handle).await.unwrap(), SessionOutcome::Paused { .. }));
+        let offset = first.log_size(&handle).await.unwrap();
+        drop(first);
+        let second = LocalSessionHost::new();
+        let handle = second.recover_at(&spec, chrono::Utc::now().timestamp(), offset).await.unwrap();
+        second.continue_approved(&handle).await.unwrap();
+        assert!(matches!(second.wait(&handle).await.unwrap(), SessionOutcome::Paused { .. }), "new output must still be supervised");
+        let next_offset = second.log_size(&handle).await.unwrap();
+        assert!(next_offset > offset);
+        let third = LocalSessionHost::new();
+        let handle = third.recover_at(&spec, chrono::Utc::now().timestamp(), next_offset).await.unwrap();
+        third.continue_approved(&handle).await.unwrap();
+        assert_eq!(third.wait(&handle).await.unwrap(), SessionOutcome::Exited { code:0 });
+        third.continue_approved(&handle).await.unwrap(); // retry after completion is a no-op
+        cleanup(&name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live tmux; see the module note above"]
+    async fn live_recovery_reattaches_after_host_restart_without_relaunch() {
+        let name = format!("hive-live-recover-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let spec = live_spec(&name, "sh", &["-c"], "echo started-once; sleep 2; echo finished-once; exit 7");
+        let started = chrono::Utc::now().timestamp();
+        let first = LocalSessionHost::new();
+        first.launch(&spec).await.unwrap();
+        drop(first);
+        let replacement = LocalSessionHost::new();
+        let handle = replacement.recover(&spec, started).await.unwrap();
+        assert_eq!(replacement.wait(&handle).await.unwrap(), SessionOutcome::Exited { code: 7 });
+        let log = std::fs::read_to_string(&spec.log).unwrap();
+        assert_eq!(log.matches("started-once").count(), 1);
+        assert_eq!(log.matches("finished-once").count(), 1);
+        // Recovery also works after the tmux session has ended, using its completion
+        // evidence instead of confusing an absent live handle with never having run.
+        let later = LocalSessionHost::new();
+        let handle = later.recover(&spec, started).await.unwrap();
+        assert_eq!(later.wait(&handle).await.unwrap(), SessionOutcome::Exited { code: 7 });
+        cleanup(&name).await;
     }
 
     #[tokio::test]

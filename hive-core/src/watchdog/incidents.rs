@@ -22,7 +22,8 @@
 //! would be worse than useless: a reviewer who cannot see what was flagged
 //! cannot judge it, which is the entire point of the record. So the bytes are
 //! kept and the file is locked down instead — [`IncidentStore::open`] forces
-//! mode `0600` on the database. Anyone who can read that file could already
+//! mode `0600` on the database and its SQLite sidecars before schema setup.
+//! Anyone who can read those files could already
 //! read the operator's `~/.hive` credentials; nothing new is exposed to a
 //! reader who was not already inside. Do not relax those permissions, and do
 //! not copy an incident database off the host.
@@ -70,17 +71,10 @@ impl IncidentStore {
     /// Open (creating if needed) the incident log at `path`.
     ///
     /// Parent directories are created — the configured default lives under
-    /// `~/.hive/`, which will not exist on a fresh machine. The file is
-    /// chmod'd to `0600`; see the module docs for why that matters here more
-    /// than it does for the knowledge graph.
+    /// `~/.hive/`, which will not exist on a fresh machine. The database and
+    /// sidecars are restricted to `0600`; see the module docs for why.
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let store = Self::from_connection(Connection::open(path)?)?;
-        restrict_permissions(path)?;
-        Ok(store)
+        Self::from_connection(crate::private_db::open(path.as_ref())?)
     }
 
     /// An ephemeral in-memory log, for tests and as the fallback when the
@@ -370,18 +364,6 @@ fn row_to_incident(row: &Row<'_>) -> rusqlite::Result<anyhow::Result<Incident>> 
     })())
 }
 
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,13 +557,12 @@ mod tests {
     fn the_database_is_not_world_readable() {
         // flagged_output holds whatever tripped the rule — including, for a
         // CredentialExposure hit, the credential itself.
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("hive-incidents-{}", uuid::Uuid::new_v4()));
         let path = dir.join("hive.db");
-        let _store = IncidentStore::open(&path).unwrap();
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "incident db was mode {mode:o}");
+        let store = IncidentStore::open(&path).unwrap();
+        raise(&store, "private-session", Severity::Critical);
+        crate::private_db::tests::assert_private(&path);
+        drop(store);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

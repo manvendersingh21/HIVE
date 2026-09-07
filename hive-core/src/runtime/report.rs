@@ -51,6 +51,10 @@ impl std::fmt::Display for Stage {
 pub enum RunOutcome {
     /// The full lifecycle ran and both transcripts agree.
     Settled { verdict: String },
+    /// HACP rejected the submitted work. Terminal, but not a successful task.
+    Rejected { reasons: Vec<String> },
+    /// HACP returned to Executing but the configured repair budget is exhausted.
+    ReworkRequired { scope: String, state_path: PathBuf },
     /// A legitimate protocol terminal: the contract did not form. Exit 0.
     NoAgreement { reason: String },
     /// Something did not hold. The stage is always named.
@@ -73,7 +77,8 @@ impl RunOutcome {
     pub fn exit_code(&self) -> i32 {
         match self {
             RunOutcome::Settled { .. } | RunOutcome::NoAgreement { .. } => 0,
-            RunOutcome::Failed { .. } => 1,
+            RunOutcome::Failed { .. } | RunOutcome::Rejected { .. } => 1,
+            RunOutcome::ReworkRequired { .. } => 2,
             RunOutcome::Paused { .. } => 2,
         }
     }
@@ -81,6 +86,11 @@ impl RunOutcome {
     pub fn headline(&self) -> String {
         match self {
             RunOutcome::Settled { verdict } => format!("SETTLED — verdict {verdict}"),
+            RunOutcome::Rejected { reasons } => format!("REJECTED — {}", reasons.join("; ")),
+            RunOutcome::ReworkRequired { scope, state_path } => format!(
+                "REWORK REQUIRED — {scope}; state saved to {} (configured repair budget exhausted)",
+                state_path.display()
+            ),
             RunOutcome::NoAgreement { reason } => format!("NO AGREEMENT — {reason}"),
             RunOutcome::Failed { stage, reason } => format!("FAILED at {stage} — {reason}"),
             RunOutcome::Paused { session, reason, .. } => {
@@ -108,6 +118,10 @@ pub struct RunReport {
     pub pair: String,
     pub supervisor_cli: String,
     pub worker_cli: String,
+    #[serde(default)]
+    pub supervisor_placement: super::hosting::Placement,
+    #[serde(default)]
+    pub worker_placement: super::hosting::Placement,
     pub run_dir: PathBuf,
     pub session_id: String,
     pub contract_id: String,
@@ -119,6 +133,11 @@ pub struct RunReport {
     pub calls: Vec<AgentCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact: Option<hacp::v2::Artifact>,
+    /// Every submitted output, including the compatibility primary `artifact`.
+    #[serde(default)]
+    pub artifacts: Vec<hacp::v2::Artifact>,
+    #[serde(default)]
+    pub executions: Vec<super::verification::Execution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corroboration: Option<Corroboration>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,12 +166,21 @@ impl RunReport {
             self.frames,
             self.calls.len(),
         );
+        for (role, placement) in [("supervisor", &self.supervisor_placement), ("worker", &self.worker_placement)] {
+            s.push_str(&format!("\n  {role:<10} device={} model={}", placement.host.as_deref().unwrap_or("local"),
+                placement.model.as_deref().unwrap_or("CLI default")));
+        }
+        if !self.executions.is_empty() {
+            let exited_zero = self.executions.iter().filter(|e| matches!(e.outcome, crate::collab::SessionOutcome::Exited { code:0 })).count();
+            s.push_str(&format!("\n  test runs  {} ({} exited 0, including earlier attempts; acceptance evaluated separately)", self.executions.len(), exited_zero));
+        }
         if let Some(c) = &self.corroboration {
             s.push_str(&format!(
-                "\n  checks     {} corroborated, {} unmatched, {} contradicted",
+                "\n  checks     {} corroborated, {} unmatched, {} contradicted; {} frozen obligations measured",
                 c.backed.len(),
                 c.unmatched.len(),
-                c.contradicted.len()
+                c.contradicted.len(),
+                c.requirements_backed.len()
             ));
         }
         if let Some(t) = &self.transcript {
@@ -177,7 +205,10 @@ mod tests {
         // §7.4: bounds reached without agreement is a valid terminal. A runtime that
         // exits non-zero here teaches agents to accept work they cannot do.
         assert_eq!(
-            RunOutcome::NoAgreement { reason: "worker declined".into() }.exit_code(),
+            RunOutcome::NoAgreement {
+                reason: "worker declined".into()
+            }
+            .exit_code(),
             0
         );
     }
@@ -193,20 +224,53 @@ mod tests {
     }
 
     #[test]
+    fn rejected_and_unfinished_work_never_exit_green() {
+        let rejected = RunOutcome::Rejected {
+            reasons: vec!["acceptance failed".into()],
+        };
+        assert_eq!(rejected.exit_code(), 1);
+        assert!(rejected.headline().starts_with("REJECTED"));
+        let rework = RunOutcome::ReworkRequired {
+            scope: "fix output".into(),
+            state_path: "rework-state.json".into(),
+        };
+        assert_eq!(rework.exit_code(), 2);
+        assert!(rework.headline().starts_with("REWORK REQUIRED"));
+    }
+
+    #[test]
     fn a_failure_names_its_stage_in_the_headline() {
         let o = RunOutcome::Failed {
             stage: Stage::Execute,
             reason: "status.txt does not exist".into(),
         };
-        assert!(o.headline().contains("FAILED at execute"), "{}", o.headline());
+        assert!(
+            o.headline().contains("FAILED at execute"),
+            "{}",
+            o.headline()
+        );
     }
 
     #[test]
     fn the_outcome_round_trips_through_its_tagged_form() {
         for o in [
-            RunOutcome::Settled { verdict: "accept".into() },
-            RunOutcome::NoAgreement { reason: "declined".into() },
-            RunOutcome::Failed { stage: Stage::Freeze, reason: "digest mismatch".into() },
+            RunOutcome::Settled {
+                verdict: "accept".into(),
+            },
+            RunOutcome::Rejected {
+                reasons: vec!["failed".into()],
+            },
+            RunOutcome::ReworkRequired {
+                scope: "fix output".into(),
+                state_path: "rework-state.json".into(),
+            },
+            RunOutcome::NoAgreement {
+                reason: "declined".into(),
+            },
+            RunOutcome::Failed {
+                stage: Stage::Freeze,
+                reason: "digest mismatch".into(),
+            },
             RunOutcome::Paused {
                 session: "s".into(),
                 reason: "r".into(),
@@ -214,7 +278,10 @@ mod tests {
             },
         ] {
             let v = serde_json::to_value(&o).unwrap();
-            assert!(v.get("outcome").is_some(), "the tag is what a reader scans for: {v}");
+            assert!(
+                v.get("outcome").is_some(),
+                "the tag is what a reader scans for: {v}"
+            );
             let back: RunOutcome = serde_json::from_value(v).unwrap();
             assert_eq!(back, o);
         }
@@ -226,6 +293,8 @@ mod tests {
             pair: "a x b".into(),
             supervisor_cli: "a".into(),
             worker_cli: "b".into(),
+            supervisor_placement: Default::default(),
+            worker_placement: Default::default(),
             run_dir: PathBuf::from("/tmp/run"),
             session_id: "s-1".into(),
             contract_id: "c-1".into(),
@@ -239,6 +308,8 @@ mod tests {
             frames: 4,
             calls: vec![],
             artifact: None,
+            artifacts: vec![],
+            executions: vec![],
             corroboration: None,
             transcript: None,
             still_running: vec![LiveSession {

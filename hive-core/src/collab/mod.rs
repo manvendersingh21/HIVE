@@ -186,7 +186,7 @@ pub trait RunStore: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// How to start one stock agentic CLI on its brief.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SessionSpec {
     /// Session name, unique per run and role.
     pub name: String,
@@ -213,7 +213,7 @@ pub struct SessionHandle {
 }
 
 /// How a session ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionOutcome {
     Exited { code: i32 },
     TimedOut,
@@ -234,6 +234,27 @@ pub enum SessionOutcome {
 #[async_trait]
 pub trait SessionHost: Send + Sync {
     async fn launch(&self, spec: &SessionSpec) -> Result<SessionHandle>;
+
+    /// Reattach to a recorded launch intent. Never start another process here:
+    /// absence of a handle is not proof that the original command had no effects.
+    async fn recover(&self, _spec: &SessionSpec, _started_unix: i64) -> Result<SessionHandle> {
+        anyhow::bail!("this session host cannot recover an uncertain invocation; inspect it before retrying")
+    }
+
+    /// Restore an operator-approved log cursor without waiving future supervision.
+    async fn recover_at(&self, spec: &SessionSpec, started_unix: i64, approved_bytes: u64) -> Result<SessionHandle> {
+        anyhow::ensure!(approved_bytes == 0, "host does not support an approved supervision cursor");
+        self.recover(spec, started_unix).await
+    }
+
+    async fn log_size(&self, handle: &SessionHandle) -> Result<u64> {
+        Ok(tokio::fs::metadata(&handle.log).await?.len())
+    }
+
+    /// Idempotent continuation of an already-approved process, never a new launch.
+    async fn continue_approved(&self, handle: &SessionHandle) -> Result<()> {
+        self.resume(handle).await
+    }
 
     /// Block until the session ends, tailing its log and applying supervision.
     async fn wait(&self, handle: &SessionHandle) -> Result<SessionOutcome>;

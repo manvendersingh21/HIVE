@@ -4,6 +4,8 @@ version = "1.1.0"
 edition = "2021"
 description = "HACP — Heterogeneous Agent Collaboration Protocol: wire types, validation, and conformance vectors"
 license = "Apache-2.0"
+repository = "https://github.com/manvendersingh21/HIVE"
+readme = "README.md"
 
 # This crate is the protocol, not an implementation of a system that uses it.
 # It MUST NOT depend on any hive-* crate, on an async runtime, on a database,
@@ -11,10 +13,10 @@ license = "Apache-2.0"
 # convenience: see spec/HACP.md, which names no implementation for the same
 # reason.
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-chrono = { workspace = true }
-uuid = { workspace = true }
-schemars = { workspace = true, features = ["chrono"] }
-sha2 = { workspace = true }
-thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+schemars = { version = "0.8", features = ["chrono"] }
+sha2 = "0.10"
+thiserror = "2"

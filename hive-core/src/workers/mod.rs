@@ -4,7 +4,7 @@
 pub mod sessions;
 pub mod ssh;
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,9 +47,12 @@ pub struct WorkerNode {
     /// it to request handlers, so there is no `&mut` to take when a background
     /// task wants to re-probe reachability. Encoded as a `u8` for the same
     /// reason `active_tasks` is an `AtomicUsize`.
-    status: AtomicU8,
+    status: Arc<AtomicU8>,
     /// Number of active tasks on this worker.
-    pub active_tasks: AtomicUsize,
+    pub active_tasks: Arc<AtomicUsize>,
+    /// A lost supervisor may leave remote work running. A health ping must not
+    /// erase that uncertainty; reconciliation is an operator action for now.
+    unresolved: Arc<AtomicBool>,
 }
 
 /// Encode/decode `WorkerStatus` for atomic storage.
@@ -94,8 +97,9 @@ impl WorkerPool {
             .into_iter()
             .map(|info| WorkerNode {
                 info,
-                status: AtomicU8::new(status_to_u8(WorkerStatus::Offline)),
-                active_tasks: AtomicUsize::new(0),
+                status: Arc::new(AtomicU8::new(status_to_u8(WorkerStatus::Offline))),
+                active_tasks: Arc::new(AtomicUsize::new(0)),
+                unresolved: Arc::new(AtomicBool::new(false)),
             })
             .collect();
 
@@ -121,9 +125,8 @@ impl WorkerPool {
             .count()
     }
 
-    /// Probe every configured worker over SSH and flip its status between
-    /// `Online`/`Offline` based on real reachability.
-    /// Re-probe every worker's reachability.
+    /// Probe reachability and the SSH task launch prerequisites. Reachable hosts
+    /// without the required tools are Unhealthy, not eligible for placement.
     ///
     /// Takes `&self`, so a long-lived master can run this on a timer while
     /// handlers are using the same pool. Each probe is bounded: SSH's own
@@ -134,25 +137,28 @@ impl WorkerPool {
             let target = worker.info.ssh_target();
             let probe = async {
                 match SshWorker::connect(&target).await {
-                    Ok(ssh) => ssh.ping().await.is_ok(),
+                    Ok(ssh) => match ssh.execution_ready().await {
+                        Ok(()) => WorkerStatus::Online,
+                        Err(e) => {
+                            warn!("Worker '{}' cannot host supervised tasks: {e}", worker.info.name);
+                            WorkerStatus::Unhealthy
+                        }
+                    },
                     Err(e) => {
                         warn!("Worker '{}' unreachable: {e}", worker.info.name);
-                        false
+                        WorkerStatus::Offline
                     }
                 }
             };
-            let reachable = tokio::time::timeout(HEALTH_PROBE_TIMEOUT, probe)
+            let status = tokio::time::timeout(HEALTH_PROBE_TIMEOUT, probe)
                 .await
                 .unwrap_or_else(|_| {
                     warn!("Worker '{}' health probe timed out", worker.info.name);
-                    false
+                    WorkerStatus::Offline
                 });
-
-            let status = if reachable {
-                WorkerStatus::Online
-            } else {
-                WorkerStatus::Offline
-            };
+            let status = if status == WorkerStatus::Online && worker.unresolved.load(Ordering::Relaxed) {
+                WorkerStatus::Unhealthy
+            } else { status };
             if status != worker.status() {
                 info!("Worker '{}' health: {:?}", worker.info.name, status);
             }
@@ -212,7 +218,7 @@ impl WorkerPool {
 
         ssh.spawn_tmux(&task.tmux_session_name, &command, &log_path)
             .await?;
-        worker.active_tasks.fetch_add(1, Ordering::Relaxed);
+        let load = TaskLoad::started(worker);
 
         let session_info = SessionInfo {
             session_name: task.tmux_session_name.clone(),
@@ -252,6 +258,7 @@ impl WorkerPool {
             ssh,
             tail,
             session_name: task.tmux_session_name.clone(),
+            load,
         };
 
         if let Err(e) = supervisor
@@ -312,12 +319,50 @@ struct SshTap {
     ssh: SshWorker,
     tail: LogTail,
     session_name: String,
+    load: TaskLoad,
+}
+
+/// Holds one confirmed remote assignment. Only a completion sentinel releases
+/// load: losing supervision is not proof the remote process stopped. An orphan
+/// retains its reservation and marks the worker unhealthy for operator review.
+struct TaskLoad {
+    active: Arc<AtomicUsize>,
+    status: Arc<AtomicU8>,
+    unresolved: Arc<AtomicBool>,
+    finished: bool,
+}
+
+impl TaskLoad {
+    fn started(worker: &WorkerNode) -> Self {
+        worker.active_tasks.fetch_add(1, Ordering::Relaxed);
+        Self { active: worker.active_tasks.clone(), status: worker.status.clone(), unresolved: worker.unresolved.clone(), finished: false }
+    }
+
+    fn finish(&mut self) {
+        if !self.finished {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+            self.finished = true;
+        }
+    }
+}
+
+impl Drop for TaskLoad {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.unresolved.store(true, Ordering::Relaxed);
+            self.status.store(status_to_u8(WorkerStatus::Unhealthy), Ordering::Relaxed);
+        }
+    }
 }
 
 #[async_trait]
 impl SessionTap for SshTap {
     async fn next_line(&mut self) -> anyhow::Result<Option<String>> {
-        self.tail.next_line().await
+        let line = self.tail.next_line().await?;
+        if line.as_deref().is_some_and(|s| s.starts_with("__HIVE_DONE__")) {
+            self.load.finish();
+        }
+        Ok(line)
     }
 
     async fn pause(&mut self) -> anyhow::Result<PauseOutcome> {
@@ -329,6 +374,42 @@ impl SessionTap for SshTap {
 mod tests {
     use super::*;
     use hive_common::TaskCommand;
+
+    fn test_pool() -> WorkerPool {
+        WorkerPool::new(vec![WorkerInfo {
+            name: "peer".into(), host: "peer-alias".into(), user: String::new(), port: None, tags: vec![],
+        }])
+    }
+
+    #[test]
+    fn completed_assignments_release_load_exactly_once() {
+        let pool = test_pool();
+        let worker = &pool.workers[0];
+        worker.set_status(WorkerStatus::Online);
+        let mut first = TaskLoad::started(worker);
+        let mut second = TaskLoad::started(worker);
+        assert_eq!(worker.active_tasks.load(Ordering::Relaxed), 2);
+        first.finish();
+        first.finish();
+        drop(first);
+        assert_eq!(worker.active_tasks.load(Ordering::Relaxed), 1);
+        second.finish();
+        drop(second);
+        assert_eq!(worker.active_tasks.load(Ordering::Relaxed), 0);
+        assert!(pool.select_worker().is_some());
+    }
+
+    #[test]
+    fn losing_supervision_does_not_pretend_remote_work_finished() {
+        let pool = test_pool();
+        let worker = &pool.workers[0];
+        worker.set_status(WorkerStatus::Online);
+        drop(TaskLoad::started(worker));
+        assert_eq!(worker.active_tasks.load(Ordering::Relaxed), 1);
+        assert_eq!(worker.status(), WorkerStatus::Unhealthy);
+        assert!(worker.unresolved.load(Ordering::Relaxed));
+        assert!(pool.select_worker().is_none());
+    }
 
     /// Exercises real SSH delegation and the Tier-1 watchdog pause against
     /// whatever worker `hive-worker-1` resolves to in `~/.ssh/config` on

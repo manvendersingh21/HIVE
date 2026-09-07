@@ -46,8 +46,8 @@ without deciding to expose a shell to the public internet.
 
 | Path | Purpose |
 |:---|:---|
-| `/home/azureuser/hive` | source checkout |
-| `/home/azureuser/hive/target/release/hive-web` | binary |
+| `~/hive` | source checkout |
+| `~/hive/target/release/hive-web` | binary |
 | `~/.config/hive/web.env` | `HIVE_WEB_PASSWORD`, bind addr, static dir (mode 600) |
 | `/etc/systemd/system/hive-web.service` | unit, `enabled` so it survives reboot |
 

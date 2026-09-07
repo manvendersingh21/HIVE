@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::canon;
-use super::session::Session;
+use super::session::{Session, SessionState};
 
 /// Who the contract binds and how (§7.2): the machine is identical; the
 /// difference is the authority and escalation semantics attached.
@@ -127,7 +127,10 @@ pub enum ContractError {
     #[error("{who:?} is not a party to contract {}", .contract)]
     NotAParty { who: String, contract: String },
     #[error("cannot {action} from state {state:?}")]
-    IllegalTransition { action: &'static str, state: ContractState },
+    IllegalTransition {
+        action: &'static str,
+        state: ContractState,
+    },
     #[error("negotiation bound reached: {rounds} of {max} rounds — NoAgreement (§7.4)")]
     RoundsExhausted { rounds: u64, max: u64 },
     #[error("amendment bound reached: {amendments} of {max} — NoAgreement (§7.6)")]
@@ -142,6 +145,12 @@ pub enum ContractError {
     NotBothAgreed { missing: String },
     #[error("terms are not canonicalizable (§5.1): {0}")]
     NotCanonical(String),
+    #[error("contract formation requires an active session, found {0:?}")]
+    InactiveSession(SessionState),
+    #[error("accepted terms differ; counter before accepting different terms")]
+    TermsMismatch,
+    #[error("verification does not match the pending submission: {0}")]
+    InvalidVerification(String),
 }
 
 /// The bilateral contract (§7).
@@ -163,10 +172,18 @@ pub struct Contract {
     pub amendments: u64,
     /// Participants recorded as having accepted the current terms.
     agreed_by: BTreeSet<String>,
+    /// Canonical content digest shared by all current acceptances. Older
+    /// snapshots without this field must collect fresh acceptance before freeze.
+    #[serde(default)]
+    agreed_terms_digest: Option<String>,
     /// Every frozen revision, in order; history is never rewritten (§7.6).
     pub revisions: Vec<Revision>,
     /// The submission awaiting a verdict, if any.
     pub pending_submission: Option<Submission>,
+    /// Authored-by identity for the pending submission. Legacy pending
+    /// snapshots without it need trusted migration before record validation.
+    #[serde(default)]
+    pending_submitter: Option<String>,
     /// The rework scope when a verdict sent the contract back.
     pub rework_scope: Option<String>,
 }
@@ -183,6 +200,9 @@ impl Contract {
         escalation_path: Vec<String>,
         limits: ContractLimits,
     ) -> Result<Self, ContractError> {
+        if session.state != SessionState::Active {
+            return Err(ContractError::InactiveSession(session.state));
+        }
         if limits.max_rounds < 1 || limits.max_amendments < 1 {
             return Err(ContractError::BadLimits);
         }
@@ -206,8 +226,10 @@ impl Contract {
             rounds: 0,
             amendments: 0,
             agreed_by: BTreeSet::new(),
+            agreed_terms_digest: None,
             revisions: Vec::new(),
             pending_submission: None,
+            pending_submitter: None,
             rework_scope: None,
         })
     }
@@ -227,15 +249,20 @@ impl Contract {
     /// exhausting `max_rounds` lands in `NoAgreement` — the valid terminal.
     pub fn counter(&mut self, by: &str) -> Result<(), ContractError> {
         self.authorize(by)?;
-        if !matches!(self.state, ContractState::Proposed | ContractState::Countered) {
+        if !matches!(
+            self.state,
+            ContractState::Proposed | ContractState::Countered | ContractState::Amending
+        ) {
             return Err(ContractError::IllegalTransition {
                 action: "counter",
                 state: self.state,
             });
         }
-        self.rounds += 1;
+        let amending = self.state == ContractState::Amending;
+        self.rounds = self.rounds.saturating_add(1);
         // A counter resets consensus: terms changed under the acceptors' feet.
         self.agreed_by.clear();
+        self.agreed_terms_digest = None;
         if self.rounds >= self.limits.max_rounds {
             self.state = ContractState::NoAgreement;
             return Err(ContractError::RoundsExhausted {
@@ -243,7 +270,11 @@ impl Contract {
                 max: self.limits.max_rounds,
             });
         }
-        self.state = ContractState::Countered;
+        self.state = if amending {
+            ContractState::Amending
+        } else {
+            ContractState::Countered
+        };
         Ok(())
     }
 
@@ -260,9 +291,13 @@ impl Contract {
                 state: self.state,
             });
         }
-        // Terms must canonicalize; a digest will be taken of them at freeze.
-        canon::canonical_json(terms)
-            .map_err(|e| ContractError::NotCanonical(e.to_string()))?;
+        let digest = self.check_terms(terms)?;
+        // A legacy snapshot carried names but no terms: it cannot establish
+        // agreement about any content until both accept again.
+        if self.agreed_terms_digest.is_none() {
+            self.agreed_by.clear();
+        }
+        self.agreed_terms_digest = Some(digest);
         self.agreed_by.insert(by.to_string());
         if self.agreed_by.len() == 2 {
             self.state = ContractState::Agreed;
@@ -270,6 +305,19 @@ impl Contract {
             self.state = ContractState::Proposed;
         }
         Ok(())
+    }
+
+    fn check_terms(&self, terms: &Value) -> Result<String, ContractError> {
+        let digest =
+            canon::digest_of(terms).map_err(|e| ContractError::NotCanonical(e.to_string()))?;
+        if self
+            .agreed_terms_digest
+            .as_ref()
+            .is_some_and(|accepted| accepted != &digest)
+        {
+            return Err(ContractError::TermsMismatch);
+        }
+        Ok(digest)
     }
 
     /// Freeze the agreed terms as revision N (§7.5). Landing state is
@@ -291,6 +339,10 @@ impl Contract {
         if !missing.is_empty() {
             return Err(ContractError::NotBothAgreed { missing });
         }
+        let content_digest = self.check_terms(&terms)?;
+        if self.agreed_terms_digest.as_ref() != Some(&content_digest) {
+            return Err(ContractError::TermsMismatch);
+        }
         let number = self.revisions.len() as u64 + 1;
         let digest = revision_digest(&self.contract_id, number, &terms)?;
         self.revisions.push(Revision {
@@ -299,6 +351,7 @@ impl Contract {
             digest: digest.clone(),
         });
         self.agreed_by.clear();
+        self.agreed_terms_digest = None;
         self.state = ContractState::Executing;
         Ok(digest)
     }
@@ -330,7 +383,10 @@ impl Contract {
     pub fn expire_negotiation(&mut self) -> Result<(), ContractError> {
         if !matches!(
             self.state,
-            ContractState::Proposed | ContractState::Countered | ContractState::Agreed
+            ContractState::Proposed
+                | ContractState::Countered
+                | ContractState::Agreed
+                | ContractState::Amending
         ) {
             return Err(ContractError::IllegalTransition {
                 action: "expire negotiation",
@@ -360,12 +416,14 @@ impl Contract {
             });
         }
         self.pending_submission = Some(submission);
+        self.pending_submitter = Some(by.to_string());
         self.state = ContractState::Verifying;
         Ok(())
     }
 
-    /// Apply a verdict (§7.3, §9.3). The verifier's record is the verifier's
-    /// business (§9); the engine takes the outcome.
+    /// Low-level state transition for a verdict already validated by the host.
+    /// This does not validate evidence or authorship. Prefer
+    /// `apply_verification` for incoming verification records (§9.3).
     pub fn decide(&mut self, verdict: Verdict) -> Result<(), ContractError> {
         if self.state != ContractState::Verifying {
             return Err(ContractError::IllegalTransition {
@@ -390,7 +448,38 @@ impl Contract {
                 self.state = ContractState::Rejected;
             }
         }
+        self.pending_submitter = None;
         Ok(())
+    }
+
+    /// Apply a complete, locally checked verification record from the
+    /// counterparty. Bind it to the contract, revision and artifact set before
+    /// changing state. The transport must authenticate the verifier's identity;
+    /// the verifier must actually measure the recorded checks.
+    pub fn apply_verification(
+        &mut self,
+        record: &super::Verification,
+    ) -> Result<(), ContractError> {
+        record
+            .validate()
+            .map_err(|e| ContractError::InvalidVerification(e.to_string()))?;
+        self.authorize(&record.verifier)?;
+        let pending = self
+            .pending_submission
+            .as_ref()
+            .ok_or_else(|| ContractError::InvalidVerification("no pending submission".into()))?;
+        if self.pending_submitter.is_none()
+            || self.pending_submitter.as_deref() == Some(record.verifier.as_str())
+            || record.contract_id != self.contract_id
+            || record.against_revision != pending.against_revision
+            || record.artifacts.iter().collect::<BTreeSet<_>>()
+                != pending.artifacts.iter().collect::<BTreeSet<_>>()
+        {
+            return Err(ContractError::InvalidVerification(
+                "wrong verifier, contract, revision or artifacts".into(),
+            ));
+        }
+        self.decide(record.verdict.clone())
     }
 
     /// Propose an amendment (§7.6): `Executing → Amending`, negotiated against
@@ -405,6 +494,7 @@ impl Contract {
         }
         self.state = ContractState::Amending;
         self.agreed_by.clear();
+        self.agreed_terms_digest = None;
         self.rounds = 0;
         Ok(())
     }
@@ -413,7 +503,12 @@ impl Contract {
     /// returns its digest; a refusal returns to `Executing` with the contract
     /// unchanged — a declined amendment is not a dispute. Round exhaustion is
     /// terminal `NoAgreement`.
-    pub fn decide_amendment(&mut self, by: &str, accept: bool, terms: Option<Value>) -> Result<Option<String>, ContractError> {
+    pub fn decide_amendment(
+        &mut self,
+        by: &str,
+        accept: bool,
+        terms: Option<Value>,
+    ) -> Result<Option<String>, ContractError> {
         self.authorize(by)?;
         if self.state != ContractState::Amending {
             return Err(ContractError::IllegalTransition {
@@ -423,13 +518,24 @@ impl Contract {
         }
         if !accept {
             self.state = ContractState::Executing;
+            self.agreed_by.clear();
+            self.agreed_terms_digest = None;
             return Ok(None);
         }
+        let terms = terms.ok_or(ContractError::IllegalTransition {
+            action: "accept an amendment without terms",
+            state: self.state,
+        })?;
+        let content_digest = self.check_terms(&terms)?;
+        if self.agreed_terms_digest.is_none() {
+            self.agreed_by.clear();
+        }
+        self.agreed_terms_digest = Some(content_digest);
         self.agreed_by.insert(by.to_string());
         if self.agreed_by.len() < 2 {
             return Ok(None); // awaiting the other participant
         }
-        self.amendments += 1;
+        self.amendments = self.amendments.saturating_add(1);
         if self.amendments > self.limits.max_amendments {
             self.state = ContractState::NoAgreement;
             return Err(ContractError::AmendmentsExhausted {
@@ -437,10 +543,6 @@ impl Contract {
                 max: self.limits.max_amendments,
             });
         }
-        let terms = terms.ok_or(ContractError::IllegalTransition {
-            action: "accept an amendment without terms",
-            state: self.state,
-        })?;
         let number = self.revisions.len() as u64 + 1;
         let digest = revision_digest(&self.contract_id, number, &terms)?;
         self.revisions.push(Revision {
@@ -449,6 +551,7 @@ impl Contract {
             digest: digest.clone(),
         });
         self.agreed_by.clear();
+        self.agreed_terms_digest = None;
         self.state = ContractState::Executing;
         Ok(Some(digest))
     }
@@ -507,7 +610,11 @@ mod tests {
         contract.agree(&urn("parent"), &agreed_terms()).unwrap();
         assert_eq!(contract.state, ContractState::Agreed);
         let digest = contract.freeze(agreed_terms()).unwrap();
-        assert_eq!(contract.state, ContractState::Executing, "EXECUTE is implicit on freeze");
+        assert_eq!(
+            contract.state,
+            ContractState::Executing,
+            "EXECUTE is implicit on freeze"
+        );
         digest
     }
 
@@ -525,7 +632,10 @@ mod tests {
                 },
                 Relationship::Delegation,
                 vec![],
-                ContractLimits { max_rounds: 1, max_amendments: 1 },
+                ContractLimits {
+                    max_rounds: 1,
+                    max_amendments: 1
+                },
             ),
             Err(ContractError::DelegationNeedsEscalationPath)
         ));
@@ -539,7 +649,10 @@ mod tests {
         // freeze from Proposed is an illegal transition.
         assert!(matches!(
             c.freeze(agreed_terms()),
-            Err(ContractError::IllegalTransition { action: "freeze", .. })
+            Err(ContractError::IllegalTransition {
+                action: "freeze",
+                ..
+            })
         ));
         c.agree(&urn("parent"), &agreed_terms()).unwrap();
         assert_eq!(c.state, ContractState::Agreed);
@@ -556,7 +669,11 @@ mod tests {
         // Second counter exhausts max_rounds = 2.
         let err = c.counter(&urn("child")).unwrap_err();
         assert!(matches!(err, ContractError::RoundsExhausted { .. }));
-        assert_eq!(c.state, ContractState::NoAgreement, "a valid terminal (§7.4)");
+        assert_eq!(
+            c.state,
+            ContractState::NoAgreement,
+            "a valid terminal (§7.4)"
+        );
     }
 
     #[test]
@@ -589,8 +706,10 @@ mod tests {
         let digest = drive_to_executing(&mut c);
         // An amendment lands revision 2; the submission still answers rev 1.
         c.propose_amendment(&urn("parent")).unwrap();
-        c.decide_amendment(&urn("parent"), true, Some(json_amended())).unwrap();
-        c.decide_amendment(&urn("child"), true, Some(json_amended())).unwrap();
+        c.decide_amendment(&urn("parent"), true, Some(json_amended()))
+            .unwrap();
+        c.decide_amendment(&urn("child"), true, Some(json_amended()))
+            .unwrap();
         assert!(matches!(
             c.submit(
                 &urn("child"),
@@ -646,7 +765,8 @@ mod tests {
         // max_amendments = 1: the second accepted amendment exhausts the bound.
         for _ in 0..2 {
             c.propose_amendment(&urn("parent")).unwrap();
-            c.decide_amendment(&urn("parent"), true, Some(json_amended())).unwrap();
+            c.decide_amendment(&urn("parent"), true, Some(json_amended()))
+                .unwrap();
             match c.decide_amendment(&urn("child"), true, Some(json_amended())) {
                 Ok(_) | Err(_) => {}
             }
@@ -663,7 +783,10 @@ mod tests {
         drive_to_executing(&mut c);
         assert!(matches!(
             c.withdraw(&urn("child")),
-            Err(ContractError::IllegalTransition { action: "withdraw", .. })
+            Err(ContractError::IllegalTransition {
+                action: "withdraw",
+                ..
+            })
         ));
     }
 
