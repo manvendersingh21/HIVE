@@ -2,7 +2,7 @@
 
 The HACP testing playbook is maintained with the independent library:
 
-[HACP protocol testing guide](https://github.com/manvendersingh21/hcap/blob/main/docs/TESTING-YOUR-PROTOCOL.md).
+[HACP protocol testing guide](https://github.com/manvendersingh21/hacp/blob/main/docs/TESTING-YOUR-PROTOCOL.md).
 
 Run protocol tests from a checkout of that repository. HIVE's own tests exercise
 the runtime against a commit-pinned HACP dependency; they do not run dependency

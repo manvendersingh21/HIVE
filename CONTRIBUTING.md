@@ -2,7 +2,7 @@
 
 HIVE owns agent hosting and orchestration. Protocol semantics, wire schemas,
 conformance fixtures, and the `hacp` library belong in the separate
-[HACP repository](https://github.com/manvendersingh21/hcap).
+[HACP repository](https://github.com/manvendersingh21/hacp).
 
 ## Development checks
 

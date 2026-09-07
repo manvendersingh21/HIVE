@@ -5,7 +5,7 @@ SSH-connected machines. It negotiates tasks through HACP contracts, runs agent
 CLIs in supervised tmux sessions, checks artifacts against frozen acceptance
 criteria, and preserves execution evidence for inspection and recovery.
 
-**HIVE uses [HACP](https://github.com/manvendersingh21/hcap); HACP does not depend
+**HIVE uses [HACP](https://github.com/manvendersingh21/hacp); HACP does not depend
 on HIVE.** The protocol is maintained in its own Apache-2.0 repository. HIVE
 consumes the `hacp` Rust library through a commit-pinned Git dependency.
 
@@ -146,7 +146,7 @@ from environment variables, never committed configuration.
 | `hive-adapter` | Legacy HACP/1.1 transport adapter |
 | `hive-common` | HIVE configuration and task types |
 | `rust_api` | Experimental Rust API scaffold |
-| [HACP repository](https://github.com/manvendersingh21/hcap) | External protocol library, specifications, schemas, conformance tests |
+| [HACP repository](https://github.com/manvendersingh21/hacp) | External protocol library, specifications, schemas, conformance tests |
 
 ## Documentation and contributing
 
@@ -158,4 +158,4 @@ See [SECURITY.md](SECURITY.md) before reporting a vulnerability.
 ## License
 
 HIVE is licensed under [Apache License 2.0](LICENSE). HACP has its own
-[Apache-2.0 license](https://github.com/manvendersingh21/hcap/blob/main/LICENSE).
+[Apache-2.0 license](https://github.com/manvendersingh21/hacp/blob/main/LICENSE).

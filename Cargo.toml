@@ -11,7 +11,7 @@ members = [
 
 [workspace.dependencies]
 # External protocol library. Pin a reviewed commit; never depend on a personal path.
-hacp = { version = "1.1.0", git = "https://github.com/manvendersingh21/hcap.git", rev = "697eae62e950e862b64984ef8f0b2ee86f2aeb34" }
+hacp = { version = "1.1.0", git = "https://github.com/manvendersingh21/hacp.git", rev = "f3d30794b2b502f65b7bd28fd666d7e33c888c59" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

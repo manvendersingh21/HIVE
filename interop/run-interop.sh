@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [ -z "${HACP_CHECKOUT:-}" ] || [ ! -f "$HACP_CHECKOUT/Cargo.toml" ]; then
-    echo "HACP now lives at https://github.com/manvendersingh21/hcap" >&2
+    echo "HACP now lives at https://github.com/manvendersingh21/hacp" >&2
     echo "Set HACP_CHECKOUT to a protocol checkout, then rerun this script." >&2
     exit 2
 fi

@@ -1,13 +1,13 @@
 # Interoperability and runtime evidence
 
 Protocol conformance and the independent Python peer now live in the
-[HACP repository](https://github.com/manvendersingh21/hcap). There is no second
+[HACP repository](https://github.com/manvendersingh21/hacp). There is no second
 maintained copy of that peer here.
 
 To run its interoperability test from this directory's compatibility script:
 
 ```sh
-HACP_CHECKOUT=../hcap interop/run-interop.sh
+HACP_CHECKOUT=../hacp interop/run-interop.sh
 ```
 
 Run from the HIVE root and provide your actual checkout location. The wrapper

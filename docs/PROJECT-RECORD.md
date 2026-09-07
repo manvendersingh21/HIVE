@@ -1,7 +1,7 @@
 # The HACP/2.0 Protocol — Project Record
 
 > Historical design record. HACP's active source, specifications, and tests now
-> live in [the standalone repository](https://github.com/manvendersingh21/hcap).
+> live in [the standalone repository](https://github.com/manvendersingh21/hacp).
 > Earlier local paths refer to the [pre-extraction tree](https://github.com/manvendersingh21/HIVE/tree/87dd12251a6e2375d48d77f85b64aba58b4c3d19).
 
 **Complete engineering record of designing, specifying, implementing, testing, and

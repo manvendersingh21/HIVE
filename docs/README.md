@@ -12,10 +12,10 @@
 
 ## Protocol documentation
 
-HACP's [README](https://github.com/manvendersingh21/hcap),
-[specifications](https://github.com/manvendersingh21/hcap/tree/main/spec),
-[schemas](https://github.com/manvendersingh21/hcap/tree/main/spec/schemas), and
-[testing guide](https://github.com/manvendersingh21/hcap/blob/main/docs/TESTING-YOUR-PROTOCOL.md)
+HACP's [README](https://github.com/manvendersingh21/hacp),
+[specifications](https://github.com/manvendersingh21/hacp/tree/main/spec),
+[schemas](https://github.com/manvendersingh21/hacp/tree/main/spec/schemas), and
+[testing guide](https://github.com/manvendersingh21/hacp/blob/main/docs/TESTING-YOUR-PROTOCOL.md)
 are maintained in their own repository. There is no in-tree `hacp/` crate.
 
 ## Historical records

@@ -3,14 +3,18 @@
 ## Result
 
 HACP is now maintained in the public
-[manvendersingh21/hcap repository](https://github.com/manvendersingh21/hcap).
+[manvendersingh21/hacp repository](https://github.com/manvendersingh21/hacp).
 Its protocol acronym and Rust package remain `HACP` and `hacp` respectively.
 Both HACP and HIVE are Apache-2.0 licensed; GitHub recognizes the new repository's
 license as `Apache-2.0`.
 
-The local protocol checkout is `~/Documents/hcap`, but no dependency embeds that
-path. HIVE resolves the library from GitHub at commit
-`697eae62e950e862b64984ef8f0b2ee86f2aeb34`, pinned in its root manifest and lockfile.
+The local protocol checkout is `~/Documents/hacp`, but no dependency embeds that
+path. At extraction, HIVE resolved the library from GitHub at commit
+`697eae62e950e862b64984ef8f0b2ee86f2aeb34`. The current pin is recorded in the
+root manifest and lockfile; the naming-correction update advances it without
+changing protocol semantics. Repository links and checkout examples in this
+record use the corrected `hacp` name; original test results and revisions remain
+historical evidence.
 Cargo metadata confirms that HACP is external and HIVE has seven workspace
 members. No other lockfile dependency changed during separation.
 
@@ -61,7 +65,7 @@ tests plus 146 HACP tests. The 17 ignored live/helper tests remain explicit
 opt-ins; they were not rerun or represented as passing during this packaging
 and documentation change.
 
-[HACP's first GitHub Actions run](https://github.com/manvendersingh21/hcap/actions/runs/34164334826)
+[HACP's first GitHub Actions run](https://github.com/manvendersingh21/hacp/actions/runs/34164334826)
 completed successfully. Runtime live-agent evidence remains the dated
 [Release 1 audit](RELEASE-1.md#final-acceptance-audit--complete-2026-09-07), not a new
 model-provider run performed for this extraction.

@@ -5,7 +5,7 @@ and [documentation index](README.md). These are the current instructions for
 public contributors; no maintainer-specific machine, private planning file,
 provider account, or particular AI coding tool is required.
 
-HACP has moved to [its own repository](https://github.com/manvendersingh21/hcap).
+HACP has moved to [its own repository](https://github.com/manvendersingh21/hacp).
 Do not recreate a protocol crate inside HIVE. Follow the
 [dependency workflow](HACP-HIVE.md) when changing protocol behavior.
 

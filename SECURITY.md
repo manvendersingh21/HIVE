@@ -18,6 +18,6 @@ Include the affected revision, a minimal synthetic reproduction, and the trust
 boundary in the private report. No response-time guarantee is offered.
 
 Protocol-library issues belong in
-[HACP's security process](https://github.com/manvendersingh21/hcap/blob/main/SECURITY.md).
+[HACP's security process](https://github.com/manvendersingh21/hacp/blob/main/SECURITY.md).
 The current development branch is the maintenance target; older revisions have
 no promised security support window.

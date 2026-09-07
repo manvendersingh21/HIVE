@@ -1,6 +1,6 @@
 # HACP integration
 
-[HACP](https://github.com/manvendersingh21/hcap) is a standalone protocol and
+[HACP](https://github.com/manvendersingh21/hacp) is a standalone protocol and
 Rust library. HIVE is a consuming runtime. The protocol has no dependency on
 HIVE, an agent vendor, CLI, database, async runtime, or network client.
 
@@ -39,8 +39,8 @@ This is Git distribution; no crates.io publication is implied.
 Clone the protocol separately:
 
 ```sh
-git clone https://github.com/manvendersingh21/hcap.git
-cd hcap
+git clone https://github.com/manvendersingh21/hacp.git
+cd hacp
 cargo test --locked
 cargo run --locked --example bilateral
 cargo package --locked
@@ -50,8 +50,8 @@ For a temporary HIVE integration check against unpublished edits, add a local
 override to HIVE's root manifest:
 
 ```toml
-[patch."https://github.com/manvendersingh21/hcap.git"]
-hacp = { path = "../hcap" }
+[patch."https://github.com/manvendersingh21/hacp.git"]
+hacp = { path = "../hacp" }
 ```
 
 Use the path to your own checkout. This is a developer-only override; do not
@@ -68,7 +68,7 @@ pinned library; it does not execute a dependency's own unit tests. Run those
 in the HACP repository. The compatibility wrapper for the independent peer is:
 
 ```sh
-HACP_CHECKOUT=../hcap interop/run-interop.sh
+HACP_CHECKOUT=../hacp interop/run-interop.sh
 ```
 
 That command tests the supplied checkout, not necessarily HIVE's pinned commit;
@@ -77,11 +77,11 @@ must not be compared with HIVE-only totals as though tests were deleted.
 
 ## Protocol and runtime references
 
-- [HACP/1.1 specification](https://github.com/manvendersingh21/hcap/blob/main/spec/HACP.md)
-- [HACP/2.0 draft](https://github.com/manvendersingh21/hcap/blob/main/spec/HACP-2.0-draft.md)
-- [Schemas](https://github.com/manvendersingh21/hcap/tree/main/spec/schemas)
-- [Independent test peer](https://github.com/manvendersingh21/hcap/blob/main/tests/interop/peer.py)
-- [Protocol contributing guide](https://github.com/manvendersingh21/hcap/blob/main/CONTRIBUTING.md)
+- [HACP/1.1 specification](https://github.com/manvendersingh21/hacp/blob/main/spec/HACP.md)
+- [HACP/2.0 draft](https://github.com/manvendersingh21/hacp/blob/main/spec/HACP-2.0-draft.md)
+- [Schemas](https://github.com/manvendersingh21/hacp/tree/main/spec/schemas)
+- [Independent test peer](https://github.com/manvendersingh21/hacp/blob/main/tests/interop/peer.py)
+- [Protocol contributing guide](https://github.com/manvendersingh21/hacp/blob/main/CONTRIBUTING.md)
 - [HIVE distributed workflow](DISTRIBUTED-COLLABORATION.md)
 - [Release 1 evidence](RELEASE-1.md#final-acceptance-audit--complete-2026-09-07)
 
