@@ -1,5 +1,10 @@
 # Hive — Current Status
 
+> Historical, append-only evidence; entries have their own dates and scope.
+> Start with the [current documentation](README.md). HACP was subsequently
+> [extracted into its own repository](HACP-HIVE.md); earlier combined test counts
+> and `hacp/` source paths refer to the pre-extraction tree.
+
 **Updated 2026-09-05, verified against a live build.** This audit reflects what was actually
 compiled, tested, and run — not what a session claimed.
 

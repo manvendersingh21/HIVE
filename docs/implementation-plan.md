@@ -1,5 +1,9 @@
 # Distributed Agentic System — Implementation Plan
 
+> Original design proposal, not installation instructions or a statement that
+> every feature below exists. Start with the [current README](../README.md) and
+> [documentation index](README.md).
+
 ## Goal
 Build a **self-hosted, distributed agentic system** where a master agent on a Mac Mini M4 (16GB) runs a local LLM, plans tasks, assesses complexity, and either handles them locally or delegates them to 4 worker machines via SSH. Delegated tasks run in tmux sessions accessible from a phone/laptop through a web terminal UI. The master agent routes complex subtasks to cloud AI services (Claude, Gemini, Codex) when the local model isn't sufficient.
 

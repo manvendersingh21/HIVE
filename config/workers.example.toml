@@ -1,0 +1,9 @@
+# Safe starting point: no remote machines are contacted.
+workers = []
+
+# To enable a worker, remove `workers = []` above and configure an SSH alias:
+# [[workers]]
+# name = "worker-laptop"
+# host = "worker-laptop"
+# user = "your-remote-username"
+# tags = ["personal", "light"]

@@ -1,185 +1,161 @@
-# 🐝 Hive
+# HIVE
 
-A **self-hosted, distributed agentic system**. A master agent runs on a Mac Mini M4 (16GB)
-with a local LLM, plans your tasks, judges how hard they are, and either handles them itself
-or delegates them over SSH to worker machines on your LAN. Delegated work runs inside `tmux`
-sessions you can attach to from your phone through a web terminal.
+HIVE is a self-hosted runtime for coordinating AI agents across local and
+SSH-connected machines. It negotiates tasks through HACP contracts, runs agent
+CLIs in supervised tmux sessions, checks artifacts against frozen acceptance
+criteria, and preserves execution evidence for inspection and recovery.
 
-Every conversation is scoped to a **project** and indexed into a **knowledge graph + RAG**
-index by the local model, so the agent remembers past decisions, commands, and errors when
-you come back to a project weeks later.
+**HIVE uses [HACP](https://github.com/manvendersingh21/hcap); HACP does not depend
+on HIVE.** The protocol is maintained in its own Apache-2.0 repository. HIVE
+consumes the `hacp` Rust library through a commit-pinned Git dependency.
 
-A **safety watchdog** watches every running session continuously. If it sees something
-dangerous, it pauses the task immediately (not kills — session state is preserved for
-review) and escalates to you for a human decision.
+This is an early-stage project. Distributed bilateral collaboration has been
+tested between two Macs, but autonomous fleet scheduling, peer discovery, and
+recursive agent teams are not implemented end to end.
 
----
+## What works
 
-## Why it's built this way
+- A supervisor CLI authors a contract; a worker reviews it and produces artifacts.
+  Independent acceptance commands execute on both participating hosts.
+- Either role can run locally or on an SSH host, with explicit per-role model
+  selection. OpenCode on a Mac mini and AGY on a MacBook Air have completed
+  both initial acceptance and a controlled feedback-and-repair exercise.
+- A SQLite journal records protocol messages, delivery receipts, invocation
+  identities, and results. Inspection and resume reuse recorded work and refuse
+  ambiguous launches instead of silently running a second task.
+- Bounded negotiation and rework preserve frozen criteria and previous attempts.
+  Conversation continuity is implemented for OpenCode and AGY.
+- A watchdog can suspend tasks for review. Incidents are persisted and exposed
+  through an authenticated web review interface.
+- A separate master-agent path provides local-model planning, SSH workers,
+  project-scoped memory APIs/CLI commands, and a browser interface.
 
-| Decision | Reason |
-|:---|:---|
-| Local model does planning + routing | Free, private, and fast enough on an M4; cloud is only paid for when the task actually needs it |
-| Complexity router (local → Gemini Flash → Claude/Codex) | Most tasks are simple; don't pay Claude prices for `df -h` |
-| tmux as the execution surface | Work survives disconnects, and any session is attachable from anywhere |
-| SSH for delegation | No agents to install beyond a small daemon; inherits your `~/.ssh/config` |
-| Rust workspace | One toolchain, shared types between master/worker/web, single static binaries to ship to workers |
+See [Release 1 evidence](docs/RELEASE-1.md#final-acceptance-audit--complete-2026-09-07)
+for exact test scope and limitations. Recorded historical counts include HACP's
+tests before the repositories were separated.
 
----
+## Requirements
 
-## Architecture
+Build with stable Rust/Cargo. Python 3 is used by acceptance tests and remote
+hosting. Live collaboration requires a Unix-like host with bash and tmux, plus
+the selected agent CLI installed and authenticated on each participating device.
+The SSH path also needs SSH access and an already trusted host key.
 
-```
-┌──────────────────────── Mac Mini M4 (Master) ────────────────────────┐
-│                                                                      │
-│   hive-cli ──► MasterAgent ──► LlmRouter ──┬── local  (Ollama/Qwen)   │
-│                    │                       ├── medium (Gemini Flash)  │
-│                    │                       └── hard   (Claude/Codex)  │
-│                    │                                                  │
-│                    ├──► MemorySystem ──► Knowledge Graph + RAG + SQLite│
-│                    ├──► Watchdog ──────► safety rules + LLM analysis   │
-│                    ├──► SkillRegistry ─► TOML-defined custom skills    │
-│                    └──► WorkerPool ────► capability-based placement    │
-│                                                                       │
-│   hive-web (axum + xterm.js)  ◄── phone/laptop browser over the tailnet│
-└───────────────────────────────┬───────────────────────────────────────┘
-                                │ SSH (direct: tmux driven over the connection)
-        ┌───────────────────────┼───────────────────────┐
-        ▼                       ▼                       ▼
-   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-   │archlinux-wkr │    │  cis-a6000   │    │  cis-linux2  │
-   │ 4c / 11.6 GB │    │2× RTX A6000  │    │ shared login │
-   │     tmux     │    │ 32c / 251 GB │    │  (bastion)   │
-   └──────────────┘    └──────────────┘    └──────────────┘
-```
-
-Full architecture diagrams, data model, and code sketches live in
-[`docs/implementation-plan.md`](docs/implementation-plan.md).
-
----
-
-## Crate map
-
-| Crate | Binary | Role |
-|:---|:---|:---|
-| `hive-common` | — | Shared protocol types (`TaskAssignment`, `TaskStatus`, …), config schema, `HiveError` |
-| `hive-core` | — | Master agent brain: agent loop, LLM router, worker pool + placement, tools, skills, memory, watchdog, finetune |
-| `hive-worker` | `hive-worker` | Daemon on each worker machine: receives tasks, runs them in tmux, reports status |
-| `hive-web` | `hive-web` | axum server: session dashboard + WebSocket↔SSH↔tmux terminal bridge |
-| `hive-cli` | `hive` | Your interface: `hive chat`, `hive task`, `hive sessions`, `hive workers`, … |
-
----
-
-## Status
-
-**The HACP/2.0 agent-collaboration protocol is designed, specified, implemented, and
-proven** — a bilateral contract protocol with an independent second implementation
-and live cross-vendor runs (claude×codex, agy×opencode) settling real lifecycles.
-The full story, commit by commit, is in
-[`docs/PROJECT-RECORD.md`](docs/PROJECT-RECORD.md); the protocol's own map is
-[`docs/HACP-HIVE.md`](docs/HACP-HIVE.md) and its testing method is
-[`docs/TESTING-YOUR-PROTOCOL.md`](docs/TESTING-YOUR-PROTOCOL.md).
-
-**Phases 1–5 are complete and live-verified** — `cargo build --workspace` and
-`cargo test --workspace` both pass cleanly (95 passed, 1 opt-in live test), and `hive task`/
-`hive chat` classify, plan, and execute real commands — locally, or delegated over real SSH to
-a machine the knowledge graph chose, running inside a tmux session the master supervises for
-its whole life. See [`docs/STATUS.md`](docs/STATUS.md) for the
-full audit, [`docs/ROADMAP.md`](docs/ROADMAP.md) for all 10 phases,
-[`docs/PLACEMENT.md`](docs/PLACEMENT.md) for how a request becomes a machine, and
-[`docs/DEPLOY-WEB.md`](docs/DEPLOY-WEB.md) for what runs where. Picking the work up from
-here starts at [`docs/HANDOFF.md`](docs/HANDOFF.md) — what is done, what is next, and the
-traps this repo has already paid for.
-
-Short version:
-
-- ✅ Workspace + all 5 crate manifests, `cargo build --workspace` clean with zero warnings
-- ✅ `hive-common` protocol, error, and config types — fully written, 18/18 unit tests passing
-- ✅ `hive-core`: real `LlmRouter` (Ollama + Gemini/Claude/OpenAI clients, complexity routing
-  with local fallback), an LLM-driven `Planner`, and a `Tool` registry (shell/file/git) that
-  `MasterAgent::handle_request` actually calls for local subtasks
-- ✅ Remote subtasks delegate for real: SSH (`openssh`, connection-pooled) into a worker,
-  start a detached tmux session, stream its output live, and watch it with a Tier-1 regex +
-  Tier-2 LLM-review safety layer (pulled forward from Phase 10; Tier 2 always runs on the
-  local model, never a routed one — see `docs/STATUS.md`) that pauses — not kills — a
-  session that looks dangerous or off-track, logging the exact command to reattach and inspect
-- ✅ **Agent chat UI** at `/` — talk to the master agent from a browser. It classifies the
-  request, shows which model it routed to (and says so when a missing cloud key made it fall
-  back to the local model), plans, and runs. Local commands the watchdog's Tier-1 rules flag
-  stop and wait for an explicit approval in the UI instead of executing
-- ✅ **Machine knowledge graph** at `/machines` — every machine is probed (OS, arch, cores,
-  RAM, disk, GPU, installed tools) and projected into a SQLite entity/relation graph as
-  `machine ──runs_os/has_arch/has_tool/has_capability──►`. Placement is a graph query rather
-  than a hardcoded branch, and the same graph renders into the planner's prompt
-- ✅ `hive-web` is a real web terminal: tmux session dashboard, create/kill sessions running
-  `claude`, `codex` or a plain shell, and a `WebSocket ↔ PTY ↔ tmux attach` bridge rendering
-  into xterm.js — password-gated, mobile key bar, auto-reconnect. Deployed on the master and reachable from any device on the tailnet
-  (see `docs/DEPLOY-WEB.md`)
-- ✅ `hive-worker` is a real daemon: accepts a `TaskAssignment`, runs its commands in a tmux
-  session honoring `working_dir`/`env_vars`/`timeout_secs`/`wait_for_completion`, tracks true
-  per-task state, captures exit codes, pushes status back to the master, and exposes
-  `pause`/`resume`/`kill` (a real SIGSTOP/SIGCONT, so paused work can actually resume).
-  Bearer-token authenticated — it refuses to start without one
-- ✅ `hive-cli/src/main.rs` — full command tree; `chat`/`task` drive a real `MasterAgent`;
-  `workers list` and worker health checks reflect real config/real SSH reachability
-- ✅ `config/hive.toml` and `config/workers.toml` in place — three workers configured
-  (`archlinux-worker`, `cis-a6000`, `cis-linux2`); the Azure `lawfinder` worker was retired
-- ✅ **Capability-based placement** — machines are probed into a knowledge graph, the planner
-  states what each subtask needs (`gpu-compute`, `containers`, …), and the graph picks the
-  machine. A named machine is a decision, not a hint: Hive will not silently run a CUDA job
-  somewhere without a GPU. See [`docs/PLACEMENT.md`](docs/PLACEMENT.md)
-- ✅ **Durable supervision** — `hive task`/`hive chat` submit to the running master, so a
-  delegated session is watched by a daemon for its whole life rather than for the moment the
-  CLI happens to stay alive
-- ✅ **Safety gate on local commands, in the CLI as well as the web UI** — anything the
-  watchdog's Tier-1 rules flag stops and asks. With no tty (piped, scripted) the answer is
-  *deny*, never *run*
-- ⚠️ Nothing routes GPU work through SLURM yet — `cis-a6000` is a shared university node, and
-  heavy jobs belong in `sbatch` rather than a tmux session. The graph records the capability;
-  no policy acts on it. See `docs/PLACEMENT.md` §5
-- ⚠️ Watchdog incidents are `tracing` warnings only — no incident log, queue, or notifier
-- ⬜ Skills, RAG/projects/history, fine-tuning, incident review UI — see the roadmap
-
----
-
-## Prerequisites
-
-```bash
-# Master (Mac Mini)
-brew install ollama tmux
-ollama pull qwen2.5:14b-instruct-q4_K_M   # planning + routing model
-ollama pull nomic-embed-text              # embeddings for RAG (274MB)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Each worker
-# - tmux installed
-# - master's SSH key in ~/.ssh/authorized_keys
-# - hive-worker binary deployed
-```
+HIVE knows adapters for `opencode`, `agy`, `codex`, and `claude`; CLI support does
+not imply a working provider account or equal conversation-resume support.
+Agent calls may consume your provider credits. Default tests use fixtures and
+do not require model accounts; live tests are opt-in.
 
 ## Build
 
-```bash
-cargo build --workspace
-cargo test  --workspace
+```sh
+git clone https://github.com/manvendersingh21/HIVE.git
+cd HIVE
+cargo build --workspace --locked
+cargo test --workspace --locked
 ```
 
-## Configuration
+Cargo fetches HACP from its pinned Git revision. No sibling HACP checkout,
+submodule, or personal filesystem path is needed. The first build needs network
+access to obtain dependencies; subsequent cached builds can use `--offline`.
+The CLI binary is `target/debug/hive`.
 
-Two files, both read from `config/` at the project root:
+## Run a collaboration
 
-- `config/hive.toml` — master settings, LLM providers, web auth, database, memory, watchdog
-- `config/workers.toml` — the list of worker machines (name, host, user, tags)
+Authenticate each agent CLI using its own setup instructions first. Start with
+a small task in a disposable workspace: agents execute commands using your
+account's permissions. The watchdog is not a process sandbox.
 
-API keys and the web password are **never** stored in config; they come from environment
-variables (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `HIVE_WEB_PASSWORD`).
+```sh
+./target/debug/hive collab run \
+  --supervisor opencode \
+  --worker agy \
+  --task "Implement a Python function that deduplicates strings in input order. Require independent unittest coverage of empty input and duplicates." \
+  --run-dir /tmp/hive-collab-example
+```
 
----
+The example uses each CLI's configured model. To place the worker on another
+device, configure an SSH alias such as `worker-laptop` in `~/.ssh/config`, verify
+access yourself, and add `--worker-host worker-laptop`. Use `--supervisor-model`
+and `--worker-model` with model IDs supported by your installations. HIVE does
+not automatically discover devices or choose these models for you.
 
-## Knowledge graph of this repo
+```sh
+./target/debug/hive collab inspect /tmp/hive-collab-example
+./target/debug/hive collab show /tmp/hive-collab-example
+./target/debug/hive collab resume /tmp/hive-collab-example
+```
 
-`graphify-out/` holds a generated knowledge graph of the codebase itself:
+Use a fresh run directory for a new task; use `resume` for an existing run.
+See [distributed collaboration](docs/DISTRIBUTED-COLLABORATION.md) for SSH
+prerequisites, pause approval, recovery, and failure handling.
 
-- `graphify-out/GRAPH_REPORT.md` — plain-language architecture audit
-- `graphify-out/graph.html` — interactive graph, open in any browser
-- `graphify-out/graph.json` — structured graph for agent queries
+## Master agent and web interface
+
+This is a separate workflow from `hive collab`. It uses `config/hive.toml` and
+`config/workers.toml` in the chosen project root. The checked-in worker file
+records the maintainer's fleet, not a ready-to-use public deployment. For your
+own setup, start from [workers.example.toml](config/workers.example.toml) and
+configure only machines you own or are authorized to use.
+
+The current local-model configuration names `qwen3.5:9b` and the embedding model
+`nomic-embed-text`. If using Ollama, pull the same models you configure:
+
+```sh
+ollama pull qwen3.5:9b
+ollama pull nomic-embed-text
+```
+
+Set `HIVE_WEB_PASSWORD` privately in your environment (at least eight characters),
+then start the server from the checkout root:
+
+```sh
+HIVE_WEB_ADDR=127.0.0.1:8080 ./target/debug/hive-web
+```
+
+Open `http://127.0.0.1:8080`. **The actual bind setting is `HIVE_WEB_ADDR`, not
+`web.listen_addr` in TOML.** The default is loopback. This interface exposes
+terminal functionality; keep it on a trusted network and do not deploy it as
+an unaudited public Internet service. Cloud provider keys are optional and come
+from environment variables, never committed configuration.
+
+## Current limitations
+
+- The supervisor authors and verifies the task; it is not yet an autonomous
+  device/model scheduler. SSH aliases provide connectivity, not HACP discovery.
+- The recursive protocol profile and escalation objects exist in HACP, but
+  HIVE does not implement a complete recursive multi-team runtime.
+- General chat still follows a command-plan interface rather than a complete
+  conversational-answer interface. Browser chat does not currently select a
+  project for memory. Do not assume all web chats are remembered.
+- Skills loading is not wired into the main application entry points. Some
+  parsed configuration keys are not effective runtime settings; do not treat
+  their parsing tests as proof that an operational setting takes effect.
+- Agent output may be malformed or semantically wrong. Independent checks reduce
+  false acceptance but cannot prove arbitrary objectives or prevent every unsafe
+  command. Suspended or uncertain tasks may require operator review.
+
+## Repository map
+
+| Component | Purpose |
+|---|---|
+| `hive-core` | Collaboration runtime, journal, local/SSH hosting, planning, memory, watchdog |
+| `hive-cli` | `hive` commands, collaboration inspection and recovery |
+| `hive-web` | Authenticated browser UI, terminal bridge, incident review |
+| `hive-worker` | Optional authenticated HTTP worker daemon; not required for direct SSH collaboration |
+| `hive-adapter` | Legacy HACP/1.1 transport adapter |
+| `hive-common` | HIVE configuration and task types |
+| `rust_api` | Experimental Rust API scaffold |
+| [HACP repository](https://github.com/manvendersingh21/hcap) | External protocol library, specifications, schemas, conformance tests |
+
+## Documentation and contributing
+
+Start with the [documentation index](docs/README.md) and
+[CONTRIBUTING.md](CONTRIBUTING.md). Report reproducible bugs or propose features
+through [GitHub issues](https://github.com/manvendersingh21/HIVE/issues).
+See [SECURITY.md](SECURITY.md) before reporting a vulnerability.
+
+## License
+
+HIVE is licensed under [Apache License 2.0](LICENSE). HACP has its own
+[Apache-2.0 license](https://github.com/manvendersingh21/hcap/blob/main/LICENSE).

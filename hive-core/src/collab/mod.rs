@@ -1,7 +1,8 @@
 //! Hive's binding to HACP — the Heterogeneous Agent Collaboration Protocol.
 //!
 //! The protocol itself lives in the standalone [`hacp`] crate and its specification in
-//! `hacp/spec/HACP.md`. Nothing in that crate knows Hive exists, and nothing in this
+//! <https://github.com/manvendersingh21/hcap/blob/main/spec/HACP.md>.
+//! Nothing in that crate depends on Hive, and nothing in this
 //! module may leak back into it: Hive is *a* reference implementation of HACP, not the
 //! definition of it.
 //!

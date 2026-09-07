@@ -762,6 +762,7 @@ dependencies = [
 [[package]]
 name = "hacp"
 version = "1.1.0"
+source = "git+https://github.com/manvendersingh21/hcap.git?rev=697eae62e950e862b64984ef8f0b2ee86f2aeb34#697eae62e950e862b64984ef8f0b2ee86f2aeb34"
 dependencies = [
  "chrono",
  "schemars",

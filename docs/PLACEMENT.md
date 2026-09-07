@@ -1,5 +1,9 @@
 # Placement — how Hive decides which machine runs what
 
+> This document describes the legacy master-agent worker pool, not automatic
+> placement in `hive collab`. The [distributed workflow](DISTRIBUTED-COLLABORATION.md)
+> uses explicit role, host, and model selection.
+
 Hive's headline claim is that a knowledge graph decides where work runs. This
 is the mechanism behind that claim: what the graph stores, how a request turns
 into a machine, and where the decision can still go wrong.

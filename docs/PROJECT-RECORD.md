@@ -1,5 +1,9 @@
 # The HACP/2.0 Protocol — Project Record
 
+> Historical design record. HACP's active source, specifications, and tests now
+> live in [the standalone repository](https://github.com/manvendersingh21/hcap).
+> Earlier local paths refer to the [pre-extraction tree](https://github.com/manvendersingh21/HIVE/tree/87dd12251a6e2375d48d77f85b64aba58b4c3d19).
+
 **Complete engineering record of designing, specifying, implementing, testing, and
 proving a lab-neutral agent-collaboration protocol.** Written 2026-09-04, at the
 milestone: *HACP/2.0 Core complete — every normative section implemented, tested by

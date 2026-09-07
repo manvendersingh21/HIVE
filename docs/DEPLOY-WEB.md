@@ -1,3 +1,7 @@
+> **Historical maintainer deployment notes.** Hostnames, addresses, credentials
+> references, and fleet status below are dated records, not public setup defaults.
+> New contributors should use the [current README](../README.md#master-agent-and-web-interface).
+
 > **Azure is retired.** The `lawfinder` worker (Azure VM, `100.93.65.98`) is no longer
 > part of the fleet. Sections below that describe deployments on it are kept as a
 > record of how a worker is set up — the same steps apply to any Linux worker — but

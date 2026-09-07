@@ -1,5 +1,9 @@
 # Hive — Roadmap
 
+> Historical phase plan, not a current feature guarantee. See the
+> [current limitations](../README.md#current-limitations) and
+> [Release 1 evidence](RELEASE-1.md#final-acceptance-audit--complete-2026-09-07).
+
 All 10 phases, in dependency order. This ordering is canonical and comes from the
 **Implementation Order** table in [`implementation-plan.md`](implementation-plan.md).
 

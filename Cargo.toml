@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "hacp",
     "hive-adapter",
     "hive-common",
     "hive-core",
@@ -11,8 +10,8 @@ members = [
 ]
 
 [workspace.dependencies]
-# Protocol library. HIVE consumes it; hacp has no workspace-inherited dependencies.
-hacp = { version = "1.1.0", path = "hacp" }
+# External protocol library. Pin a reviewed commit; never depend on a personal path.
+hacp = { version = "1.1.0", git = "https://github.com/manvendersingh21/hcap.git", rev = "697eae62e950e862b64984ef8f0b2ee86f2aeb34" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

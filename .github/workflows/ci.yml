@@ -1,0 +1,22 @@
+name: HIVE checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Check Python
+        run: python3 --version
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked --no-run
+      - run: cargo test --workspace --locked
+      - run: git diff --check
