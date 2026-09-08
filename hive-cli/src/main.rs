@@ -198,7 +198,28 @@ async fn main() -> anyhow::Result<()> {
         Commands::Memory => memory_cli::run_memory_status(&cli.project_root).await,
         Commands::Skills { action } => match action {
             SkillAction::List => {
-                println!("No skills loaded yet — the skill loader is not implemented (Phase 7).");
+                let config = HiveConfig::from_project_root(&cli.project_root)?;
+                let registry = SkillRegistry::load(&config.skills);
+                let skills = registry.skills();
+                if skills.is_empty() {
+                    println!("No skills found in {}", config.skills.directory);
+                } else {
+                    for skill in skills {
+                        println!(
+                            "{} v{} — {} [triggers: {}]",
+                            skill.name,
+                            skill.version,
+                            skill.description,
+                            skill.patterns.join(", ")
+                        );
+                    }
+                    // The registry the agents run with is still constructed empty;
+                    // listing what is on disk is not the same as it being active.
+                    println!(
+                        "\nNote: skills are not yet loaded into running agents — \
+                         activation wiring is pending (see docs/ROADMAP.md Phase 7)."
+                    );
+                }
                 Ok(())
             }
         },

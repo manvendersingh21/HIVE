@@ -1231,3 +1231,52 @@ paused on the mini (`hive-a18c668f-04-verify-a2`); its history is preserved, not
 silently rerun or killed. Final acceptance sessions completed. This milestone is
 implemented and verified in the working tree, not committed/pushed/published or
 deployed to production. Release 2 scheduling/discovery remains out of scope.
+
+---
+
+## Code-level feature audit and documentation correction — 2026-09-08
+
+Claimed features were re-verified against source, not against earlier session
+claims: every subsystem file, web/worker route, and CLI subcommand enumerated
+from the tree; the CLI exercised on a live build; skill loading exercised with
+a real `skill.toml`. Repository sync checked (clean tree, no untracked files,
+`main` and `chore/standardize-hacp-name` both pushed at `37e1564`); `.env` is
+gitignored and never tracked.
+
+Verified implemented, matching the docs that claim them: LLM router
+(`classify_complexity`, `route_and_execute`, Ollama/Gemini/Claude/OpenAI
+clients), worker pool (SSH+tmux delegation, health refresh, active sessions),
+`hive-worker` daemon (`/health`, `/task`, `/tasks`, `/status`, pause/resume/kill),
+`hive-web` (sessions/chat/approval/machines/incidents APIs, WebSocket terminal
+bridge, login), memory (projects, KG, RAG, machine facts, CLI `project`/
+`search`/`memory`), watchdog (rules, interceptor, one `ractor` supervisor,
+durable incidents, notifier, review actions), bilateral HACP collaboration
+runtime with journal, inspect, resume, replay, and four agent adapters
+(`claude`, `codex`, `agy`, `opencode`).
+
+Corrections made where documents were wrong:
+
+- `ROADMAP.md` called Phase 7 "empty struct". False: the skill engine is built
+  and unit-tested (loader with per-file fault isolation, trigger matching, LLM
+  disambiguation, tool definitions, per-skill `ai_provider` override honored by
+  the planner, confirmation policy). The accurate gap is one line: entry points
+  construct `SkillRegistry::new()` — empty — so `skills.resolve()` always
+  returns `None` in live agents. Roadmap row moved ⬜ → 🟡 with the precise
+  missing wiring named.
+- `hive skills list` printed "the skill loader is not implemented (Phase 7)".
+  False for the same reason. The command now loads the configured
+  `skills.directory` and lists what it finds, printing an explicit warning that
+  listed skills are not yet active in running agents. Verified against a real
+  `[skill]`/`[trigger]`/`[execution]` TOML before committing.
+- `ROADMAP.md` Phase 5 still deferred the incident review UI to Phase 10; it
+  shipped with Phase 10 (`incidents.html`, `/api/incidents`, all four
+  `HumanDecision` variants reachable). Checkbox corrected.
+- `ROADMAP.md` Phase 6 said `skills`/`finetune` subcommands "wait on" later
+  phases; both subcommands exist. `finetune export` reports not-implemented
+  honestly (Phase 8 is a 13-line stub; `[finetune] auto_collect` parses but has
+  no effect). README current-limitations extended to state both facts.
+
+No shipped-feature claim was found to overstate the code; the two inaccuracies
+both understated what exists. CI at `37e1564` is green on both runners after
+the portability fix (test harness process group, Python 3.13 empty-suite exit
+code) recorded earlier in this file's sibling commits.

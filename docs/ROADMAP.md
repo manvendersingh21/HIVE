@@ -3,6 +3,13 @@
 > Historical phase plan, not a current feature guarantee. See the
 > [current limitations](../README.md#current-limitations) and
 > [Release 1 evidence](RELEASE-1.md#final-acceptance-audit--complete-2026-09-07).
+>
+> Statuses below were re-verified against the code on **2026-09-08** (every
+> subsystem file, route, and CLI command enumerated from source, not from
+> earlier session claims). Two rows changed as a result: Phase 7 moved from
+> ⬜ to 🟡 (the skill engine is built and unit-tested; only startup loading is
+> missing), and the Phase 5 incident-review checkbox is checked (it shipped
+> with Phase 10).
 
 All 10 phases, in dependency order. This ordering is canonical and comes from the
 **Implementation Order** table in [`implementation-plan.md`](implementation-plan.md).
@@ -22,8 +29,8 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | 3 | Worker pool, SSH delegation, tmux creation | 2 days | 2 | ✅ done, live-verified against a real worker (redesigned: direct SSH+tmux, no daemon — see below) |
 | 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ✅ done, live-verified (on the since-retired Azure worker) |
 | 5 | `hive-web` — web terminal + agent UI | 2–3 days | 3 | ✅ done, live on the master |
-| 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 `task`/`chat`/`collab`/`sessions`/`attach`/`serve`/`workers health` all real and live-checked; `skills`/`finetune` wait on phases 7–8 |
-| 7 | Skill system | 1–2 days | 2 | ⬜ empty struct |
+| 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 `task`/`chat`/`collab`/`sessions`/`attach`/`serve`/`workers health` all real and live-checked; `skills list` loads from disk (re-wired 2026-09-08); `finetune export` reports not-implemented honestly |
+| 7 | Skill system | 1–2 days | 2 | 🟡 engine built and tested (loader, trigger matching, LLM disambiguation, tool definitions, per-skill provider override, confirmation policy) but **not loaded at startup** — agents construct an empty registry, so no skill ever activates |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
 | 9 | Memory — projects, KG, RAG | 2–3 days | 2 | ✅ done, live-verified cross-process ([STATUS](STATUS.md)): scoped KG on the proven substrate, transcripts, RAG (nomic + cosine), local-model extraction, context injection, `hive project`/`search`/`memory` |
 | 10 | Safety watchdog | 2–3 days | 3, 7 | ✅ Tier-1/Tier-2 remote (suspends, not interrupts) + gate on local exec; durable incident log, all four `HumanDecision` variants, ntfy/webhook delivery, one `ractor` supervisor, review UI. Tier 2 is still always the local model ([STATUS](STATUS.md)) |
@@ -188,7 +195,9 @@ Deployed on the `lawfinder` worker and reachable from any tailnet device — see
 - [x] `static/index.html` — session picker dashboard, auto-refreshing
 - [x] `static/terminal.html` + vendored `xterm.js` — terminal page with a mobile key bar
       (esc/tab/ctrl/arrows/^C/detach), auto-reconnect, and viewport-aware resize
-- [ ] Incident review UI (shared with Phase 10) — deferred with the rest of Phase 10
+- [x] Incident review UI (shared with Phase 10) — shipped with the Phase 10
+      M3 pass: `hive-web/static/incidents.html` + `/api/incidents` routes,
+      all four `HumanDecision` variants reachable from the browser
 
 **Deliberately not done: the SSH transport.** The plan called for
 `WebSocket ↔ SSH ↔ tmux`. `hive-web` runs *on* the worker, so the hop is local
@@ -226,8 +235,12 @@ is only worth building when there are enough workers to justify a single pane.
       [`STATUS.md`](STATUS.md) Phase 3). A TOML serializer would drop every one of
       those comments on the first `add`. If this lands, it edits the file textually
       or it does not land.
-- [ ] `hive skills <list|add|remove>` (needs Phase 7)
-- [ ] `hive finetune <export|stats>` (needs Phase 8)
+- [x] `hive skills list` — loads the configured `skills.directory` for real and
+      lists what it finds (re-wired 2026-09-08; it previously claimed the loader
+      did not exist). It also prints an explicit warning that listed skills are
+      not yet active in running agents — see Phase 7.
+- [ ] `hive finetune <export|stats>` — `export` exists as a subcommand and
+      reports not-implemented honestly (Phase 8 is still a stub)
 - [x] `hive project <new|list|switch>` and `hive search` / `hive memory` (Phase 9) —
       `--project` on `chat`/`task`, defaulting to the `hive project switch` marker;
       live-verified cross-process in [STATUS.md](STATUS.md)
@@ -235,22 +248,48 @@ is only worth building when there are enough workers to justify a single pane.
 ---
 
 ## Phase 7 — Skill System
-*Plan section: "Phase 5: Skill & Plugin System"* · **Status: ⬜**
+*Plan section: "Phase 5: Skill & Plugin System"* · **Status: 🟡 engine built, not wired**
 
 TOML-defined skills in `~/.hive/skills/<name>/`, each with `skill.toml`,
 `system_prompt.md`, and optional `scripts/`.
 
-- [ ] `skills/loader.rs` — parse `skill.toml` (metadata, trigger patterns, parameters, execution)
-- [ ] `SkillRegistry::load_from_dir`
-- [ ] `SkillRegistry::match_skill` — pattern matching plus LLM disambiguation
-- [ ] `SkillRegistry::to_tool_definitions` — expose skills as LLM tools
-- [ ] `require_confirmation` gate before execution
-- [ ] Per-skill `ai_provider` override
+Code-verified 2026-09-08 — what exists and is unit-tested:
+
+- [x] `skills/loader.rs` — parses `[skill]` / `[trigger]` / `[parameters]` /
+      `[execution]`; broken skills are skipped with a warning naming the file,
+      never fatal; `~` expansion; `ai_provider` name parsing with graceful
+      unknown-name handling
+- [x] `SkillRegistry::load` — loads the configured `skills.directory`
+- [x] `SkillRegistry::pattern_matches` — word-boundary, case-insensitive matching
+- [x] `SkillRegistry::resolve` — pattern match plus LLM disambiguation when
+      multiple skills match
+- [x] `SkillRegistry::to_tool_definitions` — skills as LLM tools
+- [x] Per-skill `ai_provider` override — honored by the planner
+      (`agent/planner.rs` replaces the complexity-routed provider for that call)
+- [x] `require_confirmation` policy parsed and carried on the skill
+- [x] `hive skills list` — loads from disk and lists (2026-09-08)
+
+What is still missing — the reason this is 🟡 and not ✅:
+
+- [ ] **Startup wiring.** `MasterAgent` *does* call `skills.resolve(...)` on
+      every request (`agent/mod.rs`), but every entry point constructs the
+      registry with `SkillRegistry::new()` — empty — instead of
+      `SkillRegistry::load(&config.skills)`. Until that one-line-per-entry-point
+      change lands, no skill can ever activate. Listing skills is not using them.
+- [ ] `require_confirmation` enforcement in the live gate (the flag is parsed
+      and carried; the gate path that consumes it for skill-produced commands
+      is part of the same wiring work)
+- [ ] `hive skills <add|remove>` authoring commands
 
 ---
 
 ## Phase 8 — Fine-Tuning Pipeline
-*Plan section: "Phase 6: Fine-Tuning Pipeline"* · **Status: ⬜**
+*Plan section: "Phase 6: Fine-Tuning Pipeline"* · **Status: ⬜ stub only**
+
+Code-verified 2026-09-08: `hive-core/src/finetune/mod.rs` is a 13-line
+`DataCollector` empty struct with a `SqlitePool` TODO; `hive finetune export`
+exists as a subcommand and prints an honest not-implemented message. The
+`[finetune] auto_collect` key in `config/hive.toml` parses but has no effect.
 
 - [ ] `finetune/collector.rs` — log successful interactions (input, reasoning, tool calls, output)
 - [ ] SQLite training-example schema
