@@ -1458,11 +1458,44 @@ mod tests {
         assert!(fresh_host.specs.lock().await.is_empty(), "replay must not rerun either models or tests");
     }
 
+    /// Python 3.13 changed `unittest discover` to exit 5 (`NO TESTS RAN`) when a suite
+    /// is empty, where Python 3.9–3.12 exited 0 and printed `OK`. The invariant under
+    /// test — an acceptance suite that never exercised anything cannot settle a run —
+    /// must hold for both interpreters, so the expected exit status is measured from
+    /// the local `python3` instead of hardcoded, and the expected verifier complaint
+    /// follows from it: exit 0 is caught by log inspection, a nonzero exit by the
+    /// exit-status check itself.
+    fn empty_suite_exit_code() -> i32 {
+        static CODE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+        *CODE.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("hive-empty-suite-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join("tests")).unwrap();
+            std::fs::write(dir.join("tests/test_api.py"), "# no test cases\n").unwrap();
+            let status = std::process::Command::new("python3")
+                .args(["-m", "unittest", "discover", "-s", "tests"])
+                .current_dir(&dir)
+                .status()
+                .expect("python3 is required by the acceptance fixtures");
+            let _ = std::fs::remove_dir_all(&dir);
+            status.code().unwrap_or(-1)
+        })
+    }
+
     #[tokio::test]
     async fn real_empty_or_fully_skipped_suites_cannot_settle_despite_exit_zero() {
-        for (fixture, reason) in [
-            ("# Valid Python, but no discovered test cases.\n", "discovered zero tests"),
-            ("import unittest\n@unittest.skip('unavailable')\nclass Acceptance(unittest.TestCase):\n    def test_value(self):\n        self.fail('must not run')\n", "skipped every discovered test"),
+        let empty_exit = empty_suite_exit_code();
+        // Exit 0 is caught by log inspection, whose reason is embedded in the brief; a
+        // nonzero exit speaks for itself — the brief carries the measured log verbatim,
+        // which on 3.13+ includes unittest's own `NO TESTS RAN` verdict line.
+        let empty_reason = if empty_exit == 0 {
+            "discovered zero tests"
+        } else {
+            "NO TESTS RAN"
+        };
+        for (fixture, expected_exit, reason) in [
+            ("# Valid Python, but no discovered test cases.\n", empty_exit, empty_reason),
+            ("import unittest\n@unittest.skip('unavailable')\nclass Acceptance(unittest.TestCase):\n    def test_value(self):\n        self.fail('must not run')\n", 0, "skipped every discovered test"),
         ] {
             let scratch = Scratch::new("empty-suite");
             let cfg = durable_config(scratch.join("run"));
@@ -1476,9 +1509,12 @@ mod tests {
             let report = run_bilateral(&host, &cfg).await.unwrap();
             assert!(matches!(report.outcome, RunOutcome::ReworkRequired { .. }), "{}", report.summary());
             assert_eq!(report.executions.len(), 2);
-            assert!(report.executions.iter().all(|e| e.outcome == SessionOutcome::Exited { code:0 }));
-            assert!(report.summary().contains("2 exited 0"));
-            assert!(!report.summary().contains("2 passed"), "exit zero must not be mislabeled as acceptance");
+            assert!(report.executions.iter().all(|e| e.outcome == SessionOutcome::Exited { code: expected_exit }));
+            // The summary line reports how many test runs exited 0, whatever the other
+            // exit codes were, so the expected count follows from the probed interpreter.
+            let expected_zero_count = if expected_exit == 0 { 2 } else { 0 };
+            assert!(report.summary().contains(&format!("({expected_zero_count} exited 0")));
+            assert!(!report.summary().contains("2 passed"), "a green-looking exit must not be mislabeled as acceptance");
             assert!(host.briefs.lock().await.iter().any(|b| b.contains(reason)),
                 "verifier must receive the measured failure, not just a green exit code");
             let fresh = FakeAgent::new(vec![]);

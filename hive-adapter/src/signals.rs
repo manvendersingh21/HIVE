@@ -126,12 +126,24 @@ mod tests {
 
     #[test]
     fn sees_a_live_process_group() {
-        // The test process's own group is the one group guaranteed to exist. This also
-        // demonstrates why the guard matters: `getpgrp()` is a plain integer, and
-        // nothing but the guard stands between a stray 0 here and SIGSTOP to self.
-        let own = unsafe { libc::getpgrp() };
-        let pgid = parse_pgid(&own.to_string()).expect("the test's own group id is valid");
+        // The test process's own group is NOT a group this test can rely on: CI shells
+        // run the whole harness in group 1 (no job control, the runner shell is the
+        // session leader), and 1 is exactly what the guard refuses — init belongs to
+        // the system, not to the adapter. So the live group measured here is one the
+        // test creates: `process_group(0)` makes the child its own group leader, and
+        // its pgid is its pid, a plain positive integer with no special meaning.
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn a child in its own process group");
+        let pgid = parse_pgid(&child.id().to_string()).expect("a fresh child group id is valid");
         assert!(group_alive(pgid));
+        child.kill().expect("stop the probe child");
+        child.wait().expect("reap the probe child");
+        // Whether the now-empty group still answers signal 0 is a race against pid
+        // reuse, not a measurement, so the test deliberately stops here.
     }
 
     #[test]
