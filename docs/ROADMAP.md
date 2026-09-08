@@ -6,10 +6,11 @@
 >
 > Statuses below were re-verified against the code on **2026-09-08** (every
 > subsystem file, route, and CLI command enumerated from source, not from
-> earlier session claims). Two rows changed as a result: Phase 7 moved from
+> earlier session claims). Three rows changed as a result: Phase 7 moved from
 > ⬜ to 🟡 (the skill engine is built and unit-tested; only startup loading is
-> missing), and the Phase 5 incident-review checkbox is checked (it shipped
-> with Phase 10).
+> missing), the Phase 5 incident-review checkbox is checked (it shipped with
+> Phase 10), and later the same day Phase 7 moved 🟡 → ✅ when the startup
+> loading was wired and live-verified end to end.
 
 All 10 phases, in dependency order. This ordering is canonical and comes from the
 **Implementation Order** table in [`implementation-plan.md`](implementation-plan.md).
@@ -30,7 +31,7 @@ All 10 phases, in dependency order. This ordering is canonical and comes from th
 | 4 | `hive-worker` daemon — real task execution | 1–2 days | 1 | ✅ done, live-verified (on the since-retired Azure worker) |
 | 5 | `hive-web` — web terminal + agent UI | 2–3 days | 3 | ✅ done, live on the master |
 | 6 | `hive-cli` — CLI subcommands | 1 day | 2–4 | 🟡 `task`/`chat`/`collab`/`sessions`/`attach`/`serve`/`workers health` all real and live-checked; `skills list` loads from disk (re-wired 2026-09-08); `finetune export` reports not-implemented honestly |
-| 7 | Skill system | 1–2 days | 2 | 🟡 engine built and tested (loader, trigger matching, LLM disambiguation, tool definitions, per-skill provider override, confirmation policy) but **not loaded at startup** — agents construct an empty registry, so no skill ever activates |
+| 7 | Skill system | 1–2 days | 2 | ✅ done, live-verified end to end (see below); `hive skills <add\|remove>` authoring commands deliberately not built |
 | 8 | Fine-tuning pipeline | 1–2 days | 2 | ⬜ empty struct |
 | 9 | Memory — projects, KG, RAG | 2–3 days | 2 | ✅ done, live-verified cross-process ([STATUS](STATUS.md)): scoped KG on the proven substrate, transcripts, RAG (nomic + cosine), local-model extraction, context injection, `hive project`/`search`/`memory` |
 | 10 | Safety watchdog | 2–3 days | 3, 7 | ✅ Tier-1/Tier-2 remote (suspends, not interrupts) + gate on local exec; durable incident log, all four `HumanDecision` variants, ntfy/webhook delivery, one `ractor` supervisor, review UI. Tier 2 is still always the local model ([STATUS](STATUS.md)) |
@@ -237,8 +238,8 @@ is only worth building when there are enough workers to justify a single pane.
       or it does not land.
 - [x] `hive skills list` — loads the configured `skills.directory` for real and
       lists what it finds (re-wired 2026-09-08; it previously claimed the loader
-      did not exist). It also prints an explicit warning that listed skills are
-      not yet active in running agents — see Phase 7.
+      did not exist). Since the Phase 7 wiring landed the same day, listed skills
+      are the same ones `hive chat`/`task` and the web agent activate.
 - [ ] `hive finetune <export|stats>` — `export` exists as a subcommand and
       reports not-implemented honestly (Phase 8 is still a stub)
 - [x] `hive project <new|list|switch>` and `hive search` / `hive memory` (Phase 9) —
@@ -248,12 +249,12 @@ is only worth building when there are enough workers to justify a single pane.
 ---
 
 ## Phase 7 — Skill System
-*Plan section: "Phase 5: Skill & Plugin System"* · **Status: 🟡 engine built, not wired**
+*Plan section: "Phase 5: Skill & Plugin System"* · **Status: ✅ done, live-verified**
 
 TOML-defined skills in `~/.hive/skills/<name>/`, each with `skill.toml`,
 `system_prompt.md`, and optional `scripts/`.
 
-Code-verified 2026-09-08 — what exists and is unit-tested:
+Engine (built earlier, unit-tested):
 
 - [x] `skills/loader.rs` — parses `[skill]` / `[trigger]` / `[parameters]` /
       `[execution]`; broken skills are skipped with a warning naming the file,
@@ -266,20 +267,34 @@ Code-verified 2026-09-08 — what exists and is unit-tested:
 - [x] `SkillRegistry::to_tool_definitions` — skills as LLM tools
 - [x] Per-skill `ai_provider` override — honored by the planner
       (`agent/planner.rs` replaces the complexity-routed provider for that call)
-- [x] `require_confirmation` policy parsed and carried on the skill
-- [x] `hive skills list` — loads from disk and lists (2026-09-08)
+- [x] `require_confirmation` enforcement — a confirmation-gated skill marks
+      every local step it produces for approval through the same gate as the
+      Tier-1 rules (`agent/mod.rs`), so no skill can route around the watchdog
+- [x] `hive skills list` — loads from disk and lists
 
-What is still missing — the reason this is 🟡 and not ✅:
+Wiring (landed 2026-09-08, after the audit found the engine unwired):
 
-- [ ] **Startup wiring.** `MasterAgent` *does* call `skills.resolve(...)` on
-      every request (`agent/mod.rs`), but every entry point constructs the
-      registry with `SkillRegistry::new()` — empty — instead of
-      `SkillRegistry::load(&config.skills)`. Until that one-line-per-entry-point
-      change lands, no skill can ever activate. Listing skills is not using them.
-- [ ] `require_confirmation` enforcement in the live gate (the flag is parsed
-      and carried; the gate path that consumes it for skill-produced commands
-      is part of the same wiring work)
-- [ ] `hive skills <add|remove>` authoring commands
+- [x] `hive-cli/src/main.rs` and `hive-web/src/main.rs` construct the registry
+      with `SkillRegistry::load(&config.skills)` instead of the empty
+      `SkillRegistry::new()`. `MasterAgent` already resolved skills per request
+      and passed them to the planner; with the registry loaded, they activate.
+
+Live verification (both on this Mac mini, qwen3.5:9b via Ollama):
+
+```text
+skill.toml with trigger "demo", require_confirmation = true
+hive task --local --deny-flagged -d "demo: list the files in this directory"
+  → Complexity: SIMPLE → local; plan produced
+  → step [0] `ls -la` gated with:
+      Reason: skill 'demo-skill' requires confirmation before running
+  → REJECTED (--deny-flagged); nothing executed
+hive task --local --deny-flagged -d "list the files in this directory"   (no trigger)
+  → no skill active; `ls -la` not gated; executed
+```
+
+Not built, deliberately: `hive skills <add|remove>` authoring commands —
+skills are a handful of hand-written TOML files in a user-owned directory,
+and an authoring UI did not earn its complexity yet.
 
 ---
 

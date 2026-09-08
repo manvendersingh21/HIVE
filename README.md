@@ -128,12 +128,12 @@ from environment variables, never committed configuration.
 - General chat still follows a command-plan interface rather than a complete
   conversational-answer interface. Browser chat does not currently select a
   project for memory. Do not assume all web chats are remembered.
-- The skill engine (TOML loader, trigger matching, LLM disambiguation,
-  per-skill provider override) is implemented and unit-tested, but registries
-  are not loaded at startup: agents run with an empty skill set, so no skill
-  can activate. `hive skills list` shows what is on disk and warns about this.
-  Some parsed configuration keys (e.g. `[finetune] auto_collect`) are not
-  effective runtime settings; do not treat parsing tests as proof that an
+- Skills activate at request time (trigger matching, optional LLM
+  disambiguation) after being loaded from `skills.directory` at startup; a
+  skill edited after startup needs a restart to take effect. Authoring
+  commands (`hive skills add/remove`) are not built — skills are hand-written
+  TOML. Some parsed configuration keys (e.g. `[finetune] auto_collect`) are
+  not effective runtime settings; do not treat parsing tests as proof that an
   operational setting takes effect.
 - Fine-tuning data collection and export are not implemented;
   `hive finetune export` reports this rather than exporting anything.

@@ -112,10 +112,14 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
     let workers = WorkerPool::new(workers_config.workers);
 
     let memory = MemorySystem::open(config.database.resolved_path(), &config);
+    // Loaded, not empty: the web chat resolves skills at request time; a
+    // `require_confirmation` skill gates its steps through the same approval
+    // flow (POST /api/chat/{run_id}/approve) as the Tier-1 rules.
+    let skills = SkillRegistry::load(&config.skills);
     let agent = MasterAgent::with_watchdog_config(
         llm,
         workers,
-        SkillRegistry::new(),
+        skills,
         memory,
         config.watchdog,
     )

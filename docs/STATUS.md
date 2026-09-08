@@ -1280,3 +1280,27 @@ No shipped-feature claim was found to overstate the code; the two inaccuracies
 both understated what exists. CI at `37e1564` is green on both runners after
 the portability fix (test harness process group, Python 3.13 empty-suite exit
 code) recorded earlier in this file's sibling commits.
+
+### Skills wiring closed — 2026-09-08, later the same day
+
+The audit above left one engineering gap: entry points built the skill
+registry empty, so the engine could never activate. `hive-cli` and `hive-web`
+now construct it with `SkillRegistry::load(&config.skills)`; `MasterAgent`'s
+per-request `resolve()` and the planner's per-call provider override were
+already in place, and `require_confirmation` already routed skill steps
+through the existing approval gate. Verified live on this Mac mini
+(qwen3.5:9b via Ollama), pasted output rather than summary:
+
+```text
+hive task --local --deny-flagged -d "demo: list the files in this directory"
+  → plan produced; step [0] `ls -la` gated with
+      Reason: skill 'demo-skill' requires confirmation before running
+    → REJECTED (--deny-flagged); nothing executed
+hive task --local --deny-flagged -d "list the files in this directory"
+  → no skill active; same command not gated; executed
+cargo test --workspace --locked                              -> 420 passed, 0 failed
+```
+
+Phase 7 is ✅ in the roadmap. Fine-tuning (Phase 8) remains a deliberate
+stub: it needs schema and design decisions in the same SQLite substrate the
+memory system depends on, and that work is not rushed in ahead of a release.

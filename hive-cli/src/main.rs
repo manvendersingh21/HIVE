@@ -213,11 +213,12 @@ async fn main() -> anyhow::Result<()> {
                             skill.patterns.join(", ")
                         );
                     }
-                    // The registry the agents run with is still constructed empty;
-                    // listing what is on disk is not the same as it being active.
+                    // The listing and the agents read the same directory:
+                    // `hive chat`/`task` and the web agent load this registry
+                    // at startup. A skill edited after startup needs a restart.
                     println!(
-                        "\nNote: skills are not yet loaded into running agents — \
-                         activation wiring is pending (see docs/ROADMAP.md Phase 7)."
+                        "\nThese skills are active: hive chat/task and the web \
+                         agent load this directory at startup."
                     );
                 }
                 Ok(())
@@ -256,7 +257,10 @@ async fn build_agent(project_root: &Path) -> anyhow::Result<MasterAgent> {
     let llm = LlmRouter::from_config(&config.llm);
     let workers = WorkerPool::new(workers_config.workers);
     workers.refresh_health().await;
-    let skills = SkillRegistry::new();
+    // Loaded, not empty: skills resolve at request time (trigger match + LLM
+    // disambiguation), and a `require_confirmation` skill gates every local
+    // step it produces through the same approval flow as the Tier-1 rules.
+    let skills = SkillRegistry::load(&config.skills);
     // Opened on the configured path, not `new()`: the in-memory constructor
     // was the M4 trap — an agent built on it forgets everything between
     // invocations while appearing to work, which is the most expensive kind
