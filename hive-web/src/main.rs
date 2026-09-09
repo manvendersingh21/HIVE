@@ -95,11 +95,9 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
 
     let llm = LlmRouter::from_config(&config.llm);
 
-    // The same binary runs on workers, which ship a copy of the config but no
-    // Ollama. Probe rather than trusting the config, so a host without a local
-    // model serves terminals and says so, instead of offering a chat that
-    // fails on the first message.
-    if !llm.local_available().await {
+    // Legacy deployments without Ollama serve terminals only. Cloud-only
+    // deployments enable chat without probing a local inference server.
+    if llm.uses_local_startup() && !llm.local_available().await {
         info!("local model unreachable — serving terminals only, chat disabled");
         return chat::AgentHandle::disabled();
     }
@@ -116,14 +114,8 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
     // `require_confirmation` skill gates its steps through the same approval
     // flow (POST /api/chat/{run_id}/approve) as the Tier-1 rules.
     let skills = SkillRegistry::load(&config.skills);
-    let agent = MasterAgent::with_watchdog_config(
-        llm,
-        workers,
-        skills,
-        memory,
-        config.watchdog,
-    )
-    .with_master_name(master_name);
+    let agent = MasterAgent::with_watchdog_config(llm, workers, skills, memory, config.watchdog)
+        .with_master_name(master_name);
 
     let agent = std::sync::Arc::new(agent);
 
@@ -252,7 +244,10 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
 #[cfg(test)]
 mod router_tests {
     use super::*;
-    use axum::{body::Body, http::{header, Request}};
+    use axum::{
+        body::Body,
+        http::{header, Request},
+    };
     use hive_core::watchdog::incidents::IncidentStore;
     use tower::ServiceExt;
 
@@ -266,29 +261,73 @@ mod router_tests {
             incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()),
         };
         let app = app_router(state, concat!(env!("CARGO_MANIFEST_DIR"), "/static"));
-        for path in ["/", "/sessions", "/incidents", "/index.html", "/chat.html", "/incidents.html", "/machines.html", "/terminal.html"] {
-            let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        for path in [
+            "/",
+            "/sessions",
+            "/incidents",
+            "/index.html",
+            "/chat.html",
+            "/incidents.html",
+            "/machines.html",
+            "/terminal.html",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
             assert_eq!(response.headers()[header::LOCATION], "/login", "{path}");
         }
-        for path in ["/api/sessions", "/api/incidents", "/api/machines", "/ws/test"] {
-            let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        for path in [
+            "/api/sessions",
+            "/api/incidents",
+            "/api/machines",
+            "/ws/test",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
         }
         for path in ["/login", "/api/health"] {
-            let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
-        let login = app.clone().oneshot(Request::post("/login")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from("password=test-password")).unwrap()).await.unwrap();
+        let login = app
+            .clone()
+            .oneshot(
+                Request::post("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("password=test-password"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(login.status(), StatusCode::SEE_OTHER);
-        let cookie = login.headers()[header::SET_COOKIE].to_str().unwrap()
-            .split(';').next().unwrap();
+        let cookie = login.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
         for path in ["/index.html", "/chat.html", "/incidents.html"] {
-            let response = app.clone().oneshot(Request::get(path)
-                .header(header::COOKIE, cookie)
-                .body(Body::empty()).unwrap()).await.unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "authenticated {path}");
         }
     }

@@ -19,4 +19,5 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked --no-run
       - run: cargo test --workspace --locked
+      - run: python3 scripts/check-nvidia.py
       - run: git diff --check

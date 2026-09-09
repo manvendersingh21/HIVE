@@ -81,7 +81,13 @@ fn default_master_listen_addr() -> String {
 /// LLM provider configurations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
+    /// When set, overrides all routing and disables provider fallback.
+    #[serde(default)]
+    pub single_provider: Option<crate::AiProvider>,
+    #[serde(default)]
+    pub nvidia: NvidiaConfig,
     /// Local LLM (Ollama) configuration.
+    #[serde(default)]
     pub local: LocalLlmConfig,
     /// Google Gemini configuration.
     #[serde(default)]
@@ -92,6 +98,23 @@ pub struct LlmConfig {
     /// OpenAI Codex configuration.
     #[serde(default)]
     pub codex: Option<CloudLlmConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NvidiaConfig {
+    pub model: String,
+    pub base_url: String,
+    pub timeout_secs: u64,
+}
+impl Default for NvidiaConfig {
+    fn default() -> Self {
+        Self {
+            model: "nvidia/nemotron-3-ultra-550b-a55b".into(),
+            base_url: "https://integrate.api.nvidia.com/v1".into(),
+            timeout_secs: 120,
+        }
+    }
 }
 
 /// Configuration for the local LLM (Ollama).
@@ -109,6 +132,17 @@ pub struct LocalLlmConfig {
     /// Maximum context window size in tokens.
     #[serde(default = "default_max_context")]
     pub max_context: u32,
+}
+
+impl Default for LocalLlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_provider(),
+            model: default_local_model(),
+            base_url: default_ollama_url(),
+            max_context: default_max_context(),
+        }
+    }
 }
 
 fn default_provider() -> String {
@@ -248,13 +282,23 @@ fn default_true_bool() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingProvider {
+    #[serde(alias = "ollama")]
+    Local,
+    Nvidia,
+}
+
 /// Memory / knowledge system settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
+    #[serde(default)]
+    pub embedding_provider: Option<EmbeddingProvider>,
     /// Whether to auto-index conversations on completion.
     #[serde(default = "default_true_bool")]
     pub auto_index: bool,
-    /// Embedding model name (run via Ollama).
+    /// Embedding model name for the selected embedding provider.
     #[serde(default = "default_embed_model")]
     pub embedding_model: String,
     /// Tokens per RAG chunk.
@@ -275,6 +319,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             auto_index: default_true_bool(),
+            embedding_provider: None,
             embedding_model: default_embed_model(),
             chunk_size: default_chunk_size(),
             chunk_overlap: default_chunk_overlap(),
@@ -474,6 +519,19 @@ impl WorkersConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvidia_only_routing_and_legacy_defaults() {
+        let legacy: LlmConfig = toml::from_str("[local]\nmodel = 'existing'").unwrap();
+        assert!(legacy.single_provider.is_none());
+        assert_eq!(legacy.local.model, "existing");
+        let cloud: LlmConfig = toml::from_str("single_provider = 'nvidia'").unwrap();
+        assert_eq!(cloud.single_provider, Some(crate::AiProvider::Nvidia));
+        assert_eq!(cloud.nvidia.model, "nvidia/nemotron-3-ultra-550b-a55b");
+        let memory: MemoryConfig = toml::from_str("embedding_provider = 'nvidia'").unwrap();
+        assert_eq!(memory.embedding_provider, Some(EmbeddingProvider::Nvidia));
+        assert!(toml::from_str::<MemoryConfig>("embedding_provider = 'claude'").is_err());
+    }
 
     #[test]
     fn test_default_db_path_expansion() {

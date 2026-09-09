@@ -3,6 +3,7 @@
 pub mod claude;
 pub mod gemini;
 pub mod local;
+pub mod nvidia;
 pub mod openai;
 
 pub use claude::ClaudeClient;
@@ -47,6 +48,7 @@ impl ChatMessage {
 /// The result of routing a request to a provider.
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
+    pub model: String,
     /// The provider's raw text response.
     pub text: String,
     /// Which provider actually produced it (may differ from the recommended
@@ -62,10 +64,13 @@ pub struct LlmResponse {
 /// - Complex → Claude
 /// - Code-heavy → Codex (OpenAI)
 ///
-/// Cloud providers are optional: if a provider isn't configured (no API key
-/// available), routing falls back to the local model rather than failing
-/// the whole request.
+/// In legacy mode, missing cloud providers fall back to the local model.
+/// Single-provider mode overrides every recommendation and skill override,
+/// and propagates errors without switching providers.
 pub struct LlmRouter {
+    single_provider: Option<AiProvider>,
+    nvidia: nvidia::NvidiaClient,
+    models: std::collections::HashMap<AiProvider, String>,
     local: OllamaClient,
     gemini: Option<GeminiClient>,
     claude: Option<ClaudeClient>,
@@ -76,6 +81,9 @@ impl LlmRouter {
     /// Create a router with only the local Ollama client configured.
     pub fn new(local_url: String, local_model: String) -> Self {
         Self {
+            models: [(AiProvider::Local, local_model.clone())].into(),
+            single_provider: None,
+            nvidia: nvidia::NvidiaClient::for_reasoning(&Default::default()),
             local: OllamaClient::new(local_url, local_model),
             gemini: None,
             claude: None,
@@ -119,7 +127,22 @@ impl LlmRouter {
             }
         });
 
+        let mut models = std::collections::HashMap::new();
+        models.insert(AiProvider::Local, cfg.local.model.clone());
+        models.insert(AiProvider::Nvidia, cfg.nvidia.model.clone());
+        for (provider, config) in [
+            (AiProvider::GeminiFlash, &cfg.gemini),
+            (AiProvider::Claude, &cfg.claude),
+            (AiProvider::Codex, &cfg.codex),
+        ] {
+            if let Some(config) = config {
+                models.insert(provider, config.model.clone());
+            }
+        }
         Self {
+            single_provider: cfg.single_provider,
+            nvidia: nvidia::NvidiaClient::for_reasoning(&cfg.nvidia),
+            models,
             local,
             gemini,
             claude,
@@ -127,7 +150,7 @@ impl LlmRouter {
         }
     }
 
-    /// Classify the complexity of a task using the local LLM.
+    /// Classify using the single provider, or the local model in legacy mode.
     pub async fn classify_complexity(&self, task_description: &str) -> anyhow::Result<Complexity> {
         let prompt = format!(
             "Classify this task's complexity as SIMPLE, MEDIUM, COMPLEX, or CODE_HEAVY.\n\
@@ -140,15 +163,29 @@ impl LlmRouter {
              Respond with ONLY the classification word, nothing else."
         );
 
-        let raw = self.local.complete_raw(&prompt).await?;
+        let raw = self.local_complete(&prompt).await?;
         let complexity = Complexity::from_llm_output(&raw);
         tracing::info!("Classified '{task_description}' as {complexity}");
         Ok(complexity)
     }
 
-    /// Send a raw completion request to the local LLM.
+    /// Auxiliary completion: NVIDIA master model, or local in legacy mode.
     pub async fn local_complete(&self, prompt: &str) -> anyhow::Result<String> {
+        if let Some(provider) = self.single_provider {
+            if provider == AiProvider::Nvidia {
+                return Ok(self.nvidia.complete(prompt, "low").await?.text);
+            }
+            return Ok(self.complete_with(prompt, provider).await?.text);
+        }
         self.local.complete_raw(prompt).await
+    }
+
+    pub fn effective_provider(&self, provider: AiProvider) -> AiProvider {
+        self.single_provider.unwrap_or(provider)
+    }
+
+    pub fn uses_local_startup(&self) -> bool {
+        self.single_provider.is_none() || self.single_provider == Some(AiProvider::Local)
     }
 
     /// Route a prompt to the provider recommended for `complexity`, falling
@@ -170,17 +207,19 @@ impl LlmRouter {
 
     /// Run a prompt against one explicit provider.
     ///
-    /// Exists for per-skill `ai_provider` overrides: a skill names the model
-    /// it wants its *reasoning* done by, and that choice must not be
-    /// overruled by whatever complexity the classifier happened to assign.
-    /// Falls back to local exactly as routed execution does — a forced but
-    /// unconfigured provider degrades, it does not fail the request.
+    /// Skill overrides take precedence over complexity in legacy mode.
+    /// Single-provider mode takes precedence over both and disables fallback.
     pub async fn complete_with(
         &self,
         prompt: &str,
         provider: AiProvider,
     ) -> anyhow::Result<LlmResponse> {
+        let provider = self.effective_provider(provider);
+        if provider == AiProvider::Nvidia {
+            return self.nvidia.complete(prompt, "high").await;
+        }
         let result = match provider {
+            AiProvider::Nvidia => unreachable!(),
             AiProvider::Local => self.local.complete_raw(prompt).await,
             AiProvider::GeminiFlash => match &self.gemini {
                 Some(client) => client.complete(prompt).await,
@@ -203,8 +242,12 @@ impl LlmRouter {
         };
 
         match result {
-            Ok(text) => Ok(LlmResponse { text, provider }),
-            Err(e) if provider != AiProvider::Local => {
+            Ok(text) => Ok(LlmResponse {
+                text,
+                provider,
+                model: self.models.get(&provider).cloned().unwrap_or_default(),
+            }),
+            Err(e) if provider != AiProvider::Local && self.single_provider.is_none() => {
                 tracing::warn!(
                     "Provider {provider} unavailable ({e}), falling back to local model"
                 );
@@ -212,6 +255,11 @@ impl LlmRouter {
                 Ok(LlmResponse {
                     text,
                     provider: AiProvider::Local,
+                    model: self
+                        .models
+                        .get(&AiProvider::Local)
+                        .cloned()
+                        .unwrap_or_default(),
                 })
             }
             Err(e) => Err(e),

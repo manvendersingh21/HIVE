@@ -143,9 +143,10 @@ impl TaskCommand {
 // ---------------------------------------------------------------------------
 
 /// Which AI provider to use for reasoning about a task.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AiProvider {
+    Nvidia,
     /// Local LLM via Ollama (e.g., Qwen2.5-14B).
     Local,
     /// Google Gemini Flash — medium complexity tasks.
@@ -159,6 +160,7 @@ pub enum AiProvider {
 impl std::fmt::Display for AiProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            AiProvider::Nvidia => write!(f, "NVIDIA"),
             AiProvider::Local => write!(f, "local (Ollama)"),
             AiProvider::GeminiFlash => write!(f, "Gemini Flash"),
             AiProvider::Claude => write!(f, "Claude"),
@@ -562,6 +564,8 @@ pub enum IncidentReviewState {
 /// Response from the master agent after processing a user request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResponse {
+    #[serde(default)]
+    pub model: String,
     /// Summary of what was done / planned.
     pub summary: String,
     /// Active tmux sessions the user can access.

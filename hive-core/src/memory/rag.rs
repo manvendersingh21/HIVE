@@ -9,8 +9,7 @@
 //! on-disk ANN file — not pretending this is one.
 //!
 //! Embeddings are produced by whatever implements [`Embedder`] —
-//! [`OllamaClient`](crate::llm::local::OllamaClient) in production (model
-//! `memory.embedding_model`, default `nomic-embed-text`), [`HashEmbedder`] in
+//! The configured NVIDIA or Ollama embedding client in production, [`HashEmbedder`] in
 //! tests. Vectors are stored as little-endian f32 BLOBs beside their text.
 
 use std::sync::Arc;
@@ -23,10 +22,21 @@ use serde::{Deserialize, Serialize};
 #[async_trait]
 pub trait Embedder: Send + Sync {
     async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>>;
+    async fn embed_query(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        self.embed(input).await
+    }
+    fn provider(&self) -> &str;
+    fn model(&self) -> &str;
 }
 
 #[async_trait]
 impl Embedder for crate::llm::local::OllamaClient {
+    fn provider(&self) -> &str {
+        "ollama"
+    }
+    fn model(&self) -> &str {
+        self.model_name()
+    }
     async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
         // `OllamaClient::embed` sends the model it was constructed with, so
         // the RAG index builds its client with `memory.embedding_model`, not
@@ -34,6 +44,39 @@ impl Embedder for crate::llm::local::OllamaClient {
         // interchangeable vector spaces.
         crate::llm::local::OllamaClient::embed(self, input).await
     }
+}
+
+#[async_trait]
+impl Embedder for crate::llm::nvidia::NvidiaClient {
+    async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        self.embed(input, "passage").await
+    }
+    async fn embed_query(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        self.embed(input, "query").await
+    }
+    fn provider(&self) -> &str {
+        "nvidia"
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+/// Add space metadata conservatively: old vectors have unknown provenance.
+pub(crate) fn migrate_space(conn: &Connection, table: &str) -> anyhow::Result<()> {
+    let columns: Vec<String> = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get(1))?
+        .collect::<Result<_, _>>()?;
+    for column in ["provider", "model", "source"] {
+        if !columns.iter().any(|c| c == column) {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Deterministic bag-of-words embedder for tests.
@@ -49,6 +92,12 @@ pub struct HashEmbedder {
 
 #[async_trait]
 impl Embedder for HashEmbedder {
+    fn provider(&self) -> &str {
+        "test"
+    }
+    fn model(&self) -> &str {
+        "hash-v1"
+    }
     async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
         Ok(hash_embed(input, self.dim))
     }
@@ -118,6 +167,11 @@ impl RagIndex {
                      ON rag_chunks(conversation_id);",
             )?;
         }
+        {
+            let db = conn.lock().unwrap();
+            migrate_space(&db, "rag_chunks")?;
+            db.execute_batch("CREATE TABLE IF NOT EXISTS rag_indexed (conversation_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);")?;
+        }
         Ok(Self {
             conn,
             embedder,
@@ -178,9 +232,7 @@ impl RagIndex {
         transcript: &str,
     ) -> anyhow::Result<usize> {
         let chunks = self.chunk_text(transcript);
-        if chunks.is_empty() {
-            return Ok(0);
-        }
+        let fingerprint = self.fingerprint(transcript);
         // Embed before deleting the old rows: if the embedder fails midway
         // the previous index survives intact rather than leaving the
         // conversation half-indexed.
@@ -189,7 +241,8 @@ impl RagIndex {
             embedded.push((chunk, self.embedder.embed(chunk).await?));
         }
         {
-            let conn = self.conn.lock().unwrap();
+            let mut db = self.conn.lock().unwrap();
+            let conn = db.transaction()?;
             conn.execute(
                 "DELETE FROM rag_chunks WHERE conversation_id = ?1",
                 params![conversation_id],
@@ -197,18 +250,23 @@ impl RagIndex {
             for (i, (text, vec)) in embedded.iter().enumerate() {
                 conn.execute(
                     "INSERT INTO rag_chunks
-                         (project_id, conversation_id, chunk_index, text, embedding, dim)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                         (project_id, conversation_id, chunk_index, text, embedding, dim, provider, model)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         project_id,
                         conversation_id,
                         i as i64,
                         text,
                         encode_f32(vec),
-                        vec.len() as i64
+                        vec.len() as i64, self.embedder.provider(), self.embedder.model()
                     ],
                 )?;
             }
+            conn.execute(
+                "INSERT OR REPLACE INTO rag_indexed VALUES (?1, ?2)",
+                params![conversation_id, fingerprint],
+            )?;
+            conn.commit()?;
         }
         Ok(chunks.len())
     }
@@ -222,22 +280,30 @@ impl RagIndex {
         query: &str,
         top_k: usize,
     ) -> anyhow::Result<Vec<RagHit>> {
-        let query_vec = self.embedder.embed(query).await?;
+        let query_vec = self.embedder.embed_query(query).await?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT project_id, conversation_id, text, embedding, dim FROM rag_chunks
-             WHERE (?1 IS NULL OR project_id = ?1)",
+             WHERE (?1 IS NULL OR project_id = ?1) AND provider = ?2 AND model = ?3 AND dim = ?4",
         )?;
-        let rows = stmt.query_map(params![project_id], |r| {
-            let blob: Vec<u8> = r.get(3)?;
-            let dim: i64 = r.get(4)?;
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                decode_f32(&blob, dim as usize),
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                self.embedder.provider(),
+                self.embedder.model(),
+                query_vec.len()
+            ],
+            |r| {
+                let blob: Vec<u8> = r.get(3)?;
+                let dim: i64 = r.get(4)?;
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    decode_f32(&blob, dim as usize),
+                ))
+            },
+        )?;
         let mut hits: Vec<RagHit> = rows
             .filter_map(|row| row.ok())
             .map(|(project_id, conversation_id, text, vec)| RagHit {
@@ -247,9 +313,36 @@ impl RagIndex {
                 score: cosine(&query_vec, &vec),
             })
             .collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(top_k);
         Ok(hits)
+    }
+
+    fn fingerprint(&self, text: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "{}:{}:{}:{}:{text}",
+                self.embedder.provider(),
+                self.embedder.model(),
+                self.chunk_tokens,
+                self.overlap_tokens
+            ))
+        )
+    }
+
+    pub fn is_current(&self, conversation: &str, text: &str) -> anyhow::Result<bool> {
+        let db = self.conn.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT COUNT(*) FROM rag_indexed WHERE conversation_id = ?1 AND fingerprint = ?2",
+            params![conversation, self.fingerprint(text)],
+            |r| r.get::<_, i64>(0),
+        )? > 0)
     }
 
     /// Chunk count for `hive memory`'s status view.
@@ -263,7 +356,10 @@ impl RagIndex {
 /// Cosine similarity; zero when either vector has zero magnitude (an empty
 /// or all-stopword text must not produce NaN scores that sort unpredictably).
 pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let n = a.len();
     let dot: f32 = a[..n].iter().zip(&b[..n]).map(|(x, y)| x * y).sum();
     let na: f32 = a[..n].iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b[..n].iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -350,7 +446,12 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = r.search(Some("webapp"), "which database did we pick? postgres sqlite", 2)
+        let hits = r
+            .search(
+                Some("webapp"),
+                "which database did we pick? postgres sqlite",
+                2,
+            )
             .await
             .unwrap();
         assert!(!hits.is_empty());
@@ -361,8 +462,12 @@ mod tests {
     #[tokio::test]
     async fn search_stays_project_scoped() {
         let r = rag();
-        r.index_conversation("alpha", "c1", "postgres migration notes").await.unwrap();
-        r.index_conversation("beta", "c2", "postgres migration notes").await.unwrap();
+        r.index_conversation("alpha", "c1", "postgres migration notes")
+            .await
+            .unwrap();
+        r.index_conversation("beta", "c2", "postgres migration notes")
+            .await
+            .unwrap();
 
         let hits = r.search(Some("alpha"), "postgres", 10).await.unwrap();
         assert!(hits.iter().all(|h| h.project_id == "alpha"));
@@ -373,8 +478,12 @@ mod tests {
     #[tokio::test]
     async fn reindexing_replaces_rather_than_duplicates() {
         let r = rag();
-        r.index_conversation("p", "c", "first version of the transcript").await.unwrap();
-        r.index_conversation("p", "c", "second version of the transcript").await.unwrap();
+        r.index_conversation("p", "c", "first version of the transcript")
+            .await
+            .unwrap();
+        r.index_conversation("p", "c", "second version of the transcript")
+            .await
+            .unwrap();
         assert_eq!(r.chunk_count().unwrap(), 1);
         let hits = r.search(Some("p"), "second version", 5).await.unwrap();
         assert!(hits[0].text.contains("second"));
@@ -385,8 +494,7 @@ mod tests {
         assert_eq!(cosine(&[0.0, 0.0], &[1.0, 2.0]), 0.0);
         assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
         assert!((cosine(&[1.0, 0.0], &[0.0, 1.0]) - 0.0).abs() < 1e-6);
-        // Different dims (an embedding-model swap left old rows): compare the
-        // shared prefix rather than panicking.
-        assert!(cosine(&[1.0], &[1.0, 5.0, 5.0]).is_finite());
+        // Different dimensions must never be compared by shared prefix.
+        assert_eq!(cosine(&[1.0], &[1.0, 5.0, 5.0]), 0.0);
     }
 }

@@ -18,6 +18,8 @@ pub struct TaskPlan {
     /// model badge need the truth rather than the intent.
     #[serde(default = "default_provider")]
     pub provider_used: AiProvider,
+    #[serde(default)]
+    pub model_used: String,
 }
 
 /// The planner deserializes `TaskPlan` straight from model output, which never
@@ -176,7 +178,9 @@ impl Planner {
         let (skill_block, provider) = match skill {
             Some(s) => (
                 format!("{}\n\n", s.render_for_prompt()),
-                s.ai_provider.clone().unwrap_or_else(|| complexity.recommended_provider()),
+                s.ai_provider
+                    .clone()
+                    .unwrap_or_else(|| complexity.recommended_provider()),
             ),
             None => (String::new(), complexity.recommended_provider()),
         };
@@ -224,29 +228,23 @@ impl Planner {
 
         let response = llm.complete_with(&prompt, provider).await?;
 
-        match extract_plan(&response.text) {
-            Ok(mut plan) => {
-                plan.provider_used = response.provider;
-                Ok(plan)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Planner couldn't parse a JSON plan ({e}), falling back to a single \
-                     no-op subtask for: {user_input}"
-                );
-                Ok(TaskPlan {
-                    summary: format!("Received: {user_input}"),
-                    subtasks: vec![SubTask {
-                        description: user_input.to_string(),
-                        requires_remote: false,
-                        commands: vec![],
-                        expected_behavior: None,
-                        required_capabilities: vec![],
-                    }],
-                    provider_used: response.provider,
-                })
-            }
-        }
+        let mut plan = extract_plan(&response.text)?;
+        anyhow::ensure!(
+            !plan.summary.trim().is_empty() && !plan.subtasks.is_empty(),
+            "empty plan rejected"
+        );
+        anyhow::ensure!(
+            plan.subtasks
+                .iter()
+                .all(|s| !s.description.trim().is_empty()
+                    && s.commands
+                        .iter()
+                        .all(|c| !c.trim().is_empty() && !c.contains('\0'))),
+            "invalid plan rejected"
+        );
+        plan.provider_used = response.provider;
+        plan.model_used = response.model;
+        Ok(plan)
     }
 }
 
@@ -315,14 +313,29 @@ mod tests {
     fn trailer_warns_about_the_right_userland_and_offers_replacements() {
         let mac = ctx("macos").trailer();
         assert!(mac.contains("BSD userland"));
-        assert!(mac.contains("manus-mac-mini"), "must name the machine commands land on");
-        assert!(mac.contains("find -printf"), "must enumerate the forbidden GNU flags");
-        assert!(mac.contains("stat -f"), "must offer the BSD replacement, not just a ban");
+        assert!(
+            mac.contains("manus-mac-mini"),
+            "must name the machine commands land on"
+        );
+        assert!(
+            mac.contains("find -printf"),
+            "must enumerate the forbidden GNU flags"
+        );
+        assert!(
+            mac.contains("stat -f"),
+            "must offer the BSD replacement, not just a ban"
+        );
 
         let linux = ctx("ubuntu").trailer();
         assert!(linux.contains("GNU/Linux userland"));
-        assert!(linux.contains("stat -f"), "must name the forbidden BSD flag");
-        assert!(linux.contains("--sort=-rss"), "must offer the GNU replacement");
+        assert!(
+            linux.contains("stat -f"),
+            "must name the forbidden BSD flag"
+        );
+        assert!(
+            linux.contains("--sort=-rss"),
+            "must offer the GNU replacement"
+        );
     }
 
     #[test]

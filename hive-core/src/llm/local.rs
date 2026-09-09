@@ -54,6 +54,9 @@ struct EmbedResponse {
 }
 
 impl OllamaClient {
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
     /// Create a new client pointed at `base_url` (e.g. `http://localhost:11434`).
     pub fn new(base_url: String, model: String) -> Self {
         Self {
