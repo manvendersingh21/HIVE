@@ -1,12 +1,6 @@
 //! Knowledge extraction — turn a transcript into graph entities and edges.
 //!
-//! Runs the **local** model only (`OllamaClient`, never
-//! [`LlmRouter::route_and_execute`]): extraction fires after every completed
-//! conversation, continuously and without a human in the loop, and the same
-//! reasoning that keeps the watchdog's Tier-2 review local applies here with
-//! more force — a background job must not bill a cloud provider per
-//! conversation. A weak extraction is recoverable (the next conversation
-//! re-extracts); a surprise API bill is not.
+//! Uses the configured master provider for extraction and passage embeddings for dedup.
 //!
 //! Every failure here is soft: an unreachable model, unparseable JSON, or a
 //! failed embedding degrades to "nothing extracted this time" and the turn
@@ -32,6 +26,13 @@ pub trait Completer: Send + Sync {
 impl Completer for crate::llm::local::OllamaClient {
     async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
         self.complete_raw(prompt).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Completer for crate::llm::LlmRouter {
+    async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+        self.local_complete(prompt).await
     }
 }
 
@@ -97,7 +98,7 @@ pub async fn extract_and_store(
     let response = match completer.complete(&prompt).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(error = %e, "knowledge extraction skipped: local model unavailable");
+            tracing::warn!(error = %e, "knowledge extraction skipped: master model unavailable");
             return Ok(ExtractionOutcome::default());
         }
     };
@@ -109,10 +110,11 @@ pub async fn extract_and_store(
     let mut outcome = ExtractionOutcome::default();
 
     // Existing project entities with their embeddings, for dedup.
-    let existing = load_project_embeddings(conn, project_id)?;
+    let existing = load_project_embeddings(conn, project_id, embedder)?;
 
     // name (lowercased) -> final entity id, for relation endpoint mapping.
-    let mut name_to_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut name_to_id: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for candidate in extraction.entities.into_iter().take(max_entities) {
         let name = candidate.name.trim().to_string();
@@ -128,10 +130,14 @@ pub async fn extract_and_store(
 
         // Dedup: nearest existing embedding above the threshold wins.
         let mut merged_into: Option<String> = None;
-        if let Ok(vec) = embedder.embed(&text).await {
+        let candidate_vec = embedder.embed(&text).await.ok();
+        if let Some(vec) = &candidate_vec {
             let mut best: Option<(f32, &str)> = None;
             for (id, existing_vec) in &existing {
-                let score = cosine(&vec, existing_vec);
+                if vec.len() != existing_vec.len() {
+                    continue;
+                }
+                let score = cosine(vec, existing_vec);
                 if best.map(|(b, _)| score > b).unwrap_or(true) {
                     best = Some((score, id.as_str()));
                 }
@@ -149,14 +155,19 @@ pub async fn extract_and_store(
                 // mention is the more current one, and stale knowledge is
                 // worse than none.
                 if let Ok(Some(mut entity)) = kg.entity(&id) {
-                    entity
-                        .attrs
-                        .as_object_mut()
-                        .map(|m| m.insert("description".into(), candidate.description.clone().into()));
-                    let _ = kg.upsert_entity_scoped(project_id, &entity);
+                    entity.attrs.as_object_mut().map(|m| {
+                        m.insert("description".into(), candidate.description.clone().into())
+                    });
+                    kg.upsert_entity_scoped(project_id, &entity)?;
+                    let source = format!("{}: {}", entity.name, candidate.description);
+                    if let Ok(vec) = embedder.embed(&source).await {
+                        store_embedding(conn, &id, project_id, &vec, embedder, &source)?;
+                    }
                 }
                 outcome.entities_merged += 1;
-                name_to_id.entry(name.to_lowercase()).or_insert_with(|| id.clone());
+                name_to_id
+                    .entry(name.to_lowercase())
+                    .or_insert_with(|| id.clone());
             }
             None => {
                 let id = scoped_entity_id(project_id, &kind, &name);
@@ -171,8 +182,8 @@ pub async fn extract_and_store(
                     attrs: serde_json::Value::Object(attrs),
                 };
                 kg.upsert_entity_scoped(project_id, &entity)?;
-                if let Ok(vec) = embedder.embed(&text).await {
-                    let _ = store_embedding(conn, &id, project_id, &vec);
+                if let Some(vec) = &candidate_vec {
+                    let _ = store_embedding(conn, &id, project_id, vec, embedder, &text);
                 }
                 outcome.entities_created += 1;
                 name_to_id.entry(entity.name.to_lowercase()).or_insert(id);
@@ -248,7 +259,7 @@ fn normalize_relation(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn create_table(conn: &Arc<std::sync::Mutex<Connection>>) -> anyhow::Result<()> {
+pub(crate) fn create_table(conn: &Arc<std::sync::Mutex<Connection>>) -> anyhow::Result<()> {
     let conn = conn.lock().unwrap();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS kg_embeddings (
@@ -258,6 +269,7 @@ fn create_table(conn: &Arc<std::sync::Mutex<Connection>>) -> anyhow::Result<()> 
              dim        INTEGER NOT NULL
          );",
     )?;
+    crate::memory::rag::migrate_space(&conn, "kg_embeddings")?;
     Ok(())
 }
 
@@ -266,32 +278,38 @@ type ExistingEmbeddings = Vec<(String, Vec<f32>)>;
 fn load_project_embeddings(
     conn: &Arc<std::sync::Mutex<Connection>>,
     project_id: &str,
+    embedder: &dyn Embedder,
 ) -> anyhow::Result<ExistingEmbeddings> {
     let conn = conn.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT k.entity_id, k.embedding, k.dim FROM kg_embeddings k
          JOIN entities e ON e.id = k.entity_id
-         WHERE k.project_id = ?1 AND e.project_id = ?1",
+         WHERE k.project_id = ?1 AND e.project_id = ?1 AND k.provider = ?2 AND k.model = ?3",
     )?;
-    let rows = stmt.query_map(params![project_id], |r| {
-        let blob: Vec<u8> = r.get(1)?;
-        let dim: i64 = r.get(2)?;
-        Ok((
-            r.get::<_, String>(0)?,
-            blob.chunks_exact(4)
-                .take(dim as usize)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect::<Vec<f32>>(),
-        ))
-    })?;
+    let rows = stmt.query_map(
+        params![project_id, embedder.provider(), embedder.model()],
+        |r| {
+            let blob: Vec<u8> = r.get(1)?;
+            let dim: i64 = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                blob.chunks_exact(4)
+                    .take(dim as usize)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect::<Vec<f32>>(),
+            ))
+        },
+    )?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-fn store_embedding(
+pub(crate) fn store_embedding(
     conn: &Arc<std::sync::Mutex<Connection>>,
     entity_id: &str,
     project_id: &str,
     vec: &[f32],
+    embedder: &dyn Embedder,
+    source: &str,
 ) -> anyhow::Result<()> {
     let mut blob = Vec::with_capacity(vec.len() * 4);
     for f in vec {
@@ -299,11 +317,11 @@ fn store_embedding(
     }
     let conn = conn.lock().unwrap();
     conn.execute(
-        "INSERT INTO kg_embeddings (entity_id, project_id, embedding, dim)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO kg_embeddings (entity_id, project_id, embedding, dim, provider, model, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(entity_id) DO UPDATE SET
-             embedding = excluded.embedding, dim = excluded.dim",
-        params![entity_id, project_id, blob, vec.len() as i64],
+             embedding = excluded.embedding, dim = excluded.dim, provider = excluded.provider, model = excluded.model, source = excluded.source",
+        params![entity_id, project_id, blob, vec.len() as i64, embedder.provider(), embedder.model(), source],
     )?;
     Ok(())
 }
@@ -328,17 +346,66 @@ mod tests {
         }
     }
 
-    fn setup() -> (KnowledgeGraph, Arc<std::sync::Mutex<Connection>>, Arc<dyn Embedder>) {
+    fn setup() -> (
+        KnowledgeGraph,
+        Arc<std::sync::Mutex<Connection>>,
+        Arc<dyn Embedder>,
+    ) {
         let kg = KnowledgeGraph::in_memory().unwrap();
         let conn = kg.shared_conn();
         (kg, conn, Arc::new(HashEmbedder { dim: 128 }))
     }
 
     #[tokio::test]
+    async fn dedup_never_merges_different_spaces_even_at_zero_threshold() {
+        for mismatch in ["model", "provider", "dimensions"] {
+            let (kg, conn, embedder) = setup();
+            let first =
+                r#"{"entities":[{"name":"postgres","kind":"tool","description":"database"}]}"#;
+            extract_and_store(
+                &kg,
+                &conn,
+                embedder.as_ref(),
+                &FixedCompleter(first.into()),
+                20,
+                0.85,
+                "p",
+                "t",
+            )
+            .await
+            .unwrap();
+            let sql = match mismatch {
+                "model" => "UPDATE kg_embeddings SET model = 'another'",
+                "provider" => "UPDATE kg_embeddings SET provider = 'another'",
+                _ => "UPDATE kg_embeddings SET dim = 1",
+            };
+            conn.lock().unwrap().execute(sql, []).unwrap();
+            let second =
+                r#"{"entities":[{"name":"sqlite","kind":"tool","description":"database"}]}"#;
+            let out = extract_and_store(
+                &kg,
+                &conn,
+                embedder.as_ref(),
+                &FixedCompleter(second.into()),
+                20,
+                0.0,
+                "p",
+                "t",
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.entities_merged, 0, "{mismatch}");
+            assert_eq!(out.entities_created, 1, "{mismatch}");
+        }
+    }
+
+    #[tokio::test]
     async fn extracts_creates_and_links_entities() {
         let (kg, conn, embedder) = setup();
         let out = extract_and_store(
-            &kg, &conn, embedder.as_ref(),
+            &kg,
+            &conn,
+            embedder.as_ref(),
             &FixedCompleter(
                 r#"{"entities":[
                      {"name":"postgres","kind":"tool","description":"the chosen database"},
@@ -347,13 +414,22 @@ mod tests {
                    "relations":[{"from":"nightly cron","relation":"Writes To","to":"postgres"}]}"#
                     .into(),
             ),
-            20, 0.85, "webapp",
+            20,
+            0.85,
+            "webapp",
             "we picked postgres; the nightly cron writes to it",
         )
         .await
         .unwrap();
 
-        assert_eq!(out, ExtractionOutcome { entities_created: 2, entities_merged: 0, relations_added: 1 });
+        assert_eq!(
+            out,
+            ExtractionOutcome {
+                entities_created: 2,
+                entities_merged: 0,
+                relations_added: 1
+            }
+        );
         assert_eq!(kg.entities_in_project("webapp").unwrap().len(), 2);
         let edges = kg
             .edges_from(&scoped_entity_id("webapp", "error", "nightly cron"))
@@ -367,13 +443,31 @@ mod tests {
     async fn near_duplicate_entities_merge_instead_of_duplicating() {
         let (kg, conn, embedder) = setup();
         let json = r#"{"entities":[{"name":"postgres","kind":"tool","description":"postgres database choice"}]}"#;
-        extract_and_store(&kg, &conn, embedder.as_ref(), &FixedCompleter(json.into()), 20, 0.85, "p", "t")
-            .await
-            .unwrap();
+        extract_and_store(
+            &kg,
+            &conn,
+            embedder.as_ref(),
+            &FixedCompleter(json.into()),
+            20,
+            0.85,
+            "p",
+            "t",
+        )
+        .await
+        .unwrap();
         // Same text -> cosine 1.0 -> merge, not a second entity.
-        let out = extract_and_store(&kg, &conn, embedder.as_ref(), &FixedCompleter(json.into()), 20, 0.85, "p", "t")
-            .await
-            .unwrap();
+        let out = extract_and_store(
+            &kg,
+            &conn,
+            embedder.as_ref(),
+            &FixedCompleter(json.into()),
+            20,
+            0.85,
+            "p",
+            "t",
+        )
+        .await
+        .unwrap();
         assert_eq!(out.entities_merged, 1);
         assert_eq!(kg.entities_in_project("p").unwrap().len(), 1);
     }
@@ -385,9 +479,18 @@ mod tests {
             .map(|i| format!(r#"{{"name":"thing {i}","kind":"concept","description":"unique content number {i} various words {i}"}}"#))
             .collect();
         let json = format!(r#"{{"entities":[{}],"relations":[]}}"#, many.join(","));
-        let out = extract_and_store(&kg, &conn, embedder.as_ref(), &FixedCompleter(json), 5, 0.99, "p", "t")
-            .await
-            .unwrap();
+        let out = extract_and_store(
+            &kg,
+            &conn,
+            embedder.as_ref(),
+            &FixedCompleter(json),
+            5,
+            0.99,
+            "p",
+            "t",
+        )
+        .await
+        .unwrap();
         assert_eq!(out.entities_created, 5, "cap enforced after parsing");
     }
 
@@ -395,12 +498,18 @@ mod tests {
     async fn relations_to_unknown_entities_are_dropped() {
         let (kg, conn, embedder) = setup();
         let out = extract_and_store(
-            &kg, &conn, embedder.as_ref(),
+            &kg,
+            &conn,
+            embedder.as_ref(),
             &FixedCompleter(
                 r#"{"entities":[{"name":"a","kind":"concept","description":"a thing"}],
-                   "relations":[{"from":"a","relation":"uses","to":"ghost"}]}"#.into(),
+                   "relations":[{"from":"a","relation":"uses","to":"ghost"}]}"#
+                    .into(),
             ),
-            20, 0.85, "p", "t",
+            20,
+            0.85,
+            "p",
+            "t",
         )
         .await
         .unwrap();
@@ -426,9 +535,18 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_model_is_a_no_op_not_an_error() {
         let (kg, conn, embedder) = setup();
-        let out = extract_and_store(&kg, &conn, embedder.as_ref(), &FailingCompleter, 20, 0.85, "p", "t")
-            .await
-            .unwrap();
+        let out = extract_and_store(
+            &kg,
+            &conn,
+            embedder.as_ref(),
+            &FailingCompleter,
+            20,
+            0.85,
+            "p",
+            "t",
+        )
+        .await
+        .unwrap();
         assert_eq!(out, ExtractionOutcome::default());
     }
 
@@ -436,9 +554,14 @@ mod tests {
     async fn garbage_output_is_a_no_op_not_an_error() {
         let (kg, conn, embedder) = setup();
         let out = extract_and_store(
-            &kg, &conn, embedder.as_ref(),
+            &kg,
+            &conn,
+            embedder.as_ref(),
             &FixedCompleter("I could not parse that transcript, sorry.".into()),
-            20, 0.85, "p", "t",
+            20,
+            0.85,
+            "p",
+            "t",
         )
         .await
         .unwrap();

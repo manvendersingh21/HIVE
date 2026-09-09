@@ -201,10 +201,7 @@ pub enum SupervisorMsg {
     /// Everything the supervisor holds.
     List(RpcReplyPort<Vec<SupervisedSession>>),
     /// A watcher reporting its session changed state.
-    StateChanged {
-        session: String,
-        state: TaskState,
-    },
+    StateChanged { session: String, state: TaskState },
 }
 
 /// A handle to a running [`SessionSupervisor`]. Cloning shares the actor.
@@ -229,12 +226,9 @@ impl SupervisorHandle {
 
     /// Begin supervising a session.
     pub async fn supervise(&self, spec: SessionSpec) -> anyhow::Result<()> {
-        let outcome: Result<(), String> = ractor::call!(
-            self.actor,
-            SupervisorMsg::Supervise,
-            Box::new(spec)
-        )
-        .map_err(|e| anyhow::anyhow!("supervisor did not accept the session: {e}"))?;
+        let outcome: Result<(), String> =
+            ractor::call!(self.actor, SupervisorMsg::Supervise, Box::new(spec))
+                .map_err(|e| anyhow::anyhow!("supervisor did not accept the session: {e}"))?;
         outcome.map_err(|e| anyhow::anyhow!(e))
     }
 
@@ -252,8 +246,10 @@ impl SupervisorHandle {
 
     /// Stop the supervisor and, with it, every watcher it owns.
     pub fn shutdown(&self) {
-        self.actor.stop_children(Some("supervisor shutting down".to_string()));
-        self.actor.stop(Some("supervisor shutting down".to_string()));
+        self.actor
+            .stop_children(Some("supervisor shutting down".to_string()));
+        self.actor
+            .stop(Some("supervisor shutting down".to_string()));
     }
 }
 
@@ -534,6 +530,11 @@ async fn watch(args: WatchArgs) -> anyhow::Result<()> {
     poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consecutive_safe: u32 = 0;
     let mut recent_lines: Vec<String> = Vec::new();
+    // Owned future is dropped on every exit (including actor cancellation).
+    let mut pending: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = SafetyAnalysis> + Send>>,
+    > = None;
+    let mut last_reviewed = String::new();
 
     loop {
         // The select's result is bound before anything else runs, so `tap`'s
@@ -541,7 +542,8 @@ async fn watch(args: WatchArgs) -> anyhow::Result<()> {
         // suspend), and that cannot happen inside a select arm.
         let step = tokio::select! {
             line = tap.next_line() => Step::Line(line),
-            _ = poll_interval.tick(), if config.llm_analysis && !recent_lines.is_empty() => Step::Review,
+            _ = poll_interval.tick(), if config.llm_analysis && !recent_lines.is_empty() && pending.is_none() => Step::Review,
+            analysis = async { pending.as_mut().unwrap().await }, if pending.is_some() => Step::Reviewed(analysis),
         };
 
         match step {
@@ -587,9 +589,20 @@ async fn watch(args: WatchArgs) -> anyhow::Result<()> {
             }
 
             Step::Review => {
-                let analysis = watchdog
-                    .review(&llm, &expected_behavior, &recent_lines.join("\n"))
-                    .await;
+                let output = recent_lines.join("\n");
+                if output == last_reviewed {
+                    continue;
+                }
+                last_reviewed = output.clone();
+                let watchdog = watchdog.clone();
+                let llm = llm.clone();
+                let expected = expected_behavior.clone();
+                pending = Some(Box::pin(async move {
+                    watchdog.review(&llm, &expected, &output).await
+                }));
+            }
+            Step::Reviewed(analysis) => {
+                pending = None;
                 if !analysis.is_safe {
                     handle_incident(
                         tap.as_mut(),
@@ -620,6 +633,7 @@ async fn watch(args: WatchArgs) -> anyhow::Result<()> {
 enum Step {
     Line(anyhow::Result<Option<String>>),
     Review,
+    Reviewed(SafetyAnalysis),
 }
 
 /// Tell the supervisor a session moved state. Best-effort: if the supervisor
@@ -891,6 +905,127 @@ mod tests {
             .unwrap_or_else(|| panic!("'{name}' is not in the registry"))
     }
 
+    struct ReviewTap {
+        requests: crate::llm::nvidia::tests::Requests,
+        stage: u8,
+        finish: bool,
+        paused: Arc<Mutex<bool>>,
+    }
+    #[async_trait]
+    impl SessionTap for ReviewTap {
+        async fn next_line(&mut self) -> anyhow::Result<Option<String>> {
+            if self.stage == 0 {
+                self.stage = 1;
+                return Ok(Some("building".into()));
+            }
+            if self.stage == 1 {
+                loop {
+                    if !self.requests.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                self.stage = 2;
+                return Ok(Some(
+                    if self.finish {
+                        "__HIVE_DONE__0"
+                    } else {
+                        "rm -rf /"
+                    }
+                    .into(),
+                ));
+            }
+            std::future::pending().await
+        }
+        async fn pause(&mut self) -> anyhow::Result<PauseOutcome> {
+            *self.paused.lock().unwrap() = true;
+            Ok(PauseOutcome::Suspended)
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_cloud_review_does_not_block_rules_or_session_end() {
+        use crate::llm::nvidia::tests::{answer, router, server};
+        for finish in [false, true] {
+            let (url, requests, task) =
+                server(vec![(200, answer("{}"), Duration::from_secs(30))]).await;
+            let handle = SupervisorHandle::start(Arc::new(IncidentStore::in_memory().unwrap()))
+                .await
+                .unwrap();
+            let paused = Arc::new(Mutex::new(false));
+            handle
+                .supervise(SessionSpec {
+                    session: session("cloud"),
+                    ssh_target: "unused".into(),
+                    expected_behavior: "build".into(),
+                    tap: Box::new(ReviewTap {
+                        requests: requests.clone(),
+                        stage: 0,
+                        finish,
+                        paused: paused.clone(),
+                    }),
+                    llm: Arc::new(router(url)),
+                    watchdog: Arc::new(
+                        Watchdog::from_config(WatchdogConfig {
+                            llm_analysis: true,
+                            poll_interval_secs: 1,
+                            ..Default::default()
+                        })
+                        .unwrap(),
+                    ),
+                    alerts: sink(),
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                settle(&handle, |s| {
+                    s.iter().any(|s| {
+                        s.info.state
+                            == if finish {
+                                TaskState::Completed
+                            } else {
+                                TaskState::PausedByWatchdog
+                            }
+                    })
+                }),
+            )
+            .await
+            .expect("terminal monitoring blocked on cloud");
+            assert_eq!(*paused.lock().unwrap(), !finish);
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("pending review connection was not cancelled")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_terminal_output_is_reviewed_only_once() {
+        use crate::llm::nvidia::tests::{answer, router, server};
+        let (url, requests, task) = server(vec![(200, answer(r#"{"is_safe":true,"severity":"low","category":null,"reason":"ok","suggested_action":"none"}"#), Duration::ZERO); 3]).await;
+        let handle = SupervisorHandle::start(Arc::new(IncidentStore::in_memory().unwrap()))
+            .await
+            .unwrap();
+        let (tap, _) = FakeTap::new("same", &["building"], ThenWhat::Hang);
+        let mut spec = spec("same", tap, sink());
+        spec.llm = Arc::new(router(url));
+        spec.watchdog = Arc::new(
+            Watchdog::from_config(WatchdogConfig {
+                llm_analysis: true,
+                poll_interval_secs: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        handle.supervise(spec).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        handle.stop_session("same").await.unwrap();
+        task.abort();
+    }
+
     // ── Tests ───────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -919,7 +1054,10 @@ mod tests {
             !s.is_empty() && find(s, "hive-a").info.state == TaskState::PausedByWatchdog
         })
         .await;
-        assert_eq!(find(&list, "hive-a").info.state, TaskState::PausedByWatchdog);
+        assert_eq!(
+            find(&list, "hive-a").info.state,
+            TaskState::PausedByWatchdog
+        );
 
         let pending = store.pending().unwrap();
         assert_eq!(pending.len(), 1, "exactly one incident should be raised");

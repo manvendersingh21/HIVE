@@ -107,6 +107,7 @@ pub fn load_skill_dir(dir: &Path) -> anyhow::Result<Skill> {
 /// not depend on the provider at all.
 fn parse_provider(raw: &str) -> Option<AiProvider> {
     match raw.trim().to_lowercase().as_str() {
+        "nvidia" => Some(AiProvider::Nvidia),
         "local" | "ollama" => Some(AiProvider::Local),
         "gemini" | "gemini-flash" => Some(AiProvider::GeminiFlash),
         "claude" | "anthropic" => Some(AiProvider::Claude),

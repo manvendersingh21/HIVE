@@ -99,6 +99,10 @@ pub async fn run_search(
     let memory = open_memory(project_root)?;
     let results = memory.search_all(query, project).await;
 
+    if let Some(error) = &results.semantic_error {
+        eprintln!("{error}");
+    }
+    println!("semantic  {}", memory.semantic_status()?);
     let mut sections = 0;
     if !results.messages.is_empty() {
         sections += 1;
@@ -140,6 +144,7 @@ pub async fn run_memory_status(project_root: &Path) -> anyhow::Result<()> {
     let config = HiveConfig::from_project_root(project_root)?;
     let memory = MemorySystem::open(config.database.resolved_path(), &config);
     let status = memory.status();
+    println!("semantic  {}", memory.semantic_status()?);
     println!("database  {}", config.database.resolved_path().display());
     println!(
         "projects  {}   conversations  {}   messages  {}",
@@ -152,6 +157,23 @@ pub async fn run_memory_status(project_root: &Path) -> anyhow::Result<()> {
     if let Some(p) = current_project() {
         println!("current   {p}");
     }
+    Ok(())
+}
+
+pub async fn run_reindex(project_root: &Path) -> anyhow::Result<()> {
+    let config = HiveConfig::from_project_root(project_root)?;
+    let memory = MemorySystem::open_for_reindex(config.database.resolved_path(), &config)?;
+    let status = memory.reindex().await?;
+    println!(
+        "Rebuilt {} records; {} failed. {}",
+        status.rebuilt,
+        status.failed,
+        memory.semantic_status()?
+    );
+    anyhow::ensure!(
+        status.failed == 0,
+        "Semantic indexing incomplete; rerun hive memory reindex to resume"
+    );
     Ok(())
 }
 
@@ -177,10 +199,7 @@ mod tests {
         std::fs::write(&marker, "  \n").unwrap();
         // A blank marker must read as "no project" — callers treat blank as
         // unset rather than erroring on startup.
-        assert!(std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .is_empty());
+        assert!(std::fs::read_to_string(&marker).unwrap().trim().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

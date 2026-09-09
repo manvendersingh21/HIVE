@@ -36,6 +36,7 @@ pub fn describe_target(target: &StepTarget) -> String {
 /// Print the routing decision and the plan's steps.
 pub fn print_plan(run: &PlannedRun) {
     println!("Complexity: {} → {}", run.complexity, run.provider);
+    println!("Model: {}", run.model);
     if run.routed_provider != run.provider {
         println!(
             "  (routed to {} but it was unavailable, so the local model answered)",
@@ -52,7 +53,11 @@ pub fn print_plan(run: &PlannedRun) {
         if step.command.is_empty() {
             continue;
         }
-        let flag = if step.needs_approval() { "  ⚠ needs approval" } else { "" };
+        let flag = if step.needs_approval() {
+            "  ⚠ needs approval"
+        } else {
+            ""
+        };
         println!(
             "  [{}] {}  ({}){}",
             step.id,
@@ -115,11 +120,12 @@ fn banner(gated: usize) -> Vec<String> {
         row("            !!  HIGH-RISK ACTION INTERCEPTED  !!"),
         format!("╠{}╣", "═".repeat(BANNER_WIDTH)),
         row("  Status: AwaitingHumanApproval"),
-        row(&format!("  {gated} step{plural} require review before execution")),
+        row(&format!(
+            "  {gated} step{plural} require review before execution"
+        )),
         format!("╚{}╝", "═".repeat(BANNER_WIDTH)),
     ]
 }
-
 
 /// Ask about every gated step, returning the approved and denied ids.
 ///
@@ -132,7 +138,11 @@ fn banner(gated: usize) -> Vec<String> {
 /// var) so they can review even if they've walked away from the terminal.
 /// Accepts `y`/`yes`/`APPROVE` to proceed, anything else (including
 /// `n`/`no`/`REJECT`) denies.
-pub fn decide(run: &PlannedRun, result: &RunResult, policy: GatePolicy) -> (Vec<usize>, Vec<usize>) {
+pub fn decide(
+    run: &PlannedRun,
+    result: &RunResult,
+    policy: GatePolicy,
+) -> (Vec<usize>, Vec<usize>) {
     let gated: HashSet<usize> = result.awaiting_approval.iter().copied().collect();
     let mut approved = Vec::new();
     let mut denied = Vec::new();
@@ -188,7 +198,10 @@ pub fn decide(run: &PlannedRun, result: &RunResult, policy: GatePolicy) -> (Vec<
 
         // ── Rich diff/command summary ───────────────────────────────
         println!();
-        println!("  ┌─ Step {} ─────────────────────────────────────────────", step.id);
+        println!(
+            "  ┌─ Step {} ─────────────────────────────────────────────",
+            step.id
+        );
         println!("  │ Command:   $ {}", step.command);
         println!("  │ Severity:  {severity}");
         println!("  │ Category:  {category}");
@@ -256,6 +269,7 @@ mod tests {
             user_input: "clean up".into(),
             summary: "remove a directory".into(),
             complexity: Complexity::Simple,
+            model: "test".into(),
             routed_provider: AiProvider::Local,
             provider: AiProvider::Local,
             conversation_id: None,
@@ -321,11 +335,15 @@ mod tests {
     fn targets_render_readably_including_the_no_worker_case() {
         assert_eq!(describe_target(&StepTarget::Local), "local");
         assert_eq!(
-            describe_target(&StepTarget::Remote { worker: "lawfinder".into() }),
+            describe_target(&StepTarget::Remote {
+                worker: "lawfinder".into()
+            }),
             "remote:lawfinder"
         );
         assert_eq!(
-            describe_target(&StepTarget::Remote { worker: String::new() }),
+            describe_target(&StepTarget::Remote {
+                worker: String::new()
+            }),
             "remote (no worker)"
         );
     }

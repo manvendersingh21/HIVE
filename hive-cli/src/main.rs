@@ -82,7 +82,10 @@ enum Commands {
         project: Option<String>,
     },
     /// Show what the memory system holds.
-    Memory,
+    Memory {
+        #[command(subcommand)]
+        action: Option<MemoryAction>,
+    },
     /// Manage skills.
     Skills {
         #[command(subcommand)]
@@ -145,6 +148,11 @@ enum FinetuneAction {
     },
 }
 
+#[derive(clap::Subcommand)]
+enum MemoryAction {
+    Reindex,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -176,7 +184,14 @@ async fn main() -> anyhow::Result<()> {
                 GatePolicy::Prompt
             };
             let project = project.or_else(memory_cli::current_project);
-            run_task(&cli.project_root, &description, policy, local, project.as_deref()).await
+            run_task(
+                &cli.project_root,
+                &description,
+                policy,
+                local,
+                project.as_deref(),
+            )
+            .await
         }
         Commands::Sessions => run_sessions(&cli.project_root).await,
         Commands::Attach { session_id } => run_attach(&cli.project_root, &session_id).await,
@@ -186,7 +201,9 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Project { action } => {
             let action = match action {
-                ProjectAction::New { slug, title } => memory_cli::ProjectAction::New { slug, title },
+                ProjectAction::New { slug, title } => {
+                    memory_cli::ProjectAction::New { slug, title }
+                }
                 ProjectAction::List => memory_cli::ProjectAction::List,
                 ProjectAction::Switch { slug } => memory_cli::ProjectAction::Switch { slug },
             };
@@ -195,7 +212,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Search { query, project } => {
             memory_cli::run_search(&cli.project_root, &query, project.as_deref()).await
         }
-        Commands::Memory => memory_cli::run_memory_status(&cli.project_root).await,
+        Commands::Memory { action } => match action {
+            Some(MemoryAction::Reindex) => memory_cli::run_reindex(&cli.project_root).await,
+            None => memory_cli::run_memory_status(&cli.project_root).await,
+        },
         Commands::Skills { action } => match action {
             SkillAction::List => {
                 let config = HiveConfig::from_project_root(&cli.project_root)?;
@@ -326,7 +346,9 @@ async fn run_task_via_master(
     }
 
     let (approved, denied) = approval::decide(&reply.run, &reply.result, policy);
-    let reply = client.approve(&reply.result.run_id, approved, denied).await?;
+    let reply = client
+        .approve(&reply.result.run_id, approved, denied)
+        .await?;
     approval::print_outcomes(&reply.result);
     Ok(())
 }
@@ -475,7 +497,10 @@ async fn run_sessions(project_root: &Path) -> anyhow::Result<()> {
     if rows.is_empty() {
         println!("No tmux sessions on this machine or on any configured worker.");
     } else {
-        println!("{:<34} {:<12} {:<9} {:<8} WINDOW", "SESSION", "HOST", "ATTACHED", "HIVE");
+        println!(
+            "{:<34} {:<12} {:<9} {:<8} WINDOW",
+            "SESSION", "HOST", "ATTACHED", "HIVE"
+        );
         rows.sort_by(|a, b| (&a.host, &a.name).cmp(&(&b.host, &b.name)));
         for s in &rows {
             println!(
@@ -483,7 +508,11 @@ async fn run_sessions(project_root: &Path) -> anyhow::Result<()> {
                 s.name,
                 s.host,
                 if s.attached { "yes" } else { "no" },
-                if sessions::is_hive_session(&s.name) { "yes" } else { "-" },
+                if sessions::is_hive_session(&s.name) {
+                    "yes"
+                } else {
+                    "-"
+                },
                 s.window_name,
             );
         }
@@ -507,13 +536,15 @@ async fn run_attach(project_root: &Path, session_id: &str) -> anyhow::Result<()>
         .map(|c| c.workers)
         .unwrap_or_default();
 
-    let mut found: Option<(sessions::TmuxSession, Option<hive_common::protocol::WorkerInfo>)> =
-        sessions::list_local()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .find(|s| s.name == session_id)
-            .map(|s| (s, None));
+    let mut found: Option<(
+        sessions::TmuxSession,
+        Option<hive_common::protocol::WorkerInfo>,
+    )> = sessions::list_local()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.name == session_id)
+        .map(|s| (s, None));
 
     if found.is_none() {
         for w in &workers {
@@ -534,7 +565,11 @@ async fn run_attach(project_root: &Path, session_id: &str) -> anyhow::Result<()>
             format!(
                 "this machine and {} worker(s): {}",
                 workers.len(),
-                workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", ")
+                workers
+                    .iter()
+                    .map(|w| w.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         };
         anyhow::bail!("no tmux session named '{session_id}' on {scope}");
@@ -542,7 +577,11 @@ async fn run_attach(project_root: &Path, session_id: &str) -> anyhow::Result<()>
 
     let command = session.attach_command(worker.as_ref());
     println!("Attaching: {command}");
-    Err(std::process::Command::new("sh").arg("-c").arg(&command).exec().into())
+    Err(std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .exec()
+        .into())
 }
 
 /// Probe every worker and report what is reachable right now.
@@ -563,7 +602,11 @@ async fn run_workers_health(project_root: &Path) -> anyhow::Result<()> {
             node.status()
         );
     }
-    println!("\n{} of {} online.", pool.online_count(), pool.workers.len());
+    println!(
+        "\n{} of {} online.",
+        pool.online_count(),
+        pool.workers.len()
+    );
     Ok(())
 }
 

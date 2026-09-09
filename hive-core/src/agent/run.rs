@@ -49,6 +49,8 @@ impl PlannedStep {
 /// A plan, ready to execute, before anything has run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedRun {
+    #[serde(default)]
+    pub model: String,
     pub id: String,
     pub user_input: String,
     /// The memory conversation this run belongs to, when the request carried
@@ -267,6 +269,7 @@ mod tests {
             user_input: "u".into(),
             summary: "s".into(),
             complexity: Complexity::Simple,
+            model: "test".into(),
             routed_provider: AiProvider::Local,
             provider: AiProvider::Local,
             steps: vec![

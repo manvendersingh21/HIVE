@@ -18,8 +18,8 @@ use crate::watchdog::Watchdog;
 use crate::workers::WorkerPool;
 use planner::{FleetContext, Planner};
 use run::{
-    assess_command_with_interceptor, Approvals, Decision, PlannedRun, PlannedStep,
-    RunResult, StepOutcome, StepStatus, StepTarget,
+    assess_command_with_interceptor, Approvals, Decision, PlannedRun, PlannedStep, RunResult,
+    StepOutcome, StepStatus, StepTarget,
 };
 
 /// The capability every supervised remote subtask needs, whatever the work is.
@@ -137,7 +137,9 @@ impl MasterAgent {
 
         // 2. Classify task complexity
         let complexity = self.llm.classify_complexity(user_input).await?;
-        let provider = complexity.recommended_provider();
+        let provider = self
+            .llm
+            .effective_provider(complexity.recommended_provider());
         info!("Task complexity: {complexity}, routing to {provider}");
 
         // 3. Plan: decompose into subtasks using the routed provider
@@ -238,11 +240,9 @@ impl MasterAgent {
                 // Safety gate: check against the interceptor before running.
                 // handle_request has no approval flow, so flagged commands are
                 // refused outright — better than silent execution.
-                if let Some(analysis) = assess_command_with_interceptor(
-                    &self.watchdog,
-                    &self.interceptor,
-                    command,
-                ) {
+                if let Some(analysis) =
+                    assess_command_with_interceptor(&self.watchdog, &self.interceptor, command)
+                {
                     warn!(
                         command = %command,
                         reason = %analysis.reason,
@@ -281,14 +281,17 @@ impl MasterAgent {
         // 5b. Close the memory turn: persist the answer, re-index the
         //     conversation, extract knowledge. Best-effort by contract.
         if let Some(turn) = &turn {
-            self.memory.complete_turn(&turn.conversation_id, &summary).await;
+            self.memory
+                .complete_turn(&turn.conversation_id, &summary)
+                .await;
         }
 
         // 6. Return summary with tmux session access info for anything delegated
         Ok(AgentResponse {
             summary,
             sessions,
-            provider_used: provider,
+            provider_used: plan.provider_used,
+            model: plan.model_used,
             complexity,
         })
     }
@@ -314,7 +317,9 @@ impl MasterAgent {
         let skill = self.skills.resolve(user_input, &self.llm).await;
 
         let complexity = self.llm.classify_complexity(user_input).await?;
-        let provider = complexity.recommended_provider();
+        let provider = self
+            .llm
+            .effective_provider(complexity.recommended_provider());
         info!("Task complexity: {complexity}, routing to {provider}");
 
         let plan = self
@@ -410,6 +415,7 @@ impl MasterAgent {
             complexity,
             routed_provider: provider,
             provider: plan.provider_used,
+            model: plan.model_used.clone(),
             steps,
             conversation_id: turn.map(|t| t.conversation_id),
         })
@@ -717,15 +723,8 @@ fn render_run_result(result: &crate::agent::run::RunResult) -> String {
         if o.command.is_empty() {
             continue;
         }
-        let output: String = o
-            .output
-            .chars()
-            .take(400)
-            .collect();
-        text.push_str(&format!(
-            "\n\n$ {} [{:?}]\n{}",
-            o.command, o.status, output
-        ));
+        let output: String = o.output.chars().take(400).collect();
+        text.push_str(&format!("\n\n$ {} [{:?}]\n{}", o.command, o.status, output));
     }
     text
 }

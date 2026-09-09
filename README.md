@@ -27,7 +27,7 @@ recursive agent teams are not implemented end to end.
   Conversation continuity is implemented for OpenCode and AGY.
 - A watchdog can suspend tasks for review. Incidents are persisted and exposed
   through an authenticated web review interface.
-- A separate master-agent path provides local-model planning, SSH workers,
+- A separate master-agent path provides model-based planning, SSH workers,
   project-scoped memory APIs/CLI commands, and a browser interface.
 
 See [Release 1 evidence](docs/RELEASE-1.md#final-acceptance-audit--complete-2026-09-07)
@@ -98,8 +98,13 @@ records the maintainer's fleet, not a ready-to-use public deployment. For your
 own setup, start from [workers.example.toml](config/workers.example.toml) and
 configure only machines you own or are authorized to use.
 
-The current local-model configuration names `qwen3.5:9b` and the embedding model
-`nomic-embed-text`. If using Ollama, pull the same models you configure:
+This checkout uses NVIDIA-hosted Nemotron Ultra for master reasoning and Nemotron
+for memory embeddings. Export `NVIDIA_API_KEY_FLASH` and `NVIDIA_API_KEY_EMBEDDING` before starting the CLI or web server;
+Ollama is not required. The launch script reads both keys from
+`~/.config/hive/web.env`. See [NVIDIA setup and migration](docs/NVIDIA.md).
+Worker agent CLIs still use their own authentication.
+
+For an older configuration using Ollama, install its models:
 
 ```sh
 ollama pull qwen3.5:9b
@@ -116,8 +121,7 @@ HIVE_WEB_ADDR=127.0.0.1:8080 ./target/debug/hive-web
 Open `http://127.0.0.1:8080`. **The actual bind setting is `HIVE_WEB_ADDR`, not
 `web.listen_addr` in TOML.** The default is loopback. This interface exposes
 terminal functionality; keep it on a trusted network and do not deploy it as
-an unaudited public Internet service. Cloud provider keys are optional and come
-from environment variables, never committed configuration.
+an unaudited public Internet service. Provider keys come from environment variables, never committed configuration.
 
 ## Current limitations
 

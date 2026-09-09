@@ -150,8 +150,8 @@
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
   const PROVIDER = {
-    Local: 'local · qwen2.5', GeminiFlash: 'gemini flash',
-    Claude: 'claude', Codex: 'codex'
+    local: 'local', gemini_flash: 'gemini flash',
+    claude: 'claude', codex: 'codex', nvidia: 'NVIDIA'
   };
   const label = p => PROVIDER[p] || String(p).toLowerCase();
 
@@ -219,6 +219,7 @@
       <div class="agent-head">
         <span class="badge">${esc(run.complexity)}</span>
         <span class="badge model">${esc(label(run.provider))}</span>
+        <span class="badge">${esc(run.model || '')}</span>
         ${run.routed_provider !== run.provider
           ? `<span class="badge fallback" title="${esc(label(run.routed_provider))} was not configured or failed, so the local model handled it">
                fell back from ${esc(label(run.routed_provider))}

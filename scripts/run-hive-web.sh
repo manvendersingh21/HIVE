@@ -1,6 +1,8 @@
 #!/bin/bash
 # launchd wrapper for hive-web on the master.
 #
+# NVIDIA_API_KEY_FLASH and NVIDIA_API_KEY_EMBEDDING are also read from this file.
+# Add both keys to ~/.config/hive/web.env and restart the service.
 # The password lives in ~/.config/hive/web.env (mode 600) rather than in the
 # plist, which is world-readable.
 set -a
