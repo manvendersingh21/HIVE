@@ -17,6 +17,7 @@ HIVE is a self-hosted runtime for coordinating AI agents across local and SSH-co
 ## Features
 
 - **Distributed Collaboration**: Coordinate AI agents across local and SSH-connected machines using HACP contracts
+- **Fleet Delegation**: Assign work to a named agent on a named machine, each keeping its own tmux session and native conversation (opt-in via `HIVE_DELEGATION=1`)
 - **Supervised Execution**: Run agent CLIs in monitored tmux sessions with safety controls
 - **Evidence Preservation**: SQLite journal records all protocol messages, results, and execution history
 - **Watchdog Protection**: Safety monitoring with incident review interface
