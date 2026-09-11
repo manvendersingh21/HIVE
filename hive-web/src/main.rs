@@ -9,6 +9,7 @@
 
 mod auth;
 mod chat;
+mod delegation;
 mod incidents;
 mod sessions;
 mod terminal;
@@ -17,7 +18,7 @@ mod workers;
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{ws::WebSocketUpgrade, FromRef, Path, Query},
+    extract::{ws::WebSocketUpgrade, FromRef, Path, Query, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Response},
@@ -75,9 +76,8 @@ impl FromRef<AppState> for incidents::IncidentReview {
 
 /// Build the master agent, if this host is configured to be one.
 ///
-/// Returns a disabled handle rather than an error when there is no config or
-/// no reachable local model: the same binary runs on workers, where it should
-/// still serve terminals.
+/// Workers without master configuration still serve terminals. Configured
+/// masters keep saved chats available when inference is temporarily offline.
 async fn build_agent(master_name: &str) -> chat::AgentHandle {
     let root = std::env::var("HIVE_CONFIG_ROOT").unwrap_or_else(|_| ".".to_string());
     let root = std::path::Path::new(&root);
@@ -95,11 +95,11 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
 
     let llm = LlmRouter::from_config(&config.llm);
 
-    // Legacy deployments without Ollama serve terminals only. Cloud-only
-    // deployments enable chat without probing a local inference server.
+    // History remains readable even when the configured inference server is down.
     if llm.uses_local_startup() && !llm.local_available().await {
-        info!("local model unreachable — serving terminals only, chat disabled");
-        return chat::AgentHandle::disabled();
+        info!(
+            "local model unreachable — saved chats remain available; planning will report errors"
+        );
     }
 
     // Health checks and the machine probe both reach workers over SSH, and an
@@ -109,7 +109,15 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
     // serving.
     let workers = WorkerPool::new(workers_config.workers);
 
-    let memory = MemorySystem::open(config.database.resolved_path(), &config);
+    // Web messages must be durable; never advertise saved chats over an
+    // in-memory fallback when opening the configured database fails.
+    let memory = match MemorySystem::open_for_reindex(config.database.resolved_path(), &config) {
+        Ok(memory) => memory,
+        Err(e) => {
+            warn!(error = %e, "chat database unavailable");
+            return chat::AgentHandle::disabled();
+        }
+    };
     // Loaded, not empty: the web chat resolves skills at request time; a
     // `require_confirmation` skill gates its steps through the same approval
     // flow (POST /api/chat/{run_id}/approve) as the Tier-1 rules.
@@ -144,12 +152,22 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
                 Ok(Err(e)) => warn!(error = %e, "could not refresh machine knowledge graph"),
                 Err(_) => warn!("machine graph refresh timed out"),
             }
+            if let Err(e) = hive_core::delegation::inventory::refresh(&background).await {
+                warn!(error=%e, "agent inventory refresh failed");
+            }
             first = false;
             tokio::time::sleep(WORKER_REFRESH_INTERVAL).await;
         }
     });
 
-    chat::AgentHandle::enabled(agent, master_name.to_string())
+    let handle = chat::AgentHandle::enabled(agent, master_name.to_string()).unwrap_or_else(|e| {
+        warn!(error = %e, "could not initialize saved chats");
+        chat::AgentHandle::disabled()
+    });
+    if handle.agent.is_some() {
+        delegation::start(handle.clone());
+    }
+    handle
 }
 
 #[tokio::main]
@@ -206,12 +224,22 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         .route("/login", get(login_page).post(auth::login))
         .route("/logout", post(auth::logout))
         .route("/terminal/{name}", get(terminal_page))
+        .route("/api/session-hosts", get(session_hosts))
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/capabilities", get(chat::capabilities))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}", axum::routing::delete(kill_session))
+        .route("/api/chats", get(chat::list_chats).post(chat::create_chat))
+        .route("/api/chats/{id}", get(chat::get_chat))
         .route("/api/chat", post(chat::chat))
         .route("/api/chat/{run_id}/approve", post(chat::approve))
+        .route("/api/runs", get(delegation::list))
+        .route("/api/runs/{id}/events", get(delegation::events))
+        .route("/api/runs/{id}/decisions", post(delegation::decide))
+        .route("/api/runs/{id}/messages", post(delegation::message))
+        .route("/api/runs/{id}/replace", post(delegation::replace))
+        .route("/api/runs/{id}/retry-setup", post(delegation::retry_setup))
+        .route("/api/runs/{id}/recovery", get(delegation::recovery).post(delegation::reconcile))
         .route("/api/machines", get(chat::machine_graph))
         .route("/api/machines/refresh", post(chat::refresh_machines))
         .route("/api/machines/prompt", get(chat::machines_prompt))
@@ -280,6 +308,8 @@ mod router_tests {
             assert_eq!(response.headers()[header::LOCATION], "/login", "{path}");
         }
         for path in [
+            "/api/chats",
+            "/api/chats/example",
             "/api/sessions",
             "/api/incidents",
             "/api/machines",
@@ -375,18 +405,109 @@ async fn terminal_page() -> Html<&'static str> {
 
 // ------------------------------------------------------------------ api
 
-async fn list_sessions() -> Response {
-    match sessions::list().await {
-        Ok(list) => Json(list).into_response(),
-        Err(e) => {
-            warn!(error = %e, "failed to list tmux sessions");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+fn session_worker(
+    h: &chat::AgentHandle,
+    host: &str,
+) -> Result<Option<hive_common::protocol::WorkerInfo>, Response> {
+    if host == "local" {
+        return Ok(None);
+    }
+    h.agent
+        .as_ref()
+        .and_then(|a| a.workers.workers.iter().find(|w| w.info.name == host))
+        .map(|w| Some(w.info.clone()))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown worker").into_response())
+}
+
+async fn session_hosts(State(h): State<chat::AgentHandle>) -> Json<serde_json::Value> {
+    let mut hosts = vec![serde_json::json!({"host": "local", "name": h.master_name})];
+    if let Some(agent) = h.agent {
+        hosts.extend(
+            agent
+                .workers
+                .workers
+                .iter()
+                .map(|w| serde_json::json!({"host": w.info.name, "name": w.info.name})),
+        );
+    }
+    Json(serde_json::json!(hosts))
+}
+
+async fn list_sessions(State(h): State<chat::AgentHandle>) -> Response {
+    let local = sessions::list();
+    let remote =
+        async {
+            match &h.agent {
+                Some(agent) => {
+                    futures::future::join_all(
+                        agent.workers.workers.iter().map(|w| async {
+                            (w.info.name.clone(), sessions::list_on(&w.info).await)
+                        }),
+                    )
+                    .await
+                }
+                None => vec![],
+            }
+        };
+    let (local, remote) = tokio::join!(local, remote);
+    let mut list = Vec::new();
+    let mut errors = Vec::new();
+    match local {
+        Ok(s) => list.extend(s),
+        Err(e) => errors.push(format!("local: {e}")),
+    }
+    for (host, result) in remote {
+        match result {
+            Ok(s) => list.extend(s),
+            Err(e) => errors.push(format!("{host}: {e}")),
         }
     }
+    if let Ok(store) = delegation::store(&h) {
+        if let Ok(runs) = store.list() {
+            for run in runs {
+                if let Some(session) = list
+                    .iter_mut()
+                    .find(|s| s.name == run.tmux_name && s.host == run.assignment.device)
+                {
+                    session.run = Some(run);
+                } else {
+                    list.push(sessions::Session {
+                        name: run.tmux_name.clone(),
+                        host: run.assignment.device.clone(),
+                        windows: 0,
+                        created: 0,
+                        attached: false,
+                        current_command: String::new(),
+                        window_name: run.assignment.agent.clone(),
+                        run: Some(run),
+                    });
+                }
+            }
+        }
+    }
+    let mut response = Json(list).into_response();
+    if !errors.is_empty() {
+        // Keep the array API compatible; the dashboard displays partial failures.
+        let value = serde_json::to_string(&errors).unwrap();
+        if let Ok(header) = value.parse() {
+            response
+                .headers_mut()
+                .insert("x-hive-session-errors", header);
+        }
+    }
+    response
+}
+
+#[derive(Deserialize)]
+struct SessionHost {
+    #[serde(default = "sessions::local_host")]
+    host: String,
 }
 
 #[derive(Deserialize)]
 struct CreateRequest {
+    #[serde(default = "sessions::local_host")]
+    host: String,
     name: String,
     #[serde(default = "default_kind")]
     kind: sessions::Kind,
@@ -398,7 +519,10 @@ fn default_kind() -> sessions::Kind {
     sessions::Kind::Shell
 }
 
-async fn create_session(Json(req): Json<CreateRequest>) -> Response {
+async fn create_session(
+    State(h): State<chat::AgentHandle>,
+    Json(req): Json<CreateRequest>,
+) -> Response {
     if !sessions::valid_name(&req.name) {
         return (
             StatusCode::BAD_REQUEST,
@@ -406,21 +530,41 @@ async fn create_session(Json(req): Json<CreateRequest>) -> Response {
         )
             .into_response();
     }
-    match sessions::create(&req.name, req.kind, req.working_dir.as_deref()).await {
+    let worker = match session_worker(&h, &req.host) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    let result = match worker {
+        Some(w) => sessions::create_on(&w, &req.name, req.kind, req.working_dir.as_deref()).await,
+        None => sessions::create(&req.name, req.kind, req.working_dir.as_deref()).await,
+    };
+    match result {
         Ok(()) => (
             StatusCode::CREATED,
-            Json(serde_json::json!({"name": req.name})),
+            Json(serde_json::json!({"name": req.name, "host": req.host})),
         )
             .into_response(),
         Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
     }
 }
 
-async fn kill_session(Path(name): Path<String>) -> Response {
+async fn kill_session(
+    State(h): State<chat::AgentHandle>,
+    Path(name): Path<String>,
+    Query(target): Query<SessionHost>,
+) -> Response {
     if !sessions::valid_name(&name) {
         return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
     }
-    match sessions::kill(&name).await {
+    let worker = match session_worker(&h, &target.host) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    let result = match worker {
+        Some(w) => sessions::kill_on(&w, &name).await,
+        None => sessions::kill(&name).await,
+    };
+    match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }
@@ -428,6 +572,8 @@ async fn kill_session(Path(name): Path<String>) -> Response {
 
 #[derive(Deserialize)]
 struct TermSize {
+    #[serde(default = "sessions::local_host")]
+    host: String,
     #[serde(default = "default_cols")]
     cols: u16,
     #[serde(default = "default_rows")]
@@ -442,6 +588,7 @@ fn default_rows() -> u16 {
 }
 
 async fn ws_handler(
+    State(h): State<chat::AgentHandle>,
     Path(name): Path<String>,
     Query(size): Query<TermSize>,
     ws: WebSocketUpgrade,
@@ -449,10 +596,23 @@ async fn ws_handler(
     if !sessions::valid_name(&name) {
         return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
     }
-    if !sessions::exists(&name).await {
-        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    let worker = match session_worker(&h, &size.host) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    match &worker {
+        Some(w) => {
+            if let Err(e) = sessions::exists_on(w, &name).await {
+                return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+            }
+        }
+        None => {
+            if !sessions::exists(&name).await {
+                return (StatusCode::NOT_FOUND, "no such session").into_response();
+            }
+        }
     }
     let cols = size.cols.clamp(20, 500);
     let rows = size.rows.clamp(5, 200);
-    ws.on_upgrade(move |socket| terminal::bridge(socket, name, cols, rows))
+    ws.on_upgrade(move |socket| terminal::bridge(socket, name, worker, cols, rows))
 }

@@ -40,6 +40,16 @@ fn pane_target(session_name: &str) -> String {
     format!("={session_name}:")
 }
 
+/// Non-interactive SSH on macOS does not load Homebrew's shell setup.
+pub const REMOTE_PATH: &str =
+    "export PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"";
+
+fn supervised_script(command: &str, log_path: &str) -> String {
+    // A heredoc terminator or trailing shell comment must end before the
+    // wrapper resumes. Appending `); ...` on the same line breaks both.
+    format!("{REMOTE_PATH}; set -m; set -o pipefail; {{ (\n{command}\n); printf '\\n__HIVE_DONE__%s\\n' \"$?\"; }} 2>&1 | tee {log_path}")
+}
+
 /// A pooled SSH connection to one worker, with tmux helpers layered on top.
 pub struct SshWorker {
     session: Arc<Session>,
@@ -144,7 +154,10 @@ echo "stopped $pgid""#
     /// Whether a tmux session is still alive on the worker.
     pub async fn session_exists(&self, session_name: &str) -> bool {
         self.session
-            .command("tmux")
+            .command("sh")
+            .arg("-c")
+            .arg(format!("{REMOTE_PATH}; exec tmux \"$@\""))
+            .arg("hive-tmux")
             .stdin(Stdio::null())
             .args(["has-session", "-t", &format!("={session_name}")])
             .status()
@@ -189,7 +202,7 @@ echo "resumed $resumed""#
             .command("sh")
             .stdin(Stdio::null())
             .arg("-c")
-            .arg(command)
+            .arg(format!("{REMOTE_PATH}; {command}"))
             .output()
             .await
             .map_err(|e| anyhow::anyhow!("remote command failed: {e}"))?;
@@ -232,11 +245,13 @@ echo "resumed $resumed""#
         // in a group of its own, tmux is never told anything stopped, and the stop holds.
         // Measured on tmux 3.7c: without this, every process was back in `S` a moment
         // after a `kill -STOP` that returned 0.
-        let inner =
-            format!("set -m; {{ ( {command} ); echo \"__HIVE_DONE__$?\"; }} 2>&1 | tee {log_path}");
+        let inner = supervised_script(command, log_path);
         let status = self
             .session
-            .command("tmux")
+            .command("sh")
+            .arg("-c")
+            .arg(format!("{REMOTE_PATH}; exec tmux \"$@\""))
+            .arg("hive-tmux")
             .stdin(Stdio::null())
             .args([
                 "new-session",
@@ -260,7 +275,10 @@ echo "resumed $resumed""#
     /// a runaway process without killing the session outright, preserving
     /// state for a human to inspect on reattach.
     pub async fn send_keys(&self, session_name: &str, keys: &[&str]) -> anyhow::Result<()> {
-        let mut cmd = self.session.command("tmux");
+        let mut cmd = self.session.command("sh");
+        cmd.arg("-c")
+            .arg(format!("{REMOTE_PATH}; exec tmux \"$@\""))
+            .arg("hive-tmux");
         cmd.stdin(Stdio::null());
         cmd.args(["send-keys", "-t", &pane_target(session_name)]);
         cmd.args(keys.iter().copied());
@@ -279,7 +297,10 @@ echo "resumed $resumed""#
     pub async fn capture_pane(&self, session_name: &str, lines: u32) -> anyhow::Result<String> {
         let output = self
             .session
-            .command("tmux")
+            .command("sh")
+            .arg("-c")
+            .arg(format!("{REMOTE_PATH}; exec tmux \"$@\""))
+            .arg("hive-tmux")
             .stdin(Stdio::null())
             .args([
                 "capture-pane",
@@ -341,6 +362,38 @@ impl LogTail {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn wrapper_preserves_heredocs_comments_and_pipeline_failures() {
+        for (command, expected) in [
+            (
+                "cat <<'EOF'\nhello heredoc\nEOF",
+                "hello heredoc\n\n__HIVE_DONE__0\n",
+            ),
+            (
+                "printf 'no newline' # trailing comment",
+                "no newline\n__HIVE_DONE__0\n",
+            ),
+            ("(exit 12) | cat", "\n__HIVE_DONE__12\n"),
+        ] {
+            let log = std::env::temp_dir().join(format!("hive-wrapper-{}", uuid::Uuid::new_v4()));
+            let out = tokio::process::Command::new("bash")
+                .args([
+                    "-c",
+                    &super::supervised_script(command, &log.to_string_lossy()),
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), expected);
+            std::fs::remove_file(log).unwrap();
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -435,11 +488,15 @@ mod tests {
         );
     }
 }
-    #[test]
-    fn execution_probe_requires_working_tmux_not_just_a_reachable_shell() {
-        for (tmux_body, expected) in [("return 0", true), ("return 1", false)] {
-            let script = format!("tmux() {{ {tmux_body}; }}; bash() {{ return 0; }}; {EXECUTION_PROBE}");
-            let result = std::process::Command::new("sh").args(["-c", &script]).status().unwrap();
-            assert_eq!(result.success(), expected);
-        }
+#[test]
+fn execution_probe_requires_working_tmux_not_just_a_reachable_shell() {
+    for (tmux_body, expected) in [("return 0", true), ("return 1", false)] {
+        let script =
+            format!("tmux() {{ {tmux_body}; }}; bash() {{ return 0; }}; {EXECUTION_PROBE}");
+        let result = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap();
+        assert_eq!(result.success(), expected);
     }
+}

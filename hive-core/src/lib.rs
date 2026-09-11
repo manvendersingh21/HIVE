@@ -13,6 +13,7 @@
 
 pub mod agent;
 pub mod collab;
+pub mod delegation;
 pub mod finetune;
 pub mod llm;
 pub mod memory;

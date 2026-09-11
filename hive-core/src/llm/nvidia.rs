@@ -99,7 +99,8 @@ impl NvidiaClient {
 
     fn chat_template_kwargs(&self, effort: &str) -> Value {
         if self.model.starts_with("nvidia/nemotron-") {
-            json!({"enable_thinking": true})
+            // Auxiliary calls need a short answer, not a full reasoning trace.
+            json!({"enable_thinking": effort != "low"})
         } else {
             // Preserve the DeepSeek template for explicitly configured older deployments.
             json!({"thinking": true, "reasoning_effort": effort})
@@ -221,6 +222,7 @@ pub(crate) mod tests {
     pub fn router(url: String) -> crate::llm::LlmRouter {
         let mut config: hive_common::HiveConfig =
             toml::from_str(include_str!("../../../config/hive.toml")).unwrap();
+        config.llm.single_provider = Some(hive_common::AiProvider::Nvidia);
         config.llm.nvidia.base_url = url;
         config.llm.local.base_url = "http://127.0.0.1:1".into();
         config.llm.gemini = None;
@@ -269,7 +271,7 @@ pub(crate) mod tests {
         assert_eq!(result.model, "actual-nemotron");
         task.await.unwrap();
         let calls = captured.lock().unwrap();
-        for (headers, body) in calls.iter() {
+        for (index, (headers, body)) in calls.iter().enumerate() {
             assert!(headers.contains("Bearer test-secret"));
             assert!(headers.starts_with("POST /v1/chat/completions"));
             assert_eq!(body["temperature"], 1);
@@ -279,7 +281,7 @@ pub(crate) mod tests {
             assert_eq!(body["model"], "nvidia/nemotron-3-ultra-550b-a55b");
             assert_eq!(
                 body["chat_template_kwargs"],
-                json!({"enable_thinking":true})
+                json!({"enable_thinking":index == 2})
             );
             assert!(body.get("extra_body").is_none());
         }

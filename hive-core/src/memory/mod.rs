@@ -10,6 +10,7 @@
 //! continuity, knowledge-graph entities for distilled facts, RAG chunks for
 //! verbatim recall — capped together at `memory.max_context_tokens`.
 
+pub mod chats;
 pub mod extractor;
 pub mod graph;
 pub mod machines;
@@ -368,8 +369,11 @@ impl MemorySystem {
         let conn = self.graph.shared_conn();
         extractor::create_table(&conn)?;
         let db = conn.lock().unwrap();
-        let mut stmt =
-            db.prepare("SELECT id, project_id, name, attrs FROM entities ORDER BY id")?;
+        // Fleet facts have NULL project_id and are consumed directly by the
+        // planner. Only project knowledge participates in semantic dedup/search.
+        let mut stmt = db.prepare(
+            "SELECT id, project_id, name, attrs FROM entities WHERE project_id IS NOT NULL ORDER BY id",
+        )?;
         let rows = stmt
             .query_map([], |r| {
                 let attrs: String = r.get(3)?;
@@ -608,6 +612,50 @@ mod tests {
         mem.complete_turn(&t2.conversation_id, "fixed the cron schedule")
             .await;
         mem
+    }
+
+    #[tokio::test]
+    async fn reindex_preserves_unscoped_fleet_and_indexes_project_knowledge() {
+        let mem = MemorySystem::new();
+        let machine = graph::Entity::new("machine", "worker", serde_json::json!({}));
+        let tool = graph::Entity::new("tool", "cargo", serde_json::json!({}));
+        mem.graph.upsert_entity(&machine).unwrap();
+        mem.graph.upsert_entity(&tool).unwrap();
+        mem.graph
+            .add_edge(&machine.id, "has_tool", &tool.id)
+            .unwrap();
+        let before = mem.graph.snapshot().unwrap();
+        let conv = mem.projects.begin_conversation("p", "database").unwrap();
+        mem.projects
+            .append_message(&conv.id, "user", "use sqlite")
+            .unwrap();
+        let entity = graph::Entity::new("tool", "sqlite", serde_json::json!({}));
+        mem.graph.upsert_entity_scoped("p", &entity).unwrap();
+        assert!(mem
+            .semantic_status()
+            .unwrap()
+            .contains("2 records need indexing"));
+        assert_eq!(mem.reindex().await.unwrap().rebuilt, 2);
+        assert!(mem
+            .semantic_status()
+            .unwrap()
+            .contains("0 records need indexing"));
+        assert_eq!(mem.reindex().await.unwrap().rebuilt, 0);
+        let after = mem.graph.snapshot().unwrap();
+        assert_eq!(after.entities, before.entities);
+        assert_eq!(after.edges, before.edges);
+        assert_eq!(mem.projects.counts().unwrap(), (1, 1, 1));
+        let conn = mem.graph.shared_conn();
+        let count: i64 = conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM kg_embeddings WHERE entity_id = ?1 OR entity_id = ?2",
+                rusqlite::params![machine.id, tool.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     struct ControlledEmbedder {

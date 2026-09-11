@@ -1,17 +1,25 @@
-# NVIDIA master reasoning and memory
+# Optional NVIDIA provider and migration history
 
-This checkout selects `llm.single_provider = "nvidia"` and
-`nvidia/nemotron-3-ultra-550b-a55b`. All master planning, classification, skill
-selection, knowledge extraction, and model watchdog review use that provider.
-Skill provider overrides and complexity recommendations cannot override this
-setting. A missing key or failed NVIDIA call does not fall back to Ollama or
-another cloud provider. Worker CLIs and the HACP runtime retain their independent
-authentication and execution behavior.
+The checkout is back on **Ollama**: `llm.single_provider = "local"`,
+`llm.local.model = "qwen3.5:9b"`, `memory.embedding_provider = "local"`, and
+`memory.embedding_model = "nomic-embed-text"`. Planning, classification, skill
+selection, extraction, watchdog review, and memory retrieval use local models.
+NVIDIA keys are not required. Run `hive memory reindex` when switching embedding
+models; the provider/model isolation and resumable migration remain available.
+
+The NVIDIA client is retained as an optional provider. The following sections
+document its configuration and the earlier hosted-model trials. They do not
+describe the active deployment. To explicitly opt in, set
+`llm.single_provider = "nvidia"`, configure `[llm.nvidia]`, and export the two keys.
+A missing key or failed call never silently switches providers. Worker CLIs and
+the HACP runtime retain their independent authentication and execution behavior.
 
 The client calls NVIDIA directly with the existing Rust HTTP stack. Chat requests
 use temperature 1, top-p 0.95, max_tokens 16384, non-streaming responses, and
-`chat_template_kwargs: {"enable_thinking": true}` for all master calls. Ultra uses
-its default thinking behavior; the DeepSeek-specific effort field is omitted.
+`chat_template_kwargs: {"enable_thinking": true}` for planning. Auxiliary calls
+(classification, skill selection, extraction, and watchdog review) use
+`enable_thinking: false` to avoid full reasoning latency. The DeepSeek-specific
+effort field is omitted for Ultra.
 Explicit older DeepSeek model configurations retain their original
 `thinking`/`reasoning_effort` template. Only final `content` is used;
 reasoning content is never interpreted as commands. Empty/incomplete responses
@@ -58,7 +66,7 @@ the relevant variable. The old shared `NVIDIA_API_KEY` is no longer used.
 
 ## Memory migration
 
-This checkout uses `memory.embedding_provider = "nvidia"` and
+For NVIDIA memory, use `memory.embedding_provider = "nvidia"` and
 `memory.embedding_model = "nvidia/nemotron-3-embed-1b"`. Searches send
 `input_type = "query"`; indexed text and both sides of entity deduplication use
 `passage`. Provider, model, and dimensions are recorded with each vector.
@@ -170,3 +178,44 @@ tests, and mock CLI/web smoke checks passed using distinct Flash/embedding keys.
 Live embeddings with `NVIDIA_API_KEY_EMBEDDING` passed (passage 0.63 s, query
 0.54 s; 2,048 dimensions). Classification with the distinct
 `NVIDIA_API_KEY_FLASH` still timed out after 120.22 s.
+
+## Web request deadlines
+
+Web planning has a 150-second total deadline across memory, skill selection,
+classification, and planning. A planning timeout returns HTTP 504 before command
+execution. The browser bounds chat and approval requests (including response-body
+reads) to 180 seconds and reports network loss or expired sessions explicitly.
+It does not automatically retry: after a transport timeout, execution may still
+be running, so inspect Sessions before repeating a command.
+
+Follow-up live check on 2026-09-09: Ultra classification still timed out after
+120.15 seconds with thinking disabled. Subsequent direct and deployed-web checks
+returned NVIDIA HTTP 404 (model unavailable or access denied), even though Ultra
+remained listed in `/v1/models`. The deployed web route surfaced this as HTTP 502
+in 0.44 seconds; its health endpoint remained HTTP 200 while planning. These
+checks supersede the earlier live readiness result: Ultra was not verified
+usable when the deployment was switched back to Ollama. No provider or model fallback was enabled.
+
+The timeout update passed 438 workspace tests, the mock CLI/web integration,
+`node scripts/check-chat-timeouts.cjs`, workspace build/test compilation, release
+builds, and `git diff --check`. The installed web service was restarted, and the
+updated page and authenticated capabilities were verified live.
+
+## Ollama restored — 2026-09-09
+
+The active checkout and installed web service use `qwen3.5:9b` for all master
+calls and `nomic-embed-text` for embeddings, with explicit local-only routing.
+The authenticated web disk-space task executed successfully in 14.63 seconds.
+NVIDIA remains an optional client; the active configuration makes no NVIDIA
+requests and requires no cloud keys.
+
+The persistent database was backed up before migration. All six conversation
+vectors and 15 project-entity vectors now use Ollama/nomic with 768 dimensions;
+reindex reports zero remaining records. Both projects, all six conversations,
+all 12 messages, and the project graph facts were preserved. Fleet/global graph
+entities are excluded from semantic reindexing because they have no project
+scope and are read directly by the planner. A regression test covers this case.
+
+Workspace build, test compilation, 439 tests, mock integration, browser timeout
+checks, release builds, and whitespace checks passed. The existing machine
+configuration, web password, approval routes, and timeout fixes remain active.

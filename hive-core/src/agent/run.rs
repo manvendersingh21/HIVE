@@ -33,6 +33,8 @@ pub struct PlannedStep {
     /// The subtask this command belongs to.
     pub description: String,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<super::planner::FileWrite>,
     pub target: StepTarget,
     /// Set when Tier-1 rules flagged the command. Presence means the step is
     /// gated; `None` means it runs without asking.
@@ -49,6 +51,10 @@ impl PlannedStep {
 /// A plan, ready to execute, before anything has run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedRun {
+    #[serde(default)]
+    pub phase: super::planner::PlanPhase,
+    #[serde(default)]
+    pub targets: Vec<StepTarget>,
     #[serde(default)]
     pub model: String,
     pub id: String,
@@ -90,6 +96,8 @@ impl PlannedRun {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
+    /// A previous step failed or awaits approval; this step has not run.
+    Pending,
     Executed,
     Failed,
     /// Flagged by Tier-1 and not approved in this call.
@@ -257,6 +265,7 @@ mod tests {
     #[test]
     fn gated_steps_are_reported_up_front() {
         let step = |id: usize, command: &str, risk: Option<SafetyAnalysis>| PlannedStep {
+            file: None,
             id,
             description: "d".into(),
             command: command.into(),
@@ -265,6 +274,8 @@ mod tests {
         };
         let wd = Watchdog::new();
         let run = PlannedRun {
+            phase: Default::default(),
+            targets: vec![],
             id: "r".into(),
             user_input: "u".into(),
             summary: "s".into(),

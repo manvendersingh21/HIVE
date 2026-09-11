@@ -95,7 +95,8 @@ impl LlmRouter {
     /// providers have a resolvable API key. Providers without one are
     /// logged and left unconfigured rather than failing construction.
     pub fn from_config(cfg: &LlmConfig) -> Self {
-        let local = OllamaClient::new(cfg.local.base_url.clone(), cfg.local.model.clone());
+        let local = OllamaClient::new(cfg.local.base_url.clone(), cfg.local.model.clone())
+            .with_context(cfg.local.max_context);
 
         let gemini = cfg
             .gemini
@@ -214,13 +215,44 @@ impl LlmRouter {
         prompt: &str,
         provider: AiProvider,
     ) -> anyhow::Result<LlmResponse> {
+        self.complete_formatted(prompt, provider, None).await
+    }
+
+    /// Structured local output also applies when a cloud route falls back to Ollama.
+    pub async fn complete_json_with(
+        &self,
+        prompt: &str,
+        provider: AiProvider,
+        schema: &serde_json::Value,
+    ) -> anyhow::Result<LlmResponse> {
+        self.complete_formatted(prompt, provider, Some(schema))
+            .await
+    }
+
+    async fn local_formatted(
+        &self,
+        prompt: &str,
+        schema: Option<&serde_json::Value>,
+    ) -> anyhow::Result<String> {
+        match schema {
+            Some(schema) => self.local.complete_json(prompt, schema).await,
+            None => self.local.complete_raw(prompt).await,
+        }
+    }
+
+    async fn complete_formatted(
+        &self,
+        prompt: &str,
+        provider: AiProvider,
+        schema: Option<&serde_json::Value>,
+    ) -> anyhow::Result<LlmResponse> {
         let provider = self.effective_provider(provider);
         if provider == AiProvider::Nvidia {
             return self.nvidia.complete(prompt, "high").await;
         }
         let result = match provider {
             AiProvider::Nvidia => unreachable!(),
-            AiProvider::Local => self.local.complete_raw(prompt).await,
+            AiProvider::Local => self.local_formatted(prompt, schema).await,
             AiProvider::GeminiFlash => match &self.gemini {
                 Some(client) => client.complete(prompt).await,
                 None => Err(anyhow::anyhow!(
@@ -251,7 +283,7 @@ impl LlmRouter {
                 tracing::warn!(
                     "Provider {provider} unavailable ({e}), falling back to local model"
                 );
-                let text = self.local.complete_raw(prompt).await?;
+                let text = self.local_formatted(prompt, schema).await?;
                 Ok(LlmResponse {
                     text,
                     provider: AiProvider::Local,
