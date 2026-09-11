@@ -80,6 +80,7 @@
 <main>
   <div class="new">
     <input id="name" placeholder="session name" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <select id="machine" aria-label="Machine"><option value="local">local</option></select>
     <select id="kind">
       <option value="claude">claude</option>
       <option value="codex">codex</option>
@@ -105,10 +106,17 @@
 
   const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+  let refreshing = false;
   async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
     let r;
-    try { r = await fetch('/api/sessions'); } catch { return; }
+    r = await fetch('/api/sessions');
     if (r.status === 401) return location.href = '/login';
+    if (!r.ok) throw new Error(await r.text());
+    const errors = JSON.parse(r.headers.get('x-hive-session-errors') || '[]');
+    $('err').textContent = errors.join('; ');
     const list = await r.json();
     $('list').innerHTML = list.length ? list.map(s => `
       <li>
@@ -116,14 +124,20 @@
         <span class="meta">
           <div class="name">${esc(s.name)}</div>
           <div class="sub">
-            <b>${esc(s.window_name || s.current_command)}</b> · ${s.windows} win · up ${ago(s.created)}
+            ${esc(s.host || 'local')} · <b>${esc(s.window_name || s.current_command)}</b> · ${s.windows} win · up ${ago(s.created)}
             ${s.attached ? ' · attached' : ''}
+            ${s.run ? ` · ${esc(s.run.state)} · ${esc(s.run.metadata.actual_model || s.run.assignment.model || 'model pending')}` : ''}
           </div>
         </span>
-        <a class="open" href="/terminal/${encodeURIComponent(s.name)}">Open</a>
-        <button class="ghost" onclick="kill('${esc(s.name)}')">Kill</button>
+        <a class="open" href="/terminal/${encodeURIComponent(s.name)}?host=${encodeURIComponent(s.host || 'local')}">Open</a>
+        <button class="ghost" data-name="${esc(s.name)}" data-host="${esc(s.host || 'local')}">Kill</button>
       </li>`).join('')
-      : '<div class="empty">No sessions yet. Start one above.</div>';
+      : '<div class="empty">No sessions found on reachable machines. Start one above.</div>';
+    $('list').querySelectorAll('button[data-name]').forEach(button => {
+      button.onclick = () => kill(button.dataset.name, button.dataset.host);
+    });
+    } catch (e) { $('err').textContent = e.message; }
+    finally { refreshing = false; }
   }
 
   async function create() {
@@ -133,19 +147,24 @@
     const r = await fetch('/api/sessions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name, kind: $('kind').value })
+      body: JSON.stringify({ name, kind: $('kind').value, host: $('machine').value })
     });
     if (r.ok) { $('name').value = ''; refresh(); }
     else $('err').textContent = await r.text();
   }
 
-  async function kill(name) {
-    if (!confirm(`Kill session "${name}"? Anything running in it stops.`)) return;
-    await fetch('/api/sessions/' + encodeURIComponent(name), { method: 'DELETE' });
+  async function kill(name, host) {
+    if (!confirm(`Kill session "${name}" on ${host}? Anything running in it stops.`)) return;
+    const r = await fetch('/api/sessions/' + encodeURIComponent(name) + '?host=' + encodeURIComponent(host), { method: 'DELETE' });
+    if (!r.ok) { $('err').textContent = await r.text(); return; }
     refresh();
   }
 
   $('name').addEventListener('keydown', e => { if (e.key === 'Enter') create(); });
+  fetch('/api/session-hosts').then(r => { if (!r.ok) throw new Error('Could not load machines'); return r.json(); }).then(hosts => {
+    $('machine').innerHTML = hosts.map(h => `<option value="${esc(h.host)}">${esc(h.name)}</option>`).join('');
+    $('host').textContent = hosts.find(h => h.host === 'local')?.name || location.hostname;
+  }).catch(e => { $('err').textContent = e.message; });
   refresh();
   setInterval(refresh, 4000);
 </script>

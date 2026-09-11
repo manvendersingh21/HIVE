@@ -9,6 +9,7 @@ pub struct OllamaClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    max_context: u32,
 }
 
 #[derive(Serialize)]
@@ -16,6 +17,9 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     stream: bool,
+    options: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'a serde_json::Value>,
     /// Suppress reasoning tokens on models that emit them.
     ///
     /// Qwen3.x and friends default to "thinking", spending hundreds of tokens
@@ -63,7 +67,13 @@ impl OllamaClient {
             http: reqwest::Client::new(),
             base_url,
             model,
+            max_context: 8192,
         }
+    }
+
+    pub fn with_context(mut self, max_context: u32) -> Self {
+        self.max_context = max_context.clamp(4096, 131072);
+        self
     }
 
     /// Send a multi-turn chat completion request.
@@ -85,11 +95,21 @@ impl OllamaClient {
     }
 
     pub async fn chat(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
+        self.chat_formatted(messages, None).await
+    }
+
+    async fn chat_formatted(
+        &self,
+        messages: &[ChatMessage],
+        format: Option<&serde_json::Value>,
+    ) -> anyhow::Result<String> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let req = ChatRequest {
             model: &self.model,
             messages,
             stream: false,
+            options: serde_json::json!({"num_ctx": self.max_context, "num_predict": 8192, "temperature": 0.1}),
+            format,
             think: false,
         };
 
@@ -113,6 +133,17 @@ impl OllamaClient {
     /// Send a single-turn completion request.
     pub async fn complete_raw(&self, prompt: &str) -> anyhow::Result<String> {
         self.chat(&[ChatMessage::user(prompt)]).await
+    }
+
+    /// Constrain JSON syntax and required fields at generation time. Shell
+    /// scripts contain backslashes that free-form model output often misescapes.
+    pub async fn complete_json(
+        &self,
+        prompt: &str,
+        schema: &serde_json::Value,
+    ) -> anyhow::Result<String> {
+        self.chat_formatted(&[ChatMessage::user(prompt)], Some(schema))
+            .await
     }
 
     /// Generate an embedding vector for `input` (used by the RAG index in Phase 9).

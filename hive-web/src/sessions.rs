@@ -1,8 +1,6 @@
 //! tmux session discovery and lifecycle.
 //!
-//! Everything here shells out to `tmux` on the machine hosting this server.
-//! That keeps the web layer honest: the sessions it lists are the same ones
-//! you would see from `tmux ls` over SSH, with no separate registry to drift.
+//! Discover local and configured remote tmux servers, without a separate registry.
 
 use std::process::Stdio;
 
@@ -13,6 +11,8 @@ use tokio::process::Command;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub name: String,
+    #[serde(default = "local_host")]
+    pub host: String,
     pub windows: u32,
     /// Unix timestamp the session was created.
     pub created: i64,
@@ -23,6 +23,129 @@ pub struct Session {
     /// can say "claude" even though `pane_current_command` reports the login
     /// shell that claude runs under.
     pub window_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<hive_core::delegation::store::Run>,
+}
+
+pub fn local_host() -> String {
+    "local".into()
+}
+
+/// Shell quoting is needed because SSH sends one command string to the remote shell.
+pub fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+pub fn ssh_args(worker: &hive_common::protocol::WorkerInfo) -> Vec<String> {
+    let mut args = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        // Dashboard polling and terminal tabs share one authenticated transport.
+        // Reconnecting every four seconds can hit a bastion's SSH login limits.
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        "ControlPersist=60".into(),
+        "-o".into(),
+        "ControlPath=~/.ssh/hive-web-%C".into(),
+        "-o".into(),
+        "ConnectTimeout=5".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        "-o".into(),
+        "ServerAliveInterval=5".into(),
+        "-o".into(),
+        "ServerAliveCountMax=2".into(),
+    ];
+    if let Some(port) = worker.port {
+        args.extend(["-p".into(), port.to_string()]);
+    }
+    args.push(worker.ssh_target());
+    args
+}
+
+pub fn remote_command(command: &str) -> String {
+    format!("{}; {command}", hive_core::workers::ssh::REMOTE_PATH)
+}
+
+async fn remote(
+    worker: &hive_common::protocol::WorkerInfo,
+    command: &str,
+) -> anyhow::Result<String> {
+    let mut cmd = Command::new("ssh");
+    cmd.args(ssh_args(worker))
+        .arg(remote_command(command))
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(8), cmd.output()).await??;
+    anyhow::ensure!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub async fn list_on(worker: &hive_common::protocol::WorkerInfo) -> anyhow::Result<Vec<Session>> {
+    // Only an absent tmux server is an empty list. Missing tmux and SSH errors
+    // must be surfaced so an unreachable worker does not look empty.
+    let out = remote(worker, &format!(
+        "out=$(tmux list-sessions -F {} 2>&1); rc=$?; if [ \"$rc\" -eq 0 ]; then printf '%s\\n' \"$out\"; else case \"$out\" in *'no server running'*|*'error connecting to '*'/default (No such file or directory)'*) ;; *) printf '%s\\n' \"$out\" >&2; exit \"$rc\";; esac; fi",
+        quote(LIST_FORMAT))).await?;
+    Ok(out
+        .lines()
+        .filter_map(parse_line)
+        .map(|mut s| {
+            s.host = worker.name.clone();
+            s
+        })
+        .collect())
+}
+
+pub async fn exists_on(
+    worker: &hive_common::protocol::WorkerInfo,
+    name: &str,
+) -> anyhow::Result<()> {
+    remote(
+        worker,
+        &format!("tmux has-session -t {}", quote(&format!("={name}"))),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn create_on(
+    worker: &hive_common::protocol::WorkerInfo,
+    name: &str,
+    kind: Kind,
+    dir: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut command = format!(
+        "tmux new-session -d -s {} -n {}",
+        quote(name),
+        quote(kind.label())
+    );
+    if let Some(dir) = dir {
+        command.push_str(&format!(" -c {}", quote(dir)));
+    }
+    match kind.launch_command() {
+        Some(program) => command.push_str(&format!(
+            " bash -lc {}",
+            quote(&format!("{program}; exec bash -l"))
+        )),
+        None => command.push_str(" bash -l"),
+    }
+    remote(worker, &command).await?;
+    Ok(())
+}
+
+pub async fn kill_on(worker: &hive_common::protocol::WorkerInfo, name: &str) -> anyhow::Result<()> {
+    remote(
+        worker,
+        &format!("tmux kill-session -t {}", quote(&format!("={name}"))),
+    )
+    .await?;
+    Ok(())
 }
 
 /// What to launch in a newly created session.
@@ -93,6 +216,8 @@ fn parse_line(line: &str) -> Option<Session> {
         current_command: parts.next().unwrap_or("").to_string(),
         window_name: parts.next().unwrap_or("").to_string(),
         name,
+        host: local_host(),
+        run: None,
     })
 }
 
@@ -161,6 +286,18 @@ pub fn valid_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_arguments_do_not_execute_shell_metacharacters() {
+        let value = "space ' quote; $(exit 17) `exit 18`";
+        let output = Command::new("sh")
+            .args(["-c", &format!("printf '%s' {}", quote(value))])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), value);
+    }
 
     #[test]
     fn parses_a_list_sessions_line() {

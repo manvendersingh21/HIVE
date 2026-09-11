@@ -78,7 +78,7 @@ pub fn print_outcomes(result: &RunResult) {
             StepStatus::Executed | StepStatus::Delegated => "ok",
             StepStatus::Failed => "FAILED",
             StepStatus::Denied => "skipped",
-            StepStatus::Skipped => "--",
+            StepStatus::Skipped | StepStatus::Pending => "--",
             StepStatus::AwaitingApproval => unreachable!("filtered above"),
         };
         if outcome.command.is_empty() {
@@ -265,6 +265,8 @@ mod tests {
 
     fn run_with_gate() -> (PlannedRun, RunResult) {
         let run = PlannedRun {
+            phase: Default::default(),
+            targets: vec![],
             id: "r1".into(),
             user_input: "clean up".into(),
             summary: "remove a directory".into(),
@@ -275,6 +277,7 @@ mod tests {
             conversation_id: None,
             steps: vec![
                 PlannedStep {
+                    file: None,
                     id: 0,
                     description: "safe".into(),
                     command: "ls".into(),
@@ -282,6 +285,7 @@ mod tests {
                     risk: None,
                 },
                 PlannedStep {
+                    file: None,
                     id: 1,
                     description: "risky".into(),
                     command: "rm -rf /tmp/x".into(),

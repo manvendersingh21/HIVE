@@ -2,18 +2,13 @@
 listen_addr = "0.0.0.0:9090"
 
 [llm]
-single_provider = "nvidia"
-
-[llm.nvidia]
-model = "nvidia/nemotron-3-ultra-550b-a55b"
-base_url = "https://integrate.api.nvidia.com/v1"
-timeout_secs = 120
+single_provider = "local"
 
 [llm.local]
 provider = "ollama"
 model = "qwen3.5:9b"
 base_url = "http://localhost:11434"
-max_context = 8192
+max_context = 16384
 
 [llm.gemini]
 model = "gemini-2.5-flash"
@@ -43,8 +38,8 @@ auto_collect = true  # Automatically log successful interactions
 
 [memory]
 auto_index = true                    # Auto-index conversations on completion
-embedding_provider = "nvidia"
-embedding_model = "nvidia/nemotron-3-embed-1b"
+embedding_provider = "local"
+embedding_model = "nomic-embed-text"
 chunk_size = 512                     # Tokens per RAG chunk
 chunk_overlap = 64                   # Overlap between chunks
 max_context_tokens = 2048            # Max tokens of retrieved context to inject

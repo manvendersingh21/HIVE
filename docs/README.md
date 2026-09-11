@@ -1,32 +1,28 @@
 # Documentation
 
-## Current guides
+## Getting Started
 
-- [Project overview and quick start](../README.md)
-- [Distributed collaboration](DISTRIBUTED-COLLABORATION.md): roles, SSH, verification, recovery
-- [HACP integration](HACP-HIVE.md): the external protocol library and dependency workflow
-- [Contributing](../CONTRIBUTING.md): development and validation requirements
-- [Security](../SECURITY.md): deployment boundaries and reporting
-- [Release 1 acceptance](RELEASE-1.md#final-acceptance-audit--complete-2026-09-07): measured two-device results
-- [Repository separation](REPOSITORY-SPLIT.md): extraction and validation evidence
+- [Project Overview and Quick Start](../README.md)
+- [Contributing](../CONTRIBUTING.md): Development and validation requirements
+- [Security](../SECURITY.md): Deployment boundaries and reporting
 
-## Protocol documentation
+## Core Features
 
-HACP's [README](https://github.com/manvendersingh21/hacp),
-[specifications](https://github.com/manvendersingh21/hacp/tree/main/spec),
-[schemas](https://github.com/manvendersingh21/hacp/tree/main/spec/schemas), and
-[testing guide](https://github.com/manvendersingh21/hacp/blob/main/docs/TESTING-YOUR-PROTOCOL.md)
-are maintained in their own repository. There is no in-tree `hacp/` crate.
+- [Distributed Collaboration](DISTRIBUTED-COLLABORATION.md): Roles, SSH, verification, recovery
+- [HACP Integration](HACP-HIVE.md): The external protocol library and dependency workflow
+- [Worker Placement](PLACEMENT.md): How Hive decides which machine runs what
+- [Fleet Delegation](FLEET-DELEGATION.md): Native agent sessions, peer messages, approvals and recovery
+- [Web Agent Workflow](AGENT-WORKFLOW.md): Execution feedback, correction, verification, and saved progress
+- [Deployment Guide](DEPLOYMENT.md): Production deployment and security considerations
 
-## Historical records
+## Project Status
 
-[STATUS](STATUS.md), [PROJECT-RECORD](PROJECT-RECORD.md),
-[ROADMAP](ROADMAP.md), [implementation plan](implementation-plan.md),
-[placement notes](PLACEMENT.md), [deployment notes](DEPLOY-WEB.md), and
-[findings](findings/) record earlier phases and maintainer-specific deployments.
-Read their dates and scope: old counts, commands, machine inventories, and
-uncompleted design proposals are not current installation instructions.
+- [Roadmap](ROADMAP.md): Current status and future plans
+- [Release Evidence](RELEASE-1.md): Tested capabilities and limitations
+- [Development Status](STATUS.md): Append-only development log with evidence
 
-References to the former `hacp/` directory in historical records can be inspected
-in [the pre-extraction HIVE tree](https://github.com/manvendersingh21/HIVE/tree/87dd12251a6e2375d48d77f85b64aba58b4c3d19).
-Keep historical evidence intact; use the current guides for new deployments.
+## Historical Records
+
+Historical documents and findings:
+- [Architecture Decision Records](adr/): Design decisions and rationale
+- [Findings](findings/): Debugging and investigation records

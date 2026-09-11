@@ -29,7 +29,30 @@
   nav a:hover { color: var(--text); background: var(--panel); }
   nav a.on { color: var(--accent); background: var(--panel); }
 
+  .workspace { display: flex; flex: 1; min-height: 0; }
+  .conversation { flex: 1; min-width: 0; display: flex; flex-direction: column; }
   main { flex: 1; overflow-y: auto; }
+  aside { width: 260px; flex: none; padding: 16px 12px; border-right: 1px solid var(--line); overflow-y: auto; }
+  .history-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .history-top h2 { margin: 0; font-size: 15px; }
+  .history-button { border: 1px solid var(--line2); border-radius: 7px; background: var(--panel); color: var(--text); cursor: pointer; padding: 7px 10px; }
+  #chat-search { width: 100%; padding: 9px; border: 1px solid var(--line2); border-radius: 7px; background: var(--bg); color: var(--text); font: inherit; font-size: 16px; }
+  #chat-list { margin-top: 12px; }
+  .chat-item { display: block; text-align: left; width: 100%; padding: 10px; margin-bottom: 5px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--text); cursor: pointer; }
+  .chat-item:hover, .chat-item.selected { background: var(--panel); border-color: var(--line2); }
+  .chat-item.selected { border-color: var(--accent); }
+  .chat-item strong { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 500; }
+  .chat-item small { color: var(--dim); }
+  #chat-title { padding: 10px 18px; font-size: 14px; color: var(--dim); border-bottom: 1px solid var(--line); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  #history-error { font-size: 13px; color: var(--bad); }
+  #history-toggle { display: none; }
+  @media (max-width: 700px) {
+    header { gap: 7px; padding: 10px; }
+    nav { gap: 0; } nav a { padding: 6px; font-size: 12px; }
+    #history-toggle { display: inline-block; }
+    aside { display: none; position: fixed; top: 59px; bottom: 0; left: 0; z-index: 6; background: var(--bg); width: min(85vw, 300px); box-shadow: 8px 0 25px #0008; }
+    aside.open { display: block; }
+  }
   .wrap { max-width: 780px; margin: 0 auto; padding: 22px 18px 8px; }
 
   .intro { color: var(--dim); font-size: 14px; padding: 32px 0; text-align: center; }
@@ -122,6 +145,7 @@
 
 <header>
   <h1>🐝 Hive</h1>
+  <button id="history-toggle" class="history-button" aria-controls="history-panel" aria-expanded="false">Chats</button>
   <nav>
     <a href="/" class="on">Agent</a>
     <a href="/sessions">Sessions</a>
@@ -129,6 +153,16 @@
   </nav>
 </header>
 
+<div class="workspace">
+<aside id="history-panel" aria-label="Saved chats">
+  <div class="history-top"><h2>Chats</h2><button id="new-chat" class="history-button">New chat</button></div>
+  <input id="chat-search" type="search" placeholder="Search chats…" aria-label="Search saved chats">
+  <div id="history-error" role="status"></div>
+  <div id="chat-list"></div>
+  <button id="more-chats" class="history-button" hidden>Load more</button>
+</aside>
+<section class="conversation" aria-label="Conversation">
+<div id="chat-title">New chat · saved automatically</div>
 <main><div class="wrap" id="feed">
   <div class="intro" id="intro">
     Ask the agent to do something. It classifies the task, picks a model, plans,
@@ -142,6 +176,7 @@
             autocapitalize="sentences" autocorrect="on"></textarea>
   <button class="send" id="send">Send</button>
 </div></footer>
+</section></div>
 
 <script>
   const $ = id => document.getElementById(id);
@@ -155,7 +190,8 @@
   };
   const label = p => PROVIDER[p] || String(p).toLowerCase();
 
-  const scroll = () => feed.parentElement.scrollTo({ top: feed.scrollHeight, behavior: 'smooth' });
+  let restoring = false;
+  const scroll = () => { if (!restoring) feed.parentElement.scrollTo({ top: feed.scrollHeight, behavior: 'smooth' }); };
 
   function addUser(text) {
     $('intro')?.remove();
@@ -169,7 +205,7 @@
   function addAgent() {
     const el = document.createElement('div');
     el.className = 'msg agent';
-    el.innerHTML = `<div class="thinking"><span class="spin"></span>planning…</div>`;
+    el.innerHTML = `<div class="thinking"><span class="spin"></span>Planning and running…</div>`;
     feed.appendChild(el);
     scroll();
     return el;
@@ -178,7 +214,7 @@
   // A step whose outcome is `awaiting_approval` renders with the command the
   // server is holding — the browser never sends a command back, only an id.
   function stepHtml(step, outcome) {
-    const status = outcome?.status ?? 'skipped';
+    const status = outcome?.status ?? 'pending';
     const body = (outcome?.output ?? '').trim();
     const gated = status === 'awaiting_approval';
     const where = step.target.kind === 'remote'
@@ -211,7 +247,91 @@
       </div>`;
   }
 
+  let delegatedWatching = false;
+  const expandedRuns = new Set();
+  function renderDelegation(el, task) {
+    el.dataset.taskId = task.task_id;
+    el.innerHTML = `<div class="agent-head"><span class="badge model">Hive coordinator</span></div>
+      <div class="summary">${esc(task.runs.find(r=>r.state!=='superseded' && r.review?.summary)?.review.summary || task.summary)}</div>` + task.runs.map(run => {
+        const pending = run.state==='superseded' ? [] : (run.metadata.approvals || []).filter(a => !a.decision && !a.consumed);
+        return `<div class="step"><b>${esc(run.assignment.device)} · ${esc(run.assignment.agent)}</b>
+          <span class="tag">${esc(run.state)}</span>
+          <div>${esc(run.metadata.actual_model || run.assignment.model || 'Resolving native model')}</div>
+          <div>${esc(run.assignment.objective)}</div>
+          <div>${esc(run.metadata.reason || '')}</div>
+          <a href="/terminal/${encodeURIComponent(run.tmux_name)}?host=${encodeURIComponent(run.assignment.device)}" target="_blank" rel="noopener">Open Session</a>
+          <button data-output="${esc(run.id)}">View output</button>
+          <button data-guidance="${esc(run.id)}">Send guidance</button>
+          ${['failed','disconnected','needs-setup'].includes(run.state) && run.runner_path ? `<button data-recovery="${esc(run.id)}">Review recovery</button>` : ''}
+          ${run.state==='needs-setup' && !run.runner_path ? `<button data-retry="${esc(run.id)}">Retry setup</button>` : ''}
+          ${run.state !== 'superseded' ? `<button data-move="${esc(run.id)}">Move assignment</button>` : ''}
+          ${pending.map(a => `<div class="gate"><b>Approval required on ${esc(run.assignment.device)} · ${esc(run.assignment.agent)}</b>
+            <pre>${esc(a.action)}</pre>${a.details ? `<pre>${esc(JSON.stringify(a.details, null, 2))}</pre>` : ''}<div>${esc(a.reason)}</div>
+            <button data-decision="continue" data-run="${esc(run.id)}" data-id="${esc(a.id)}" data-fingerprint="${esc(a.fingerprint)}">Continue</button>
+            <button data-decision="stop" data-run="${esc(run.id)}" data-id="${esc(a.id)}" data-fingerprint="${esc(a.fingerprint)}">Stop</button></div>`).join('')}
+          <pre class="run-output" data-run-output="${esc(run.id)}" hidden></pre></div>`;
+      }).join('');
+    el.querySelectorAll('[data-decision]').forEach(button => button.onclick = async () => {
+      button.disabled = true;
+      try {
+        await chatRequest(`/api/runs/${encodeURIComponent(button.dataset.run)}/decisions`, {id:button.dataset.id, fingerprint:button.dataset.fingerprint, decision:button.dataset.decision});
+        await refreshChat();
+      } catch(e) { button.disabled=false; button.textContent=e.message; }
+    });
+    el.querySelectorAll('[data-output]').forEach(button => button.onclick = async () => {
+      const output = el.querySelector(`[data-run-output="${button.dataset.output}"]`);
+      if (expandedRuns.has(button.dataset.output)) expandedRuns.delete(button.dataset.output); else expandedRuns.add(button.dataset.output);
+      showRunOutput(button.dataset.output, output, task.runs);
+
+    });
+    el.querySelectorAll('[data-run-output]').forEach(output => { if (expandedRuns.has(output.dataset.runOutput)) showRunOutput(output.dataset.runOutput, output, task.runs); });
+    el.querySelectorAll('[data-retry]').forEach(button => button.onclick=async()=>{try {await chatRequest(`/api/runs/${encodeURIComponent(button.dataset.retry)}/retry-setup`,{});await refreshChat();}catch(e){button.textContent=e.message;}});
+    el.querySelectorAll('[data-move]').forEach(button => button.onclick = async () => {
+      const device=window.prompt('Configured destination device name:'); if (!device?.trim()) return;
+      try {await chatRequest(`/api/runs/${encodeURIComponent(button.dataset.move)}/replace`,{device:device.trim()}); await refreshChat();} catch(e) {button.textContent=e.message;}
+    });
+    el.querySelectorAll('[data-recovery]').forEach(button => button.onclick = async () => {
+      try {
+        const recovery = await readJSON(`/api/runs/${encodeURIComponent(button.dataset.recovery)}/recovery`);
+        const dialog = document.createElement('dialog');
+        const run = task.runs.find(r=>r.id===button.dataset.recovery);
+        dialog.innerHTML = `<h3>Recover ${esc(run.assignment.agent)} on ${esc(run.assignment.device)}</h3>
+          <p>Review the last action and its effects before resuming this conversation.</p>
+          <div>${recovery.blockers.map(esc).join('<br>')}</div>
+          <details><summary>Recorded actions and delivery state</summary><pre style="max-height:35vh;overflow:auto;white-space:pre-wrap">${esc(JSON.stringify(recovery.snapshot, null, 2))}</pre></details>
+          ${recovery.acknowledge_ids.map(id=>`<label style="display:block"><input type="checkbox" data-ack="${esc(id)}"> I reviewed delivery ${esc(id)}; do not replay it.</label>`).join('')}
+          <label style="display:block">Reason for recovery <textarea data-reason></textarea></label>
+          <label style="display:block">Verified effects of the last action <textarea data-evidence></textarea></label>
+          <p data-recovery-error></p><button data-resume ${recovery.can_resume ? '' : 'disabled'}>Resume same session</button> <button data-close>Close</button>`;
+        document.body.append(dialog);dialog.showModal();
+        dialog.querySelector('[data-close]').onclick=()=>{dialog.close();dialog.remove();};
+        dialog.querySelector('[data-resume]').onclick=async()=>{
+          const error=dialog.querySelector('[data-recovery-error]');
+          const reason=dialog.querySelector('[data-reason]').value.trim(),evidence=dialog.querySelector('[data-evidence]').value.trim();
+          const checked=Array.from(dialog.querySelectorAll('[data-ack]:checked')).map(c=>c.dataset.ack);
+          if(!reason || !evidence || checked.length!==recovery.acknowledge_ids.length){error.textContent='Enter the reason, verified effects, and acknowledge every uncertain delivery.';return;}
+          const submit=dialog.querySelector('[data-resume]');submit.disabled=true;
+          try {await chatRequest(`/api/runs/${encodeURIComponent(run.id)}/recovery`,{fingerprint:recovery.fingerprint,reason,evidence,acknowledge_ids:checked});dialog.close();dialog.remove();await refreshChat();}
+          catch(e){error.textContent=e.message;submit.disabled=false;}
+        };
+      } catch(e) {button.textContent=e.message;}
+    });
+    el.querySelectorAll('[data-guidance]').forEach(button => button.onclick = async () => {
+      const text = window.prompt('Guidance for this agent (continues the same conversation):');
+      if (!text?.trim()) return;
+      try { await chatRequest(`/api/runs/${encodeURIComponent(button.dataset.guidance)}/messages`, {id:crypto.randomUUID(),text}); }
+      catch(e) { button.textContent=e.message; }
+    });
+  }
+  async function showRunOutput(id, output, runs) {
+    output.hidden = !expandedRuns.has(id);
+    if (output.hidden) return;
+    const run=runs.find(r=>r.id===id);
+    try { const events=await readJSON(`/api/runs/${encodeURIComponent(id)}/events?after=${Math.max(0,(run?.cursor||0)-100)}`); output.textContent=events.map(e=>JSON.stringify(e.payload)).join('\n'); }
+    catch(e) { output.textContent=e.message; }
+  }
   function render(el, reply) {
+    if (reply.delegation) { renderDelegation(el, reply.delegation); return; }
     const { run, result } = reply;
     const byId = Object.fromEntries(result.outcomes.map(o => [o.id, o]));
     el.dataset.runId = run.id;
@@ -225,10 +345,42 @@
                fell back from ${esc(label(run.routed_provider))}
              </span>` : ''}
       </div>
+      ${reply.workflow ? `<div class="tag">Round ${reply.workflow.round} · ${esc(reply.workflow.status.replace(/_/g, ' '))}${reply.workflow.status === 'running' ? ' · observing results and continuing' : ''}</div>` : ''}
       <div class="summary">${esc(result.summary)}</div>
       ${run.steps.map(s => stepHtml(s, byId[s.id])).join('')}`;
     wireGates(el);
     scroll();
+  }
+
+  // Keep the timer active through body parsing, including a stalled response body.
+  // A transport timeout cannot tell us whether execution started: never auto-retry.
+  async function chatRequest(url, body) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 180000);
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+      if (r.status === 401) {
+        location.href = '/login';
+        throw new Error('Your session expired. Sign in again.');
+      }
+      if (!r.ok) throw new Error(await r.text());
+      return await r.json();
+    } catch (e) {
+      if (controller.signal.aborted) {
+        throw new Error('No response within 3 minutes. Work may still be running; check Sessions before retrying.');
+      }
+      if (e instanceof TypeError) {
+        throw new Error('Connection to Hive was lost. Check Tailscale and reload the page. Work may still be running; check Sessions before retrying.');
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function wireGates(el) {
@@ -241,13 +393,10 @@
 
         const body = approve ? { approved: [id] } : { denied: [id] };
         try {
-          const r = await fetch(`/api/chat/${encodeURIComponent(el.dataset.runId)}/approve`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body)
-          });
-          if (!r.ok) throw new Error(await r.text());
-          render(el, await r.json());
+          const reply = await chatRequest(`/api/chat/${encodeURIComponent(el.dataset.runId)}/approve`, body);
+          render(el, reply);
+          if (activeChat === reply.conversation_id) await refreshChat();
+          loadChats();
         } catch (e) {
           el.insertAdjacentHTML('beforeend', `<div class="err">${esc(e.message)}</div>`);
         }
@@ -255,29 +404,148 @@
     });
   }
 
+  let activeChat = null, sending = false, chatBusy = false, viewVersion = 0;
+  let listVersion = 0, listOffset = 0, searchTimer;
+  const emptyFeed = feed.innerHTML;
+
+  function updateComposer() { send.disabled = sending || chatBusy; }
+  function closeHistory() {
+    $('history-panel').classList.remove('open');
+    $('history-toggle').setAttribute('aria-expanded', 'false');
+  }
+  function rememberChat(id) {
+    history.replaceState(null, '', id ? '#chat=' + encodeURIComponent(id) : location.pathname);
+  }
+  function requestId() {
+    // randomUUID requires HTTPS; getRandomValues also works on the tailnet HTTP UI.
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+    const hex = [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+  }
+  async function readJSON(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      const r = await fetch(url, { cache: 'no-store', signal: controller.signal });
+      if (r.status === 401) { location.href = '/login'; throw new Error('Sign in again to open your chats.'); }
+      if (!r.ok) throw new Error(await r.text());
+      return await r.json();
+    } finally { clearTimeout(timer); }
+  }
+  async function loadChats(more = false) {
+    const version = ++listVersion;
+    const offset = more ? listOffset : 0;
+    try {
+      const chats = await readJSON(`/api/chats?q=${encodeURIComponent($('chat-search').value)}&offset=${offset}`);
+      if (version !== listVersion) return;
+      if (!more) $('chat-list').replaceChildren();
+      for (const chat of chats) {
+        const button = document.createElement('button');
+        button.className = 'chat-item' + (chat.id === activeChat ? ' selected' : '');
+        button.dataset.chatId = chat.id;
+        button.innerHTML = `<strong>${esc(chat.title || 'New chat')}</strong><small>${esc(chat.updated_at)} · ${chat.message_count} messages</small>`;
+        button.addEventListener('click', () => openChat(chat.id));
+        $('chat-list').appendChild(button);
+      }
+      listOffset = offset + chats.length;
+      $('more-chats').hidden = chats.length < 50;
+      $('history-error').textContent = '';
+    } catch (e) { if (version === listVersion) $('history-error').textContent = 'Could not load saved chats: ' + e.message; }
+  }
+  async function refreshChat(scrollToEnd = false) {
+    const id = activeChat, version = viewVersion;
+    if (!id) return;
+    const data = await readJSON('/api/chats/' + encodeURIComponent(id));
+    const delegated = await readJSON('/api/runs?conversation_id=' + encodeURIComponent(id));
+    for (const message of data.messages) { if (message.reply?.delegation) message.reply.delegation.runs = delegated.filter(r => r.task_id === message.reply.delegation.task_id); }
+    if (id !== activeChat || version !== viewVersion) return;
+    delegatedWatching = delegated.some(r => r.state !== 'superseded' && r.review?.status !== 'complete');
+    const main = feed.parentElement, oldTop = main.scrollTop;
+    const nearEnd = main.scrollHeight - oldTop - main.clientHeight < 100;
+    restoring = true;
+    feed.replaceChildren();
+    chatBusy = false;
+    for (const message of data.messages) {
+      if (message.role === 'user') { addUser(message.content); continue; }
+      const el = addAgent();
+      if (message.status === 'planning' || message.status === 'executing') {
+        chatBusy = true;
+        if (message.reply) render(el, message.reply);
+        else el.innerHTML = `<div class="thinking"><span class="spin"></span>${message.status === 'planning' ? 'Planning…' : 'Running commands…'}</div>`;
+      } else if (message.status === 'failed' || message.status === 'interrupted') {
+        if (message.reply) render(el, message.reply);
+        else el.innerHTML = `<div class="err">${esc(message.content)}</div>`;
+        if (message.status === 'interrupted' && message.reply) el.insertAdjacentHTML('afterbegin', `<div class="err">${esc(message.content)}</div>`);
+      } else if (message.reply) {
+        render(el, message.reply);
+        if (message.status === 'awaiting_approval') chatBusy = true;
+      } else {
+        el.innerHTML = `<div class="summary">${esc(message.content)}</div>`;
+      }
+    }
+    if (!data.messages.length) feed.innerHTML = emptyFeed;
+    restoring = false;
+    $('chat-title').textContent = data.chat.title + ' · saved';
+    if (scrollToEnd || nearEnd) scroll(); else main.scrollTop = oldTop;
+    updateComposer();
+  }
+  async function openChat(id) {
+    activeChat = id; viewVersion++; chatBusy = true; updateComposer();
+    rememberChat(id); closeHistory();
+    feed.innerHTML = '<div class="thinking">Loading saved chat…</div>';
+    try { await refreshChat(true); }
+    catch (e) { if (activeChat === id) { feed.innerHTML = `<div class="err">${esc(e.message)}</div>`; chatBusy = false; updateComposer(); } }
+    loadChats();
+  }
+  function newChat() {
+    activeChat = null; viewVersion++; chatBusy = false; rememberChat(null); closeHistory();
+    feed.innerHTML = emptyFeed; input.value = ''; input.style.height = 'auto';
+    $('chat-title').textContent = 'New chat · saved automatically';
+    updateComposer(); loadChats(); input.focus();
+  }
   async function submit() {
     const text = input.value.trim();
-    if (!text) return;
-    input.value = ''; input.style.height = 'auto';
-    send.disabled = true;
-    addUser(text);
-    const el = addAgent();
+    if (!text || send.disabled) return;
+    sending = true; updateComposer();
+    let id = activeChat;
+    let el;
+    const version = viewVersion;
     try {
-      const r = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message: text })
-      });
-      if (r.status === 401) return location.href = '/login';
-      if (!r.ok) throw new Error(await r.text());
-      render(el, await r.json());
+      if (!id) {
+        const chat = await chatRequest('/api/chats', {});
+        if (version !== viewVersion) return;
+        id = activeChat = chat.id; rememberChat(id);
+      }
+      input.value = ''; input.style.height = 'auto';
+      addUser(text); el = addAgent();
+      const reply = await chatRequest('/api/chat', { message: text, conversation_id: id, request_id: requestId(), background: true });
+      if (activeChat === id && version === viewVersion) {
+        if (reply.run || reply.delegation) render(el, reply);
+        else { chatBusy = true; el.innerHTML = '<div class="thinking"><span class="spin"></span>Hive is working. Progress is saved here.</div>'; }
+      }
     } catch (e) {
-      el.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+      if (activeChat === id && version === viewVersion) {
+        if (!el) el = addAgent();
+        el.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+      }
     } finally {
-      send.disabled = false;
+      sending = false; updateComposer(); loadChats();
+      if (id === activeChat) refreshChat().catch(() => {});
       input.focus();
     }
   }
+  $('new-chat').addEventListener('click', newChat);
+  $('history-toggle').addEventListener('click', () => {
+    const open = $('history-panel').classList.toggle('open');
+    $('history-toggle').setAttribute('aria-expanded', String(open));
+  });
+  $('chat-search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => loadChats(), 250); });
+  $('more-chats').addEventListener('click', () => loadChats(true));
+  setInterval(() => { if (activeChat && (sending || chatBusy || delegatedWatching)) refreshChat().catch(() => {}); }, 3000);
+  loadChats();
+  const initialChat = new URLSearchParams(location.hash.slice(1)).get('chat');
+  if (initialChat) openChat(initialChat);
 
   send.addEventListener('click', submit);
   input.addEventListener('keydown', e => {

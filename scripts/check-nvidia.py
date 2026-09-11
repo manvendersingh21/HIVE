@@ -77,7 +77,7 @@ class Mock(BaseHTTPRequestHandler):
             elif "You extract a knowledge graph" in prompt:
                 text = json.dumps({"entities": [{"name": "smoke", "kind": "tool", "description": "test"}], "relations": []})
             else:
-                text = json.dumps({"summary": "Print smoke marker", "subtasks": [{"description": "Print marker", "requires_remote": False, "commands": ["printf 'hive-nvidia-ok\\n'"], "expected_behavior": "Print marker", "required_capabilities": []}]})
+                text = json.dumps({"phase": "work", "targets": ["local"], "summary": "Print smoke marker", "subtasks": [{"description": "Print marker", "target_machine": "local", "requires_remote": False, "commands": ["printf 'hive-nvidia-ok\\n'"], "expected_behavior": "Print marker", "required_capabilities": []}]})
             result = {"model": MODEL, "choices": [{"finish_reason": "stop", "message": {"content": text, "reasoning_content": "must remain separate"}}]}
         data = json.dumps(result).encode()
         self.send_response(200)
@@ -103,8 +103,8 @@ def api(path, body):
         return json.load(response)
 
 
-def complete(prompt):
-    result = api("/chat/completions", {"model": MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 1, "top_p": 0.95, "max_tokens": 16384, "stream": False, "chat_template_kwargs": {"enable_thinking": True}})
+def complete(prompt, thinking=True):
+    result = api("/chat/completions", {"model": MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 1, "top_p": 0.95, "max_tokens": 16384, "stream": False, "chat_template_kwargs": {"enable_thinking": thinking}})
     assert result["choices"][0]["finish_reason"] == "stop", result["choices"][0]["finish_reason"]
     content = result["choices"][0]["message"]["content"]
     assert content.strip()
@@ -113,7 +113,7 @@ def complete(prompt):
 
 try:
     if args.probe in (None, "classification"):
-        label = timed("classification", lambda: complete("Classify echo hi as SIMPLE, MEDIUM, COMPLEX, or CODE_HEAVY. Return only the word."))
+        label = timed("classification", lambda: complete("Classify echo hi as SIMPLE, MEDIUM, COMPLEX, or CODE_HEAVY. Return only the word.", thinking=False))
         assert label.strip() == "SIMPLE", label
     if args.probe in (None, "planning"):
         plan = timed("planning", lambda: complete('Return only a JSON plan with summary and subtasks for echo hi. Each subtask has description, requires_remote=false, commands, and expected_behavior.'))
@@ -203,7 +203,11 @@ listen_addr = "127.0.0.1:0"
                 web.terminate()
                 web.wait(timeout=10)
     if not args.live:
-        assert all(body.get("chat_template_kwargs") == {"enable_thinking": True} for path, body in records if path.endswith("completions"))
+        for path, body in records:
+            if path.endswith("completions"):
+                prompt = body["messages"][0]["content"]
+                auxiliary = prompt.startswith("Classify") or "You extract a knowledge graph" in prompt
+                assert body.get("chat_template_kwargs") == {"enable_thinking": not auxiliary}
         print(f"Mock requests checked: {len(records)}")
 finally:
     if mock:

@@ -2,6 +2,7 @@
 
 pub mod planner;
 pub mod run;
+pub mod workflow;
 
 use std::sync::Arc;
 
@@ -163,12 +164,24 @@ impl MasterAgent {
             plan.subtasks.len()
         );
 
+        // Validate every destination before executing any part of the plan.
+        let targets = plan
+            .subtasks
+            .iter()
+            .map(|s| self.subtask_target(s))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
         // 4. Execute local subtasks now; delegate remote ones to a worker
         let mut notes = Vec::new();
         let mut sessions = Vec::new();
-        for subtask in &plan.subtasks {
-            if subtask.requires_remote {
-                match self.workers.select_worker() {
+        for (subtask, target) in plan.subtasks.iter().zip(targets) {
+            if let StepTarget::Remote { worker: name } = target {
+                match self
+                    .workers
+                    .workers
+                    .iter()
+                    .find(|w| w.info.name == name && w.is_online())
+                {
                     Some(worker) => {
                         let assignment = TaskAssignment::new(
                             subtask.description.clone(),
@@ -314,6 +327,32 @@ impl MasterAgent {
             None => None,
         };
         let context_block = render_turn_context(turn.as_ref());
+        self.plan_with_context(user_input, context_block, turn.map(|t| t.conversation_id))
+            .await
+    }
+
+    /// Web history is already durably saved by the caller, which also owns the
+    /// reply. Keep it separate from the CLI's automatic one-turn persistence.
+    pub async fn plan_chat_run(
+        &self,
+        user_input: &str,
+        history: Vec<String>,
+    ) -> anyhow::Result<PlannedRun> {
+        let context = crate::memory::RetrievedContext {
+            recent_messages: history,
+            rag_chunks: vec![],
+            kg_entities: vec![],
+        };
+        self.plan_with_context(user_input, Some(context.render()), None)
+            .await
+    }
+
+    async fn plan_with_context(
+        &self,
+        user_input: &str,
+        context_block: Option<String>,
+        conversation_id: Option<String>,
+    ) -> anyhow::Result<PlannedRun> {
         let skill = self.skills.resolve(user_input, &self.llm).await;
 
         let complexity = self.llm.classify_complexity(user_input).await?;
@@ -337,52 +376,65 @@ impl MasterAgent {
             info!(skill = %s.name, "skill active for this request");
         }
 
+        self.materialize_plan(
+            user_input,
+            plan,
+            complexity,
+            provider,
+            conversation_id,
+            skill,
+        )
+    }
+
+    fn materialize_plan(
+        &self,
+        user_input: &str,
+        plan: planner::TaskPlan,
+        complexity: hive_common::Complexity,
+        provider: hive_common::AiProvider,
+        conversation_id: Option<String>,
+        skill: Option<&crate::skills::Skill>,
+    ) -> anyhow::Result<PlannedRun> {
         let mut steps = Vec::new();
         for subtask in &plan.subtasks {
-            let target = if subtask.requires_remote {
-                // Ask the graph for a machine that can actually do this work,
-                // rather than any machine at all.
-                let mut needed: Vec<&str> = vec![BASELINE_CAPABILITY];
-                needed.extend(subtask.required_capabilities.iter().map(String::as_str));
-                match self.choose_worker(&needed) {
-                    Some(worker) => StepTarget::Remote {
-                        worker: worker.info.name.clone(),
-                    },
-                    // Named so the UI can say *which* worker was wanted even
-                    // when none is available.
-                    None => StepTarget::Remote {
-                        worker: String::new(),
-                    },
-                }
-            } else {
-                StepTarget::Local
-            };
+            let target = self.subtask_target(subtask)?;
 
+            for file in &subtask.files {
+                let command = format!("write_file {}\n{}", file.path, file.content);
+                steps.push(PlannedStep {
+                    id: steps.len(),
+                    description: subtask.description.clone(),
+                    command: command.clone(),
+                    file: Some(file.clone()),
+                    target: target.clone(),
+                    risk: assess_command_with_interceptor(
+                        &self.watchdog,
+                        &self.interceptor,
+                        &command,
+                    ),
+                });
+            }
             for command in &subtask.commands {
                 steps.push(PlannedStep {
                     id: steps.len(),
                     description: subtask.description.clone(),
                     command: command.clone(),
-                    // Remote commands are supervised live by the watchdog once
-                    // delegated; the pre-flight gate is for local execution,
-                    // which has no such supervision.
-                    risk: match target {
-                        StepTarget::Local => assess_command_with_interceptor(
-                            &self.watchdog,
-                            &self.interceptor,
-                            command,
-                        ),
-                        StepTarget::Remote { .. } => None,
-                    },
+                    file: None,
+                    risk: assess_command_with_interceptor(
+                        &self.watchdog,
+                        &self.interceptor,
+                        command,
+                    ),
                     target: target.clone(),
                 });
             }
 
-            if subtask.commands.is_empty() {
+            if subtask.commands.is_empty() && subtask.files.is_empty() {
                 steps.push(PlannedStep {
                     id: steps.len(),
                     description: subtask.description.clone(),
                     command: String::new(),
+                    file: None,
                     target: target.clone(),
                     risk: None,
                 });
@@ -396,7 +448,7 @@ impl MasterAgent {
         // no other way around the watchdog.
         if let Some(s) = skill.filter(|s| s.require_confirmation) {
             for step in &mut steps {
-                if step.risk.is_none() && matches!(step.target, StepTarget::Local) {
+                if step.risk.is_none() {
                     step.risk = Some(SafetyAnalysis {
                         is_safe: false,
                         severity: Severity::Low,
@@ -408,7 +460,34 @@ impl MasterAgent {
             }
         }
 
+        // Explicit configured names in the request take precedence over model
+        // metadata. A model sometimes copies the entire fleet into `targets`.
+        let named = self.named_request_targets(user_input);
+        let destination_names = if named.is_empty() {
+            &plan.targets
+        } else {
+            &named
+        };
+        let mut targets = Vec::new();
+        for name in destination_names {
+            let task: planner::SubTask = serde_json::from_value(serde_json::json!({
+                "description":"task destination", "target_machine":name, "commands":[]
+            }))?;
+            let target = self.subtask_target(&task)?;
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        if targets.is_empty() {
+            for step in &steps {
+                if !targets.contains(&step.target) {
+                    targets.push(step.target.clone());
+                }
+            }
+        }
         Ok(PlannedRun {
+            phase: plan.phase,
+            targets,
             id: format!("run-{}", uuid::Uuid::new_v4()),
             user_input: user_input.to_string(),
             summary: plan.summary,
@@ -417,7 +496,7 @@ impl MasterAgent {
             provider: plan.provider_used,
             model: plan.model_used.clone(),
             steps,
-            conversation_id: turn.map(|t| t.conversation_id),
+            conversation_id,
         })
     }
 
@@ -431,7 +510,17 @@ impl MasterAgent {
         let mut sessions = Vec::new();
         let mut awaiting = Vec::new();
 
+        let mut halted = false;
         for step in &plan.steps {
+            if halted {
+                outcomes.push(StepOutcome {
+                    id: step.id,
+                    command: step.command.clone(),
+                    status: StepStatus::Pending,
+                    output: "Not run: an earlier step failed or requires review.".into(),
+                });
+                continue;
+            }
             if step.command.is_empty() {
                 outcomes.push(StepOutcome {
                     id: step.id,
@@ -445,6 +534,7 @@ impl MasterAgent {
             if step.needs_approval() {
                 match approvals.decision(step.id) {
                     Decision::Pending => {
+                        halted = true;
                         awaiting.push(step.id);
                         outcomes.push(StepOutcome {
                             id: step.id,
@@ -459,6 +549,7 @@ impl MasterAgent {
                         continue;
                     }
                     Decision::Denied => {
+                        halted = true;
                         outcomes.push(StepOutcome {
                             id: step.id,
                             command: step.command.clone(),
@@ -473,12 +564,52 @@ impl MasterAgent {
                 }
             }
 
+            let command = match &step.file {
+                Some(file) => match workflow::file_command(file) {
+                    Ok(command) => command,
+                    Err(e) => {
+                        outcomes.push(StepOutcome {
+                            id: step.id,
+                            command: step.command.clone(),
+                            status: StepStatus::Failed,
+                            output: e.to_string(),
+                        });
+                        halted = true;
+                        continue;
+                    }
+                },
+                None => step.command.clone(),
+            };
+            // Reject malformed shell syntax before creating a remote session.
+            let syntax = tokio::process::Command::new("bash")
+                .args(["-n", "-c", &command])
+                .output()
+                .await;
+            if let Ok(out) = &syntax {
+                if !out.status.success() {
+                    outcomes.push(StepOutcome {
+                        id: step.id,
+                        command: step.command.clone(),
+                        status: StepStatus::Failed,
+                        output: format!(
+                            "Shell syntax rejected before execution: {}",
+                            String::from_utf8_lossy(&out.stderr)
+                        ),
+                    });
+                    halted = true;
+                    continue;
+                }
+            }
             match &step.target {
-                StepTarget::Local => match self.tools.run_shell(&step.command).await {
+                StepTarget::Local => match self.tools.run_shell(&command).await {
                     Ok(output) => outcomes.push(StepOutcome {
                         id: step.id,
                         command: step.command.clone(),
-                        status: StepStatus::Executed,
+                        status: if output.starts_with("exit_code: 0\n") {
+                            StepStatus::Executed
+                        } else {
+                            StepStatus::Failed
+                        },
                         output,
                     }),
                     Err(e) => outcomes.push(StepOutcome {
@@ -522,12 +653,13 @@ impl MasterAgent {
                                 )
                             },
                         });
+                        halted = true;
                         continue;
                     };
 
                     let assignment = TaskAssignment::new(
                         step.description.clone(),
-                        vec![TaskCommand::new(step.command.clone())],
+                        vec![TaskCommand::new(command)],
                         format!("hive-{}", uuid::Uuid::new_v4()),
                     );
 
@@ -537,16 +669,32 @@ impl MasterAgent {
                         .await
                     {
                         Ok(session) => {
-                            outcomes.push(StepOutcome {
-                                id: step.id,
-                                command: step.command.clone(),
-                                status: StepStatus::Delegated,
-                                output: format!(
-                                    "Delegated to '{}' as tmux session '{}'.",
-                                    node.info.name, session.session_name
-                                ),
-                            });
-                            sessions.push(session);
+                            match self.workers.wait_for_completion(&session, 120).await {
+                                Ok((finished, output)) => {
+                                    outcomes.push(StepOutcome {
+                                        id: step.id,
+                                        command: step.command.clone(),
+                                        status: if finished.state
+                                            == hive_common::TaskState::Completed
+                                        {
+                                            StepStatus::Executed
+                                        } else {
+                                            StepStatus::Failed
+                                        },
+                                        output,
+                                    });
+                                    sessions.push(finished);
+                                }
+                                Err(e) => {
+                                    outcomes.push(StepOutcome {
+                                        id: step.id,
+                                        command: step.command.clone(),
+                                        status: StepStatus::Delegated,
+                                        output: e.to_string(),
+                                    });
+                                    sessions.push(session);
+                                }
+                            }
                         }
                         Err(e) => outcomes.push(StepOutcome {
                             id: step.id,
@@ -557,6 +705,9 @@ impl MasterAgent {
                     }
                 }
             }
+            halted = outcomes
+                .last()
+                .is_some_and(|o| matches!(o.status, StepStatus::Failed | StepStatus::Delegated));
         }
 
         let result = RunResult {
@@ -601,8 +752,81 @@ impl MasterAgent {
         FleetContext {
             local_machine: self.master_name.clone(),
             local_os,
-            description: machines::describe_for_prompt(&self.memory.graph).unwrap_or_default(),
+            description: format!(
+                "{}\nConfigured workers (use these exact target_machine names): {}",
+                machines::describe_for_prompt(&self.memory.graph).unwrap_or_default(),
+                self.workers
+                    .workers
+                    .iter()
+                    .map(|w| w.info.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
+    }
+
+    fn named_request_targets(&self, input: &str) -> Vec<String> {
+        let text = input.to_lowercase();
+        self.workers
+            .workers
+            .iter()
+            .map(|w| w.info.name.as_str())
+            .chain(std::iter::once(self.master_name.as_str()))
+            .filter(|name| {
+                let name = name.to_lowercase();
+                text.match_indices(&name).any(|(start, _)| {
+                    let boundary = |c: char| !c.is_alphanumeric() && c != '-' && c != '_';
+                    text[..start].chars().next_back().is_none_or(boundary)
+                        && text[start + name.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(boundary)
+                })
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn subtask_target(&self, task: &planner::SubTask) -> anyhow::Result<StepTarget> {
+        if let Some(name) = task
+            .target_machine
+            .as_deref()
+            .filter(|name| *name != "auto")
+        {
+            if name == "local" || name == self.master_name {
+                return Ok(StepTarget::Local);
+            }
+            let worker = self
+                .workers
+                .workers
+                .iter()
+                .find(|w| w.info.name == name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Unknown target machine '{name}'; no commands were executed")
+                })?;
+            // Capabilities are hints for automatic placement, not a veto on
+            // an explicitly named destination. The model can invent unrelated
+            // requirements, and the graph can be unseeded or temporarily stale.
+            // Installation tasks also intentionally target missing software.
+            // Execution still requires a healthy SSH/tmux worker and passes
+            // through the existing watchdog; never substitute another host.
+            // Preserve the destination even when offline; execution reports that
+            // failure instead of substituting another online worker.
+            return Ok(StepTarget::Remote {
+                worker: worker.info.name.clone(),
+            });
+        }
+        if !task.requires_remote && task.target_machine.as_deref() != Some("auto") {
+            return Ok(StepTarget::Local);
+        }
+        let mut needed = vec![BASELINE_CAPABILITY];
+        needed.extend(task.required_capabilities.iter().map(String::as_str));
+        let worker = self
+            .choose_worker(&needed)
+            .ok_or_else(|| anyhow::anyhow!("No online worker meets the requested capabilities"))?;
+        Ok(StepTarget::Remote {
+            worker: worker.info.name.clone(),
+        })
     }
 
     /// Pick a worker that has every one of `capabilities`, consulting the
@@ -727,4 +951,164 @@ fn render_run_result(result: &crate::agent::run::RunResult) -> String {
         text.push_str(&format!("\n\n$ {} [{:?}]\n{}", o.command, o.status, output));
     }
     text
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use hive_common::protocol::{WorkerInfo, WorkerStatus};
+
+    fn agent() -> MasterAgent {
+        let pool = WorkerPool::new(
+            ["archlinux-worker", "mac-air", "cis-linux2", "cis-a6000"]
+                .iter()
+                .map(|name| WorkerInfo {
+                    name: (*name).into(),
+                    host: (*name).into(),
+                    user: "test".into(),
+                    port: None,
+                    tags: vec![],
+                })
+                .collect(),
+        );
+        pool.workers[0].set_status(WorkerStatus::Online);
+        MasterAgent::new(
+            LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            pool,
+            SkillRegistry::new(),
+            MemorySystem::new(),
+        )
+        .with_master_name("mac-mini")
+    }
+
+    fn task(target: &str, remote: bool) -> planner::SubTask {
+        serde_json::from_value(serde_json::json!({
+            "description": "create session", "target_machine": target,
+            "requires_remote": remote, "commands": ["tmux new-session -d -s ws-share"]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_request_destinations_override_fleet_copied_by_model() {
+        let agent = agent();
+        let plan = serde_json::from_value(serde_json::json!({
+            "targets":["mac-air","archlinux-worker","cis-linux2","cis-a6000"],
+            "summary":"work", "subtasks":[task("mac-air",true)]
+        }))
+        .unwrap();
+        let run = agent
+            .materialize_plan(
+                "Use mac-air and archlinux-worker.",
+                plan,
+                hive_common::Complexity::Simple,
+                hive_common::AiProvider::Local,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(run.targets.len(), 2);
+        assert!(run.targets.contains(&StepTarget::Remote {
+            worker: "mac-air".into()
+        }));
+        assert!(run.targets.contains(&StepTarget::Remote {
+            worker: "archlinux-worker".into()
+        }));
+        assert!(agent
+            .named_request_targets("mac-air-backup and cis-a6000-test")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn named_air_stays_remote_even_if_model_sets_local_and_air_is_offline() {
+        let agent = agent();
+        assert_eq!(
+            agent.subtask_target(&task("mac-air", false)).unwrap(),
+            StepTarget::Remote {
+                worker: "mac-air".into()
+            }
+        );
+        assert_eq!(
+            agent
+                .subtask_target(&task("archlinux-worker", true))
+                .unwrap(),
+            StepTarget::Remote {
+                worker: "archlinux-worker".into()
+            }
+        );
+        assert!(agent.subtask_target(&task("unknown-laptop", true)).is_err());
+        assert_eq!(
+            agent.subtask_target(&task("mac-mini", true)).unwrap(),
+            StepTarget::Local
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_command_stops_dependents_and_reports_real_exit_code() {
+        let agent = agent();
+        let marker = std::env::temp_dir().join(format!("hive-dependency-{}", uuid::Uuid::new_v4()));
+        let plan: PlannedRun = serde_json::from_value(serde_json::json!({
+            "id":"r", "model":"test", "user_input":"do work", "summary":"work", "complexity":"simple",
+            "routed_provider":"local", "provider":"local", "steps":[
+                {"id":0,"description":"fail","command":"(printf 'broken' >&2; exit 12) | cat","target":{"kind":"local"},"risk":null},
+                {"id":1,"description":"dependent","command":format!("touch {}", workflow::shell_quote(&marker.to_string_lossy())),"target":{"kind":"local"},"risk":null}
+            ]
+        })).unwrap();
+        let result = agent.execute_run(&plan, &Approvals::none()).await;
+        assert_eq!(result.outcomes[0].status, StepStatus::Failed);
+        assert!(result.outcomes[0].output.contains("exit_code: 12"));
+        assert!(result.outcomes[0].output.contains("broken"));
+        assert_eq!(result.outcomes[1].status, StepStatus::Pending);
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn malformed_remote_shell_is_rejected_before_dispatch() {
+        let agent = agent();
+        let plan: PlannedRun = serde_json::from_value(serde_json::json!({
+            "id":"r", "model":"test", "user_input":"do work", "summary":"work", "complexity":"simple",
+            "routed_provider":"local", "provider":"local", "steps":[
+                {"id":0,"description":"bad quoting","command":"echo 'unterminated","target":{"kind":"remote","worker":"mac-air"},"risk":null}
+            ]
+        })).unwrap();
+        let result = agent.execute_run(&plan, &Approvals::none()).await;
+        assert_eq!(result.outcomes[0].status, StepStatus::Failed);
+        assert!(result.outcomes[0].output.contains("Shell syntax rejected"));
+        assert!(result.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_named_workers_remain_placeable_without_capability_metadata() {
+        let agent = agent();
+        for name in ["mac-air", "archlinux-worker", "cis-linux2", "cis-a6000"] {
+            let mut task = task(name, false);
+            task.required_capabilities = vec!["websocket-server".into(), "file-sharing".into()];
+            assert_eq!(
+                agent.subtask_target(&task).unwrap(),
+                StepTarget::Remote {
+                    worker: name.into()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn named_worker_ignores_model_capability_hints_but_auto_placement_enforces_them() {
+        let agent = agent();
+        let mut task = task("mac-air", true);
+        task.required_capabilities = vec!["gpu-compute".into()];
+        assert_eq!(
+            agent.subtask_target(&task).unwrap(),
+            StepTarget::Remote {
+                worker: "mac-air".into()
+            }
+        );
+        task.target_machine = Some("auto".into());
+        assert!(agent.subtask_target(&task).is_err());
+        task.target_machine = None;
+        assert!(agent.subtask_target(&task).is_err());
+        let context = agent.fleet_context();
+        assert!(context.description.contains("mac-air"));
+        assert!(context.description.contains("archlinux-worker"));
+    }
 }

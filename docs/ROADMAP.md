@@ -13,15 +13,13 @@
 > loading was wired and live-verified end to end.
 
 All 10 phases, in dependency order. This ordering is canonical and comes from the
-**Implementation Order** table in [`implementation-plan.md`](implementation-plan.md).
+original implementation planning document.
 
-> Picking the work up? Start at [`HANDOFF.md`](HANDOFF.md) — it carries the verified
-> baseline, the gate, the next milestone in full detail, and the traps already paid for.
+> Picking the work up? Start with the [contributor guide](../CONTRIBUTING.md) — it carries the verified
+> development checks, the HACP dependency workflow, and the distinction between fixture tests and live opt-ins.
 
-> **Note on numbering:** the narrative sections of `implementation-plan.md` use a slightly
-> different numbering than its own Implementation Order table (the prose has no "Phase 8",
-> and puts Skills at 5 / Finetune at 6 / CLI at 7). This roadmap uses the **table's**
-> dependency-ordered numbering, and each phase below cites the plan section that documents it.
+> **Note on numbering:** this roadmap uses the original implementation plan's
+> dependency-ordered numbering.
 
 | # | Phase | Effort | Depends on | Status |
 |:---:|:---|:---:|:---|:---|
@@ -186,7 +184,7 @@ belonging to that task, with the host's other services untouched.
 *Plan section: "Phase 4: Web Terminal (Phone/Laptop Access)"* · **Status: ✅ done**
 
 Deployed on the `lawfinder` worker and reachable from any tailnet device — see
-[`DEPLOY-WEB.md`](DEPLOY-WEB.md).
+the [Deployment Guide](DEPLOYMENT.md).
 
 - [x] axum server with `/api/health`
 - [x] `GET /api/sessions` — real `tmux list-sessions` aggregation
@@ -320,7 +318,7 @@ exists as a subcommand and prints an honest not-implemented message. The
 
 The reason the agent still knows what you decided three weeks ago — and now it
 does. Full detail, including the proving run and the schema decision, is in
-[STATUS.md](STATUS.md); the design notes live in [HANDOFF.md](HANDOFF.md) §3.
+[STATUS.md](STATUS.md).
 
 - [x] SQLite schema: `projects`, `conversations`, `messages`, `rag_chunks`,
       `kg_embeddings` — and the **existing** `entities`/`edges` tables scoped

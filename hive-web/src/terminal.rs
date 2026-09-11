@@ -30,15 +30,50 @@ enum Control {
 /// Bytes read from the PTY in one go. tmux redraws can be large.
 const READ_BUF: usize = 8192;
 
-pub async fn bridge(socket: WebSocket, session: String, cols: u16, rows: u16) {
-    if let Err(e) = run(socket, &session, cols, rows).await {
+fn attach_command(
+    session: &str,
+    worker: Option<&hive_common::protocol::WorkerInfo>,
+) -> CommandBuilder {
+    match worker {
+        Some(w) => {
+            let mut cmd = CommandBuilder::new("ssh");
+            cmd.arg("-tt");
+            cmd.args(crate::sessions::ssh_args(w));
+            cmd.arg(crate::sessions::remote_command(&format!(
+                "exec tmux attach-session -t {}",
+                crate::sessions::quote(&format!("={session}"))
+            )));
+            cmd
+        }
+        None => {
+            let mut cmd = CommandBuilder::new("tmux");
+            cmd.args(["attach-session", "-t", &format!("={session}")]);
+            cmd
+        }
+    }
+}
+
+pub async fn bridge(
+    socket: WebSocket,
+    session: String,
+    worker: Option<hive_common::protocol::WorkerInfo>,
+    cols: u16,
+    rows: u16,
+) {
+    if let Err(e) = run(socket, &session, worker.as_ref(), cols, rows).await {
         warn!(session = %session, error = %e, "terminal bridge ended with error");
     } else {
         debug!(session = %session, "terminal bridge closed cleanly");
     }
 }
 
-async fn run(socket: WebSocket, session: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
+async fn run(
+    socket: WebSocket,
+    session: &str,
+    worker: Option<&hive_common::protocol::WorkerInfo>,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<()> {
     let pty = NativePtySystem::default();
     let pair = pty.openpty(PtySize {
         rows,
@@ -47,10 +82,7 @@ async fn run(socket: WebSocket, session: &str, cols: u16, rows: u16) -> anyhow::
         pixel_height: 0,
     })?;
 
-    let mut cmd = CommandBuilder::new("tmux");
-    // `-t =name` pins the exact session; without `=` tmux prefix-matches and a
-    // request for "build" could attach to "build-arm64".
-    cmd.args(["attach-session", "-t", &format!("={session}")]);
+    let mut cmd = attach_command(session, worker);
     cmd.env("TERM", "xterm-256color");
     // A detach here means the browser tab closed, not that the session died.
     let mut child = pair.slave.spawn_command(cmd)?;
@@ -148,6 +180,34 @@ async fn run(socket: WebSocket, session: &str, cols: u16, rows: u16) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_attach_uses_configured_host_port_and_exact_quoted_session() {
+        let worker = hive_common::protocol::WorkerInfo {
+            name: "mac-air".into(),
+            host: "air-ssh".into(),
+            user: "alice".into(),
+            port: Some(2222),
+            tags: vec![],
+        };
+        let command = attach_command("ws-share", Some(&worker));
+        let args = command
+            .get_argv()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], "ssh");
+        assert!(args.contains(&"-tt".into()));
+        assert!(args.windows(2).any(|a| a == ["-p", "2222"]));
+        assert!(args.contains(&"alice@air-ssh".into()));
+        assert!(args
+            .last()
+            .unwrap()
+            .contains("attach-session -t '=ws-share'"));
+        assert!(args.last().unwrap().contains("/opt/homebrew/bin"));
+        let local = attach_command("ws-share", None);
+        assert_eq!(local.get_argv()[0], "tmux");
+    }
 
     #[test]
     fn parses_a_resize_control_frame() {

@@ -15,9 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::llm::LlmRouter;
 use crate::watchdog::notifier::Notifier;
-use crate::watchdog::supervisor::{
-    open_incident_log, SessionSpec, SessionTap, SupervisorHandle,
-};
+use crate::watchdog::supervisor::{open_incident_log, SessionSpec, SessionTap, SupervisorHandle};
 use crate::watchdog::Watchdog;
 use ssh::{LogTail, PauseOutcome, SshWorker};
 
@@ -119,10 +117,7 @@ impl WorkerPool {
 
     /// Get the number of online workers.
     pub fn online_count(&self) -> usize {
-        self.workers
-            .iter()
-            .filter(|w| w.is_online())
-            .count()
+        self.workers.iter().filter(|w| w.is_online()).count()
     }
 
     /// Probe reachability and the SSH task launch prerequisites. Reachable hosts
@@ -140,7 +135,10 @@ impl WorkerPool {
                     Ok(ssh) => match ssh.execution_ready().await {
                         Ok(()) => WorkerStatus::Online,
                         Err(e) => {
-                            warn!("Worker '{}' cannot host supervised tasks: {e}", worker.info.name);
+                            warn!(
+                                "Worker '{}' cannot host supervised tasks: {e}",
+                                worker.info.name
+                            );
                             WorkerStatus::Unhealthy
                         }
                     },
@@ -156,9 +154,12 @@ impl WorkerPool {
                     warn!("Worker '{}' health probe timed out", worker.info.name);
                     WorkerStatus::Offline
                 });
-            let status = if status == WorkerStatus::Online && worker.unresolved.load(Ordering::Relaxed) {
-                WorkerStatus::Unhealthy
-            } else { status };
+            let status =
+                if status == WorkerStatus::Online && worker.unresolved.load(Ordering::Relaxed) {
+                    WorkerStatus::Unhealthy
+                } else {
+                    status
+                };
             if status != worker.status() {
                 info!("Worker '{}' health: {:?}", worker.info.name, status);
             }
@@ -286,6 +287,58 @@ impl WorkerPool {
         Ok(session_info)
     }
 
+    /// Wait for a supervised command's real terminal state, then return its log.
+    /// A deadline or a watchdog pause is an unresolved execution, never success.
+    pub async fn wait_for_completion(
+        &self,
+        session: &SessionInfo,
+        seconds: u64,
+    ) -> anyhow::Result<(SessionInfo, String)> {
+        let wait = async {
+            loop {
+                let sessions = self.supervisor().await?.supervised().await?;
+                let current = sessions
+                    .iter()
+                    .find(|s| s.info.session_name == session.session_name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Supervised session disappeared; execution state is unknown"
+                        )
+                    })?;
+                if matches!(
+                    current.info.state,
+                    TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+                ) {
+                    let worker = self
+                        .workers
+                        .iter()
+                        .find(|w| w.info.name == session.worker_name)
+                        .ok_or_else(|| anyhow::anyhow!("Worker removed during execution"))?;
+                    let ssh = SshWorker::connect(&worker.info.ssh_target()).await?;
+                    let log = ssh
+                        .run(&format!(
+                            "tail -c 24576 '/tmp/{}.log'",
+                            session.session_name
+                        ))
+                        .await?;
+                    return Ok((current.info.clone(), log));
+                }
+                anyhow::ensure!(
+                    current.watching
+                        && !matches!(
+                            current.info.state,
+                            TaskState::PausedByWatchdog | TaskState::WaitingForDecision
+                        ),
+                    "Session '{}' requires human review; work is not complete",
+                    session.session_name
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(seconds), wait).await
+            .map_err(|_| anyhow::anyhow!("Session '{}' still has no confirmed result after {seconds}s; inspect Sessions before retrying", session.session_name))?
+    }
+
     /// Currently tracked delegated sessions (across all workers).
     ///
     /// The supervisor's registry is the source: there is no second map here to
@@ -335,7 +388,12 @@ struct TaskLoad {
 impl TaskLoad {
     fn started(worker: &WorkerNode) -> Self {
         worker.active_tasks.fetch_add(1, Ordering::Relaxed);
-        Self { active: worker.active_tasks.clone(), status: worker.status.clone(), unresolved: worker.unresolved.clone(), finished: false }
+        Self {
+            active: worker.active_tasks.clone(),
+            status: worker.status.clone(),
+            unresolved: worker.unresolved.clone(),
+            finished: false,
+        }
     }
 
     fn finish(&mut self) {
@@ -350,7 +408,8 @@ impl Drop for TaskLoad {
     fn drop(&mut self) {
         if !self.finished {
             self.unresolved.store(true, Ordering::Relaxed);
-            self.status.store(status_to_u8(WorkerStatus::Unhealthy), Ordering::Relaxed);
+            self.status
+                .store(status_to_u8(WorkerStatus::Unhealthy), Ordering::Relaxed);
         }
     }
 }
@@ -359,7 +418,10 @@ impl Drop for TaskLoad {
 impl SessionTap for SshTap {
     async fn next_line(&mut self) -> anyhow::Result<Option<String>> {
         let line = self.tail.next_line().await?;
-        if line.as_deref().is_some_and(|s| s.starts_with("__HIVE_DONE__")) {
+        if line
+            .as_deref()
+            .is_some_and(|s| s.starts_with("__HIVE_DONE__"))
+        {
             self.load.finish();
         }
         Ok(line)
@@ -377,7 +439,11 @@ mod tests {
 
     fn test_pool() -> WorkerPool {
         WorkerPool::new(vec![WorkerInfo {
-            name: "peer".into(), host: "peer-alias".into(), user: String::new(), port: None, tags: vec![],
+            name: "peer".into(),
+            host: "peer-alias".into(),
+            user: String::new(),
+            port: None,
+            tags: vec![],
         }])
     }
 
