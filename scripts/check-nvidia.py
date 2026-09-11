@@ -77,7 +77,7 @@ class Mock(BaseHTTPRequestHandler):
             elif "You extract a knowledge graph" in prompt:
                 text = json.dumps({"entities": [{"name": "smoke", "kind": "tool", "description": "test"}], "relations": []})
             else:
-                text = json.dumps({"summary": "Print smoke marker", "subtasks": [{"description": "Print marker", "requires_remote": False, "commands": ["printf 'hive-nvidia-ok\\n'"], "expected_behavior": "Print marker", "required_capabilities": []}]})
+                text = json.dumps({"phase": "work", "targets": ["local"], "summary": "Print smoke marker", "subtasks": [{"description": "Print marker", "target_machine": "local", "requires_remote": False, "commands": ["printf 'hive-nvidia-ok\\n'"], "expected_behavior": "Print marker", "required_capabilities": []}]})
             result = {"model": MODEL, "choices": [{"finish_reason": "stop", "message": {"content": text, "reasoning_content": "must remain separate"}}]}
         data = json.dumps(result).encode()
         self.send_response(200)
