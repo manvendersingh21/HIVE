@@ -1,5 +1,6 @@
 # HIVE
 
+[![CI](https://github.com/manvendersingh21/HIVE/actions/workflows/ci.yml/badge.svg)](https://github.com/manvendersingh21/HIVE/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![HACP Protocol](https://img.shields.io/badge/protocol-HACP-blueviolet.svg)](https://github.com/manvendersingh21/hacp)
@@ -7,6 +8,11 @@
 HIVE is a self-hosted runtime for coordinating AI agents across local and SSH-connected machines. It negotiates tasks through HACP contracts, runs agent CLIs in supervised tmux sessions, checks artifacts against frozen acceptance criteria, and preserves execution evidence for inspection and recovery.
 
 **HIVE uses [HACP](https://github.com/manvendersingh21/hacp); HACP does not depend on HIVE.** The protocol is maintained in its own Apache-2.0 repository. HIVE consumes the `hacp` Rust library through a commit-pinned Git dependency.
+
+> **Project status:** pre-release. No version has been tagged, interfaces may
+> change without a deprecation period, and several subsystems are documented as
+> unverified — see [Current Limitations](#current-limitations) and the
+> [changelog](CHANGELOG.md).
 
 ## Features
 
@@ -108,37 +114,50 @@ saved conversations or **New chat** to start another. See [chat history](docs/CH
 
 ## Configuration
 
-Create `config/hive.toml` and `config/workers.toml` in your project root:
+Two files in your project root:
 
-- `config/hive.toml`: Contains LLM providers, web settings, database path, skills directory, and memory configuration
-- `config/workers.toml`: Defines SSH worker machines with host, user, and tags for placement decisions
+- `config/hive.toml` — LLM providers, web settings, database path, skills directory, and memory configuration.
+- `config/workers.toml` — your SSH worker machines. This file names real hosts and accounts, so it is **gitignored**; copy the template and edit your copy:
 
-Example worker configuration:
-```toml
-# Add one [[workers]] block per machine
-[[workers]]
-name = "worker-1"
-host = "your-worker-host"
-user = "your-username"
-tags = ["gpu", "powerful"]
-
-# Multiple workers can be defined
-[[workers]]
-name = "worker-2"
-host = "another-worker"
-user = "another-user"
-tags = ["cpu", "light"]
+```bash
+cp config/workers.example.toml config/workers.toml
 ```
+
+```toml
+# One [[workers]] block per machine
+[[workers]]
+name = "worker-1"          # how plans and logs refer to this machine
+host = "worker-1"          # SSH alias from ~/.ssh/config, or a hostname/IP
+user = "your-username"
+tags = ["linux", "docker"]
+
+[[workers]]
+name = "laptop"
+host = "laptop"
+user = "your-username"
+tags = ["macos", "arm64", "light"]
+```
+
+Most tags are free-form context for the planner, but three are enforced:
+`light`, `login-node`, and `slurm` mark a machine as an invalid target for
+heavy or GPU work, and naming it explicitly does not override that. See
+[Worker Placement](docs/PLACEMENT.md).
 
 ## Documentation
 
+Full index: [docs/README.md](docs/README.md).
+
+- [Web Agent Workflow](docs/AGENT-WORKFLOW.md): The chat loop — planning, execution, correction, verification
+- [Orchestration](docs/ORCHESTRATION.md): Turning a prompt into device and agent assignments
+- [Fleet Delegation](docs/FLEET-DELEGATION.md): Native agent sessions, peer messages, approvals, recovery
 - [Distributed Collaboration](docs/DISTRIBUTED-COLLABORATION.md): Roles, SSH setup, verification, recovery
-- [HACP Integration](docs/HACP-HIVE.md): Protocol library and dependency workflow
-- [Deployment Guide](docs/DEPLOYMENT.md): Production deployment and security considerations
 - [Worker Placement](docs/PLACEMENT.md): How Hive decides which machine runs what
-- [Roadmap](docs/ROADMAP.md): Current status and future plans
+- [Deployment Guide](docs/DEPLOYMENT.md): Production deployment and security considerations
+- [HACP Integration](docs/HACP-HIVE.md): Protocol library and dependency workflow
 - [Contributing](CONTRIBUTING.md): Development guidelines
+- [Code of Conduct](CODE_OF_CONDUCT.md): Community standards
 - [Security](SECURITY.md): Security model and reporting
+- [Changelog](CHANGELOG.md): Notable changes on the development branch
 
 ## Current Limitations
 
@@ -149,6 +168,8 @@ tags = ["cpu", "light"]
 - Skills activate at request time after being loaded from `skills.directory` at startup
 - Fine-tuning data collection and export are not implemented
 - Agent output may be malformed; independent checks reduce false acceptance
+- Fleet delegation is opt-in (`HIVE_DELEGATION=1`) and under live validation
+- The AGY and OpenCode adapters have not been validated against live provider-backed execution
 
 ## Repository Structure
 
@@ -164,7 +185,18 @@ tags = ["cpu", "light"]
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines and contribution process.
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the
+development checks, the HACP dependency workflow, the policy on live and
+destructive tests, and what a pull request should explain. Participation is
+governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+Two things worth knowing before you open a PR:
+
+- Protocol semantics, wire schemas, and conformance fixtures belong in the
+  [HACP repository](https://github.com/manvendersingh21/hacp), not here.
+- A successful build is not validation. Describe the checks you actually ran.
+
+Open an issue to discuss substantial changes before implementing them.
 
 ## License
 

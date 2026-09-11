@@ -8,8 +8,9 @@
 **Updated 2026-09-05, verified against a live build.** This audit reflects what was actually
 compiled, tested, and run — not what a session claimed.
 
-This file is the backward-looking record. The forward-looking one — what is left, in what
-order, with the gate and the traps — is [`HANDOFF.md`](HANDOFF.md).
+This file is the backward-looking record. The forward-looking one — what is left and in
+what order — is the [roadmap](ROADMAP.md); `HANDOFF.md`, referenced below, was a working
+document that has since been removed.
 
 ---
 
@@ -158,7 +159,7 @@ was real — it holds the machine fleet — but nothing conversational existed: 
 projects, no transcripts, no RAG, no extraction, no injection, no CLI. And the
 CLI built its agent on `MemorySystem::new()`, the **in-memory** constructor, so
 even a working memory layer would have vanished between invocations (the M4
-trap in [`HANDOFF.md`](HANDOFF.md) §3.4 — fixed first, `hive-cli/src/main.rs`).
+trap in `HANDOFF.md` §3.4 — fixed first, `hive-cli/src/main.rs`).
 
 ```
 $ cargo build --workspace                          # zero warnings
