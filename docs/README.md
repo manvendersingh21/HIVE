@@ -1,28 +1,52 @@
-# Documentation
+# HIVE documentation
 
-## Getting Started
+Start with the [project README](../README.md) for what HIVE is, how to build it,
+and how to run something small.
 
-- [Project Overview and Quick Start](../README.md)
-- [Contributing](../CONTRIBUTING.md): Development and validation requirements
-- [Security](../SECURITY.md): Deployment boundaries and reporting
+## Using HIVE
 
-## Core Features
+| Guide | What it covers |
+|---|---|
+| [Web Agent Workflow](AGENT-WORKFLOW.md) | The web chat loop: planning, execution feedback, correction, verification |
+| [Saved Chats](CHAT-HISTORY.md) | Searching, reopening, and continuing stored conversations |
+| [Orchestration](ORCHESTRATION.md) | Turning a prompt into device and agent assignments with a local model |
+| [Fleet Delegation](FLEET-DELEGATION.md) | Native agent sessions, peer messages, approvals, and recovery |
+| [Distributed Collaboration](DISTRIBUTED-COLLABORATION.md) | The `hive collab` two-role HACP workflow |
+| [Worker Placement](PLACEMENT.md) | How Hive chooses a machine when a plan does not name one |
 
-- [Distributed Collaboration](DISTRIBUTED-COLLABORATION.md): Roles, SSH, verification, recovery
-- [HACP Integration](HACP-HIVE.md): The external protocol library and dependency workflow
-- [Worker Placement](PLACEMENT.md): How Hive decides which machine runs what
-- [Fleet Delegation](FLEET-DELEGATION.md): Native agent sessions, peer messages, approvals and recovery
-- [Web Agent Workflow](AGENT-WORKFLOW.md): Execution feedback, correction, verification, and saved progress
-- [Deployment Guide](DEPLOYMENT.md): Production deployment and security considerations
+## Operating HIVE
 
-## Project Status
+| Guide | What it covers |
+|---|---|
+| [Deployment](DEPLOYMENT.md) | Running HIVE across machines, and the security considerations that come with it |
+| [Security Model](../SECURITY.md) | Trust boundaries and vulnerability reporting |
+| [NVIDIA Provider](NVIDIA.md) | The optional NVIDIA provider, and the migration history behind the current default |
 
-- [Roadmap](ROADMAP.md): Current status and future plans
-- [Release Evidence](RELEASE-1.md): Tested capabilities and limitations
-- [Development Status](STATUS.md): Append-only development log with evidence
+## Architecture and protocol
 
-## Historical Records
+| Guide | What it covers |
+|---|---|
+| [HACP Integration](HACP-HIVE.md) | The external protocol library and the dependency workflow |
+| [Decision Records](adr/) | Design decisions and the reasoning behind them |
 
-Historical documents and findings:
-- [Architecture Decision Records](adr/): Design decisions and rationale
-- [Findings](findings/): Debugging and investigation records
+## Contributing
+
+| Guide | What it covers |
+|---|---|
+| [Contributing](../CONTRIBUTING.md) | Development checks, dependency workflow, live-test policy, PR expectations |
+| [Code of Conduct](../CODE_OF_CONDUCT.md) | Community standards and enforcement |
+| [Changelog](../CHANGELOG.md) | Notable changes on the development branch |
+
+## Project history
+
+These documents are dated records rather than current guarantees. They are kept
+because they show what was actually tested and when, but a claim in one of them
+is only evidence about the revision it describes.
+
+| Record | What it covers |
+|---|---|
+| [Roadmap](ROADMAP.md) | The original ten-phase plan and where each phase stands |
+| [Release 1 Evidence](RELEASE-1.md) | Acceptance gates for the first release, with the runs behind them |
+| [Development Status](STATUS.md) | Append-only development log |
+| [Worker Validation](WORKER-VALIDATION.md) | Placement fixes and the checks that confirmed them |
+| [Findings](findings/) | Debugging and investigation records |

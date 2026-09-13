@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/manvendersingh21/HIVE/security/advisories/new
+    about: Report privately. Do not open a public issue with exploit details.
+  - name: HACP protocol issues
+    url: https://github.com/manvendersingh21/hacp/issues
+    about: Protocol semantics, wire schemas, and conformance fixtures live there.
+  - name: Questions and setup help
+    url: https://github.com/manvendersingh21/HIVE/discussions
+    about: Ask here before filing a bug if you are unsure whether it is one.

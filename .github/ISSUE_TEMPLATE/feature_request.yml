@@ -1,0 +1,53 @@
+name: Feature request
+description: Propose a capability or a change in behavior
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Substantial changes are worth discussing here before implementation —
+        see [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md).
+
+        Protocol semantics, wire schemas, and conformance fixtures belong in the
+        [HACP repository](https://github.com/manvendersingh21/hacp) instead.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >
+        What are you trying to do that is currently awkward or impossible?
+        Describe the situation, not a proposed API.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you think Hive should do instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, and why they were not enough.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Does this change a trust boundary?
+      description: >
+        Approval prompts, the watchdog, authentication, SSH host-key handling,
+        and workspace containment are safety-relevant surfaces.
+      options:
+        - "No"
+        - "Yes — it changes what runs without explicit approval"
+        - "Yes — it changes authentication or network exposure"
+        - "Not sure"
+    validations:
+      required: true

@@ -1,9 +1,38 @@
+# Fleet definition. Copy this file to `config/workers.toml` and edit it there;
+# `config/workers.toml` is gitignored because it names real hosts and accounts.
+#
 # Safe starting point: no remote machines are contacted.
 workers = []
 
-# To enable a worker, remove `workers = []` above and configure an SSH alias:
+# To enable a worker, remove `workers = []` above and add one block per machine.
+#
+#   name  Stable identifier. Plans and logs refer to the machine by this name.
+#   host  SSH destination — an alias from ~/.ssh/config, or a hostname/IP.
+#   user  SSH username on that machine.
+#   tags  Optional placement hints. Three are enforced, not advisory:
+#
+#           light       a laptop or shared desktop someone may be using
+#           login-node  a bastion or login host, not a compute target
+#           slurm       batch-scheduled; work belongs in an sbatch job
+#
+#         A machine carrying any of those three refuses assignments that
+#         request `gpu-compute` or `heavy-compute`. Other tags are free-form
+#         and available to the planner as context.
+#
 # [[workers]]
-# name = "worker-laptop"
-# host = "worker-laptop"
-# user = "your-remote-username"
-# tags = ["personal", "light"]
+# name = "worker-1"
+# host = "worker-1"          # resolved through ~/.ssh/config
+# user = "your-username"
+# tags = ["linux", "docker"]
+#
+# [[workers]]
+# name = "gpu-node"
+# host = "gpu-node.example.edu"
+# user = "your-username"
+# tags = ["gpu", "cuda", "shared", "slurm"]
+#
+# [[workers]]
+# name = "laptop"
+# host = "laptop"
+# user = "your-username"
+# tags = ["macos", "arm64", "light"]

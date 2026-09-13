@@ -7,3 +7,7 @@ graphify-out/
 .env.*
 !.env.example
 .DS_Store
+
+# Local fleet definition: real hostnames, SSH usernames, and machine tags.
+# Copy config/workers.example.toml to config/workers.toml and edit it there.
+config/workers.toml

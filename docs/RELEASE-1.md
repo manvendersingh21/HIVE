@@ -1,8 +1,9 @@
 # Release 1 — native, recoverable two-device collaboration
 
-> Dated acceptance evidence. The later [repository separation](REPOSITORY-SPLIT.md)
-> moved HACP's tests to its own repository; combined totals below describe the
-> original run and remain unchanged as historical evidence.
+> Dated acceptance evidence. HACP was subsequently
+> [extracted into its own repository](HACP-HIVE.md), moving its tests out of this
+> tree; the combined totals below describe the original run and remain unchanged
+> as historical evidence.
 
 Scope: OpenCode supervises on the Mac mini, a worker runs on the Air, and HIVE
 coordinates HACP negotiation, execution, independent verification, rework and

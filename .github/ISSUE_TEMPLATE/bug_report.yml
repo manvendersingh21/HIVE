@@ -1,0 +1,86 @@
+name: Bug report
+description: Something behaves differently from what the documentation describes
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: please do not paste run journals, terminal transcripts, or
+        database files directly. They routinely contain hostnames, account names,
+        and task data. Quote the specific lines you need and redact the rest.
+
+        Suspected vulnerabilities go through [SECURITY.md](../blob/main/SECURITY.md),
+        not this form.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, in order.
+      placeholder: |
+        1. cargo build --workspace --locked
+        2. ./target/debug/hive task --description "..."
+        3. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: Error messages or log lines, redacted. Do not attach raw artifacts.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: Output of `git rev-parse --short HEAD`.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - hive-core (runtime, planning, memory, watchdog)
+        - hive-cli
+        - hive-web
+        - hive-worker
+        - Fleet delegation
+        - Documentation
+        - Build / CI
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS and version on the machine running Hive, plus `rustc --version`.
+      placeholder: "macOS 15.3 (arm64), rustc 1.85.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: fleet
+    attributes:
+      label: Fleet shape
+      description: >
+        If remote machines are involved, describe them generically — how many
+        workers, their OS and tags. Do not include real hostnames or usernames.
+    validations:
+      required: false
