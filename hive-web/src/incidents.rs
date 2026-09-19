@@ -41,7 +41,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-/// The review page. Served from `main` so the binary carries it.
+/// The review page's old server-rendered markup. `/incidents` is now served
+/// from the Next.js static export via `page_shell` (see `main.rs`), but this
+/// stays around — and compiled in, not just on disk — for the XSS-regression
+/// tests below.
+#[allow(dead_code)]
 pub const PAGE: &str = include_str!("../static/incidents.html");
 
 /// How much history `?all=1` returns. A review page is for triage, not for
