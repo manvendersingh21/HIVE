@@ -112,8 +112,8 @@ rule. Measured on `qwen3.5:9b` over the same cases:
 | Prose rule ("set it only when the work genuinely needs it…") | 11/15 |
 | Worked `command → capability` table | **14/14** |
 
-This is the same lesson as the OS trailer in [`STATUS.md`](STATUS.md): with a 9B
-planner, examples beat general instructions, consistently and by a lot.
+This echoes a broader lesson with small planner models: examples beat general
+instructions, consistently and by a lot.
 
 ### Ranking
 

@@ -224,8 +224,8 @@ pub enum SessionOutcome {
 
 /// Launches and supervises a stock CLI on behalf of one role.
 ///
-/// **Implementers:** two rules come straight from operational experience already recorded
-/// in `docs/STATUS.md`, and both matter more than they look.
+/// **Implementers:** two rules come straight from operational experience, and both
+/// matter more than they look.
 ///
 /// * **Pause, never kill.** Suspend the pane's foreground process group (SIGSTOP). An
 ///   interrupt ends the session and orphans its children, destroying the very state an

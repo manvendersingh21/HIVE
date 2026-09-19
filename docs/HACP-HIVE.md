@@ -83,7 +83,6 @@ must not be compared with HIVE-only totals as though tests were deleted.
 - [Independent test peer](https://github.com/manvendersingh21/hacp/blob/main/tests/interop/peer.py)
 - [Protocol contributing guide](https://github.com/manvendersingh21/hacp/blob/main/CONTRIBUTING.md)
 - [HIVE distributed workflow](DISTRIBUTED-COLLABORATION.md)
-- [Release 1 evidence](RELEASE-1.md#final-acceptance-audit--complete-2026-09-07)
 
 The earlier integration ledger is preserved in
 [HIVE's pre-extraction history](https://github.com/manvendersingh21/HIVE/blob/87dd12251a6e2375d48d77f85b64aba58b4c3d19/docs/HACP-HIVE.md).

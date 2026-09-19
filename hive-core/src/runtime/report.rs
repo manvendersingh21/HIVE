@@ -104,7 +104,7 @@ impl RunOutcome {
 ///
 /// Recorded rather than cleaned up. Killing it would destroy the state a person is
 /// being asked to look at — the same reason the session host suspends instead of
-/// interrupting, learned three separate times in `docs/STATUS.md`.
+/// interrupting, learned the hard way more than once during development.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LiveSession {
     pub name: String,

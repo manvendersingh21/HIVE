@@ -8,7 +8,7 @@
 //! reads its log.
 //!
 //! Three things here are load-bearing and each of them cost real debugging time in this
-//! project (`docs/STATUS.md`):
+//! project:
 //!
 //! * **A bare session name is not a target-pane.** tmux answers `can't find pane` and
 //!   exits non-zero, which once made the watchdog's pause a silent no-op — it could
@@ -31,8 +31,8 @@
 //!
 //! Supervision only lasts as long as [`SessionHost::wait`] is being polled. The tmux
 //! session itself is detached and survives this process, but nothing scans its output
-//! once the future is dropped — the same limitation `docs/STATUS.md` records for the SSH
-//! path. The v2 runtime now journals the launch spec and start time; `recover` restores
+//! once the future is dropped — the same limitation the SSH path has. The v2 runtime
+//! now journals the launch spec and start time; `recover` restores
 //! the original deadline and reattaches to the existing handle or its completion log.
 //! This restores supervision when recovery starts, not during coordinator downtime.
 

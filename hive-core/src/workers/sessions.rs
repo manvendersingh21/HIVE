@@ -46,7 +46,7 @@ impl TmuxSession {
     /// `=name:` rather than a bare name: tmux treats a bare string as a prefix match, and
     /// this project has already shipped one bug from that — a bare session name where a
     /// target-pane was required, which made the watchdog's pause silently fail for a
-    /// whole phase (`docs/STATUS.md`, `workers::ssh::pane_target`).
+    /// whole phase (see `workers::ssh::pane_target`).
     pub fn attach_command(&self, worker: Option<&WorkerInfo>) -> String {
         let inner = format!("tmux attach -t '={}:'", self.name);
         match worker {

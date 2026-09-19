@@ -92,8 +92,7 @@ OpenCode and AGY preserve conversations across stages. The other adapters do not
 have equivalent continuity guarantees. A finite suite cannot establish arbitrary
 task correctness, and the author may omit a requirement from its contract.
 
-The [Release 1 audit](RELEASE-1.md#final-acceptance-audit--complete-2026-09-07)
-records real mini/Air acceptance, controlled repair, and explicit recovery tests.
-These are dated tests, not a guarantee that every provider, OS, or CLI version
-has been exercised. No automatic peer discovery or recursive team scheduler is
-implemented by this workflow.
+Real mini/Air acceptance, controlled repair, and explicit recovery have been
+tested end to end. These are dated tests, not a guarantee that every provider,
+OS, or CLI version has been exercised. No automatic peer discovery or
+recursive team scheduler is implemented by this workflow.

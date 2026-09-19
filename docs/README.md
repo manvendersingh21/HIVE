@@ -39,14 +39,7 @@ and how to run something small.
 
 ## Project history
 
-These documents are dated records rather than current guarantees. They are kept
-because they show what was actually tested and when, but a claim in one of them
-is only evidence about the revision it describes.
-
 | Record | What it covers |
 |---|---|
 | [Roadmap](ROADMAP.md) | The original ten-phase plan and where each phase stands |
-| [Release 1 Evidence](RELEASE-1.md) | Acceptance gates for the first release, with the runs behind them |
-| [Development Status](STATUS.md) | Append-only development log |
-| [Worker Validation](WORKER-VALIDATION.md) | Placement fixes and the checks that confirmed them |
-| [Findings](findings/) | Debugging and investigation records |
+| [Findings](findings/) | The adapter-edge findings cited by the runtime's own doc comments |
