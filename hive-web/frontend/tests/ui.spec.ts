@@ -93,6 +93,17 @@ async function defaults(page: Page) {
         ],
         edges: [{ from: "machine:a", to: "tool:codex", relation: "has_tool" }],
       },
+      "/api/fleet": [
+        {
+          name: "worker-a",
+          host: "ssh-a",
+          user: "someone",
+          port: null,
+          tags: ["linux"],
+          status: "online",
+          removable: false,
+        },
+      ],
     };
     if (path === "/api/machines/prompt")
       return route.fulfill({ body: "worker-a can run codex" });

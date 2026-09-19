@@ -235,9 +235,7 @@ async fn recovery_control(
         .ok_or_else(|| anyhow::anyhow!("Delegation unavailable"))?;
     let worker = agent
         .workers
-        .workers
-        .iter()
-        .find(|worker| worker.info.name == run.assignment.device)
+        .find(&run.assignment.device)
         .ok_or_else(|| anyhow::anyhow!("Device removed from configured fleet"))?;
     let payload = request.map(|request| json!({"fingerprint":request.fingerprint,"reason":request.reason,"evidence":request.evidence,"acknowledge_ids":request.acknowledge_ids}));
     let result = transport::control(
@@ -341,9 +339,7 @@ async fn sync_run(
     let agent = h.agent.as_ref().unwrap();
     let worker = agent
         .workers
-        .workers
-        .iter()
-        .find(|w| w.info.name == run.assignment.device)
+        .find(&run.assignment.device)
         .ok_or_else(|| anyhow::anyhow!("Device removed from configured fleet"))?;
     if run.state == "superseded" {
         if run.runner_path.is_some() {

@@ -109,6 +109,7 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
     // blocks the listener — a stalled worker must not stop the master from
     // serving.
     let workers = WorkerPool::new(workers_config.workers);
+    chat::apply_persisted_fleet(&workers);
 
     // Web messages must be durable; never advertise saved chats over an
     // in-memory fallback when opening the configured database fails.
@@ -236,6 +237,14 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         .route(
             "/api/settings/master-agent",
             get(chat::master_agent_settings).post(chat::set_master_agent),
+        )
+        .route(
+            "/api/fleet",
+            get(chat::list_fleet).post(chat::add_fleet_worker),
+        )
+        .route(
+            "/api/fleet/{name}",
+            axum::routing::delete(chat::remove_fleet_worker),
         )
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}", axum::routing::delete(kill_session))
@@ -474,8 +483,8 @@ fn session_worker(
     }
     h.agent
         .as_ref()
-        .and_then(|a| a.workers.workers.iter().find(|w| w.info.name == host))
-        .map(|w| Some(w.info.clone()))
+        .and_then(|a| a.workers.find(host))
+        .map(|w| Some(w.info))
         .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown worker").into_response())
 }
 
@@ -485,7 +494,7 @@ async fn session_hosts(State(h): State<chat::AgentHandle>) -> Json<serde_json::V
         hosts.extend(
             agent
                 .workers
-                .workers
+                .snapshot()
                 .iter()
                 .map(|w| serde_json::json!({"host": w.info.name, "name": w.info.name})),
         );
@@ -499,11 +508,10 @@ async fn list_sessions(State(h): State<chat::AgentHandle>) -> Response {
         async {
             match &h.agent {
                 Some(agent) => {
-                    futures::future::join_all(
-                        agent.workers.workers.iter().map(|w| async {
-                            (w.info.name.clone(), sessions::list_on(&w.info).await)
-                        }),
-                    )
+                    let fleet = agent.workers.snapshot();
+                    futures::future::join_all(fleet.iter().map(|w| async {
+                        (w.info.name.clone(), sessions::list_on(&w.info).await)
+                    }))
                     .await
                 }
                 None => vec![],

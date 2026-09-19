@@ -870,6 +870,189 @@ pub fn apply_persisted_master_agent(llm: &hive_core::llm::LlmRouter) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fleet management — add/list/remove SSH worker machines from the UI,
+// without hand-editing `config/workers.toml`. UI-added workers are persisted
+// separately (`~/.hive/fleet-ui.json`) and merged with the configured fleet
+// at startup: `config/workers.toml` is hand-maintained (its comments carry
+// reasoning that matters — see docs/ROADMAP.md), and this never rewrites it.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct FleetWorker {
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    pub port: Option<u16>,
+    pub tags: Vec<String>,
+    pub status: &'static str,
+    /// Whether this worker can be removed through the API — only true for
+    /// ones added here, never for `config/workers.toml` entries.
+    pub removable: bool,
+}
+
+#[derive(Deserialize)]
+pub struct AddWorkerRequest {
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+fn worker_status_label(status: hive_common::WorkerStatus) -> &'static str {
+    match status {
+        hive_common::WorkerStatus::Online => "online",
+        hive_common::WorkerStatus::Busy => "busy",
+        hive_common::WorkerStatus::Offline => "offline",
+        hive_common::WorkerStatus::Unhealthy => "unhealthy",
+    }
+}
+
+async fn fleet_view(agent: &MasterAgent) -> Vec<FleetWorker> {
+    let ui_added = load_fleet_ui_state();
+    agent
+        .workers
+        .snapshot()
+        .into_iter()
+        .map(|w| FleetWorker {
+            name: w.info.name.clone(),
+            host: w.info.host.clone(),
+            user: w.info.user.clone(),
+            port: w.info.port,
+            tags: w.info.tags.clone(),
+            status: worker_status_label(w.status()),
+            removable: ui_added.iter().any(|added| added.name == w.info.name),
+        })
+        .collect()
+}
+
+pub async fn list_fleet(State(h): State<AgentHandle>) -> Result<Json<Vec<FleetWorker>>, Response> {
+    let agent = h.require()?;
+    Ok(Json(fleet_view(agent).await))
+}
+
+pub async fn add_fleet_worker(
+    State(h): State<AgentHandle>,
+    Json(req): Json<AddWorkerRequest>,
+) -> Result<Json<Vec<FleetWorker>>, Response> {
+    let agent = h.require()?;
+
+    let name = req.name.trim().to_string();
+    let host = req.host.trim().to_string();
+    let user = req.user.trim().to_string();
+    if name.is_empty() || host.is_empty() || user.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name, host, and user are all required",
+        )
+            .into_response());
+    }
+
+    let info = hive_common::WorkerInfo {
+        name,
+        host,
+        user,
+        port: req.port,
+        tags: req.tags,
+    };
+
+    agent
+        .workers
+        .add_worker(info.clone())
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()).into_response())?;
+
+    if let Err(e) = save_fleet_ui_addition(&info) {
+        warn!(error = %e, worker = %info.name, "failed to persist added worker; it will not survive a restart");
+    }
+
+    // Probe the new worker (and re-probe the rest — the pool has no
+    // single-worker refresh) so the response reflects real reachability
+    // instead of the "Offline" every worker starts at.
+    agent.workers.refresh_health().await;
+
+    info!(worker = %info.name, host = %info.host, "worker added to fleet from settings UI");
+    Ok(Json(fleet_view(agent).await))
+}
+
+pub async fn remove_fleet_worker(
+    State(h): State<AgentHandle>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<FleetWorker>>, Response> {
+    let agent = h.require()?;
+
+    let ui_added = load_fleet_ui_state();
+    if !ui_added.iter().any(|w| w.name == name) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "only workers added through this API can be removed here; edit config/workers.toml for the rest",
+        )
+            .into_response());
+    }
+
+    agent.workers.remove_worker(&name);
+    if let Err(e) = save_fleet_ui_removal(&name) {
+        warn!(error = %e, worker = %name, "failed to persist worker removal; it will reappear on restart");
+    }
+
+    info!(worker = %name, "worker removed from fleet from settings UI");
+    Ok(Json(fleet_view(agent).await))
+}
+
+fn fleet_ui_state_path() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| std::path::Path::new(&home).join(".hive").join("fleet-ui.json"))
+}
+
+fn load_fleet_ui_state() -> Vec<hive_common::WorkerInfo> {
+    let Some(path) = fleet_ui_state_path() else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+fn write_fleet_ui_state(workers: &[hive_common::WorkerInfo]) -> anyhow::Result<()> {
+    let path = fleet_ui_state_path()
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot persist the fleet-UI state"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(workers)?)?;
+    Ok(())
+}
+
+fn save_fleet_ui_addition(info: &hive_common::WorkerInfo) -> anyhow::Result<()> {
+    let mut workers = load_fleet_ui_state();
+    workers.retain(|w| w.name != info.name);
+    workers.push(info.clone());
+    write_fleet_ui_state(&workers)
+}
+
+fn save_fleet_ui_removal(name: &str) -> anyhow::Result<()> {
+    let mut workers = load_fleet_ui_state();
+    workers.retain(|w| w.name != name);
+    write_fleet_ui_state(&workers)
+}
+
+/// Merge any UI-added workers into a freshly built pool. Called once at
+/// startup, before the pool is shared behind an `Arc`. A worker whose name
+/// now collides with one in `config/workers.toml` (the file always wins) is
+/// skipped with a warning rather than failing startup.
+pub fn apply_persisted_fleet(workers: &hive_core::workers::WorkerPool) {
+    for info in load_fleet_ui_state() {
+        let name = info.name.clone();
+        if let Err(e) = workers.add_worker(info) {
+            warn!(error = %e, worker = %name, "skipping persisted fleet-UI worker");
+        }
+    }
+}
+
 #[cfg(test)]
 mod deadline_tests {
     use super::*;

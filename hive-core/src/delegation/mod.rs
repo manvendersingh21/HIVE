@@ -47,11 +47,7 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             "Assignment keys must be unique"
         );
         anyhow::ensure!(
-            agent
-                .workers
-                .workers
-                .iter()
-                .any(|w| w.info.name == a.device),
+            agent.workers.find(&a.device).is_some(),
             "Unknown device: {}",
             a.device
         );
@@ -141,7 +137,7 @@ pub fn validate_explicit(
     plan: &DelegationPlan,
     agent: &MasterAgent,
 ) -> anyhow::Result<()> {
-    for worker in &agent.workers.workers {
+    for worker in &agent.workers.snapshot() {
         let pattern = format!(
             r"(?i)\b(claude|codex|agy|opencode)\s+on\s+{}(?:$|[^[:alnum:]_.-])",
             regex::escape(&worker.info.name)

@@ -6,7 +6,8 @@ use crate::{
 use serde_json::{json, Value};
 
 pub async fn refresh(agent: &MasterAgent) -> anyhow::Result<()> {
-    let probes = agent.workers.workers.iter().map(|worker| async move {
+    let fleet = agent.workers.snapshot();
+    let probes = fleet.iter().map(|worker| async move {
         // Probe existing bundle when present (SDK/runtime status is device-specific).
         let source = format!(
             "__file__ = str(__import__('pathlib').Path.home()/'.hive/runners/{}/runner.py')\n{}",

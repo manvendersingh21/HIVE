@@ -5,7 +5,7 @@ pub mod sessions;
 pub mod ssh;
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,8 +24,13 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Pool of worker machines for task delegation.
 pub struct WorkerPool {
-    /// Worker definitions loaded from config.
-    pub workers: Vec<WorkerNode>,
+    /// Worker definitions, loaded from config at startup and growable at
+    /// runtime (e.g. through the master-agent settings API). Behind a lock
+    /// rather than `&mut` for the same reason [`WorkerNode`]'s own fields are
+    /// atomics: the master owns this pool inside an `Arc<MasterAgent>` and
+    /// hands it to request handlers concurrently. Take [`WorkerPool::snapshot`]
+    /// rather than holding the lock across an `.await`.
+    workers: RwLock<Vec<WorkerNode>>,
     /// The one supervisor watching everything this pool has delegated.
     ///
     /// Started on first use rather than in [`WorkerPool::new`]: `new` is sync
@@ -35,6 +40,12 @@ pub struct WorkerPool {
 }
 
 /// A worker node with connection state.
+///
+/// Cheap to clone: `status`, `active_tasks`, and `unresolved` are `Arc`-backed,
+/// so a clone shares the same underlying atomics as the original — updating a
+/// cloned node's status (e.g. from [`WorkerPool::refresh_health`]'s snapshot)
+/// updates the live pool's view of it too.
+#[derive(Clone)]
 pub struct WorkerNode {
     /// Static worker info from config.
     pub info: WorkerInfo,
@@ -88,36 +99,91 @@ impl WorkerNode {
     }
 }
 
+fn new_node(info: WorkerInfo) -> WorkerNode {
+    WorkerNode {
+        info,
+        status: Arc::new(AtomicU8::new(status_to_u8(WorkerStatus::Offline))),
+        active_tasks: Arc::new(AtomicUsize::new(0)),
+        unresolved: Arc::new(AtomicBool::new(false)),
+    }
+}
+
 impl WorkerPool {
     /// Create a new worker pool from worker configurations.
     pub fn new(workers: Vec<WorkerInfo>) -> Self {
-        let nodes = workers
-            .into_iter()
-            .map(|info| WorkerNode {
-                info,
-                status: Arc::new(AtomicU8::new(status_to_u8(WorkerStatus::Offline))),
-                active_tasks: Arc::new(AtomicUsize::new(0)),
-                unresolved: Arc::new(AtomicBool::new(false)),
-            })
-            .collect();
+        let nodes = workers.into_iter().map(new_node).collect();
 
         Self {
-            workers: nodes,
+            workers: RwLock::new(nodes),
             supervisor: OnceCell::new(),
         }
     }
 
-    /// Select the least-loaded online worker.
-    pub fn select_worker(&self) -> Option<&WorkerNode> {
+    /// A cheap, point-in-time copy of the worker list. Clones share the same
+    /// underlying atomics as the live nodes (see [`WorkerNode`]), so this is
+    /// the way to iterate the pool — especially across an `.await` — without
+    /// holding its lock.
+    pub fn snapshot(&self) -> Vec<WorkerNode> {
+        self.workers.read().unwrap().clone()
+    }
+
+    /// The configured worker count, including any added at runtime.
+    pub fn worker_count(&self) -> usize {
+        self.workers.read().unwrap().len()
+    }
+
+    /// Look up one worker by name.
+    pub fn find(&self, name: &str) -> Option<WorkerNode> {
         self.workers
+            .read()
+            .unwrap()
+            .iter()
+            .find(|w| w.info.name == name)
+            .cloned()
+    }
+
+    /// Add a worker to the pool at runtime (e.g. from the settings UI),
+    /// without touching `config/workers.toml`. Starts `Offline`; the next
+    /// health-check tick (or an immediate one the caller triggers) brings it
+    /// online. Refuses a name already in use — worker names are how plans,
+    /// logs, and explicit placement (`validate_explicit`) refer to a machine,
+    /// so two workers sharing one would make placement ambiguous.
+    pub fn add_worker(&self, info: WorkerInfo) -> anyhow::Result<()> {
+        let mut workers = self.workers.write().unwrap();
+        anyhow::ensure!(
+            !workers.iter().any(|w| w.info.name == info.name),
+            "a worker named '{}' is already configured",
+            info.name
+        );
+        workers.push(new_node(info));
+        Ok(())
+    }
+
+    /// Remove a worker from the pool at runtime. Returns whether a worker by
+    /// that name was present. Only affects the in-memory pool — a worker
+    /// defined in `config/workers.toml` reappears on the next restart; that
+    /// file is hand-maintained and edited by hand, not by this call.
+    pub fn remove_worker(&self, name: &str) -> bool {
+        let mut workers = self.workers.write().unwrap();
+        let before = workers.len();
+        workers.retain(|w| w.info.name != name);
+        workers.len() != before
+    }
+
+    /// Select the least-loaded online worker.
+    pub fn select_worker(&self) -> Option<WorkerNode> {
+        self.workers
+            .read()
+            .unwrap()
             .iter()
             .filter(|w| w.is_online())
             .min_by_key(|w| w.active_tasks.load(Ordering::Relaxed))
+            .cloned()
     }
 
     /// Get the number of online workers.
     pub fn online_count(&self) -> usize {
-        self.workers.iter().filter(|w| w.is_online()).count()
+        self.workers.read().unwrap().iter().filter(|w| w.is_online()).count()
     }
 
     /// Probe reachability and the SSH task launch prerequisites. Reachable hosts
@@ -128,7 +194,7 @@ impl WorkerPool {
     /// `ConnectTimeout` does not cover every stall, and one wedged host must
     /// not hold up the rest of the fleet.
     pub async fn refresh_health(&self) {
-        for worker in &self.workers {
+        for worker in self.snapshot() {
             let target = worker.info.ssh_target();
             let probe = async {
                 match SshWorker::connect(&target).await {
@@ -310,9 +376,7 @@ impl WorkerPool {
                     TaskState::Completed | TaskState::Failed | TaskState::Cancelled
                 ) {
                     let worker = self
-                        .workers
-                        .iter()
-                        .find(|w| w.info.name == session.worker_name)
+                        .find(&session.worker_name)
                         .ok_or_else(|| anyhow::anyhow!("Worker removed during execution"))?;
                     let ssh = SshWorker::connect(&worker.info.ssh_target()).await?;
                     let log = ssh
@@ -437,6 +501,68 @@ mod tests {
     use super::*;
     use hive_common::TaskCommand;
 
+    #[test]
+    fn add_worker_refuses_a_duplicate_name_and_find_sees_the_addition() {
+        let pool = test_pool();
+        assert!(pool.find("new-worker").is_none());
+
+        pool.add_worker(WorkerInfo {
+            name: "new-worker".into(),
+            host: "new-host".into(),
+            user: "someone".into(),
+            port: None,
+            tags: vec!["gpu".into()],
+        })
+        .unwrap();
+
+        let found = pool.find("new-worker").unwrap();
+        assert_eq!(found.info.host, "new-host");
+        assert_eq!(found.status(), WorkerStatus::Offline);
+        assert_eq!(pool.worker_count(), 2);
+
+        let err = pool
+            .add_worker(WorkerInfo {
+                name: "new-worker".into(),
+                host: "other-host".into(),
+                user: "someone".into(),
+                port: None,
+                tags: vec![],
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("already configured"), "{err}");
+        assert_eq!(pool.worker_count(), 2, "the duplicate must not be added");
+    }
+
+    #[test]
+    fn remove_worker_reports_whether_it_was_present() {
+        let pool = test_pool();
+        pool.add_worker(WorkerInfo {
+            name: "removable".into(),
+            host: "h".into(),
+            user: "u".into(),
+            port: None,
+            tags: vec![],
+        })
+        .unwrap();
+        assert_eq!(pool.worker_count(), 2);
+
+        assert!(pool.remove_worker("removable"));
+        assert!(pool.find("removable").is_none());
+        assert_eq!(pool.worker_count(), 1);
+        assert!(!pool.remove_worker("removable"), "already gone");
+    }
+
+    #[test]
+    fn a_snapshot_clone_still_updates_the_live_pool() {
+        let pool = test_pool();
+        let nodes = pool.snapshot();
+        nodes[0].set_status(WorkerStatus::Online);
+        // The snapshot's Arc-backed status is the same cell as the live
+        // node's — the whole point of taking a snapshot instead of holding
+        // the pool's lock across an await.
+        assert_eq!(pool.find("peer").unwrap().status(), WorkerStatus::Online);
+    }
+
     fn test_pool() -> WorkerPool {
         WorkerPool::new(vec![WorkerInfo {
             name: "peer".into(),
@@ -450,7 +576,8 @@ mod tests {
     #[test]
     fn completed_assignments_release_load_exactly_once() {
         let pool = test_pool();
-        let worker = &pool.workers[0];
+        let nodes = pool.snapshot();
+        let worker = &nodes[0];
         worker.set_status(WorkerStatus::Online);
         let mut first = TaskLoad::started(worker);
         let mut second = TaskLoad::started(worker);
@@ -468,7 +595,8 @@ mod tests {
     #[test]
     fn losing_supervision_does_not_pretend_remote_work_finished() {
         let pool = test_pool();
-        let worker = &pool.workers[0];
+        let nodes = pool.snapshot();
+        let worker = &nodes[0];
         worker.set_status(WorkerStatus::Online);
         drop(TaskLoad::started(worker));
         assert_eq!(worker.active_tasks.load(Ordering::Relaxed), 1);
@@ -493,7 +621,8 @@ mod tests {
             tags: vec![],
         };
         let pool = WorkerPool::new(vec![worker_info]);
-        let worker = &pool.workers[0];
+        let nodes = pool.snapshot();
+        let worker = &nodes[0];
 
         // Tier-2 (LLM review) is disabled so this test only depends on the
         // SSH worker being reachable, not on a local Ollama instance.

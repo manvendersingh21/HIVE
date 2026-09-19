@@ -176,12 +176,7 @@ impl MasterAgent {
         let mut sessions = Vec::new();
         for (subtask, target) in plan.subtasks.iter().zip(targets) {
             if let StepTarget::Remote { worker: name } = target {
-                match self
-                    .workers
-                    .workers
-                    .iter()
-                    .find(|w| w.info.name == name && w.is_online())
-                {
+                match self.workers.find(&name).filter(|w| w.is_online()) {
                     Some(worker) => {
                         let assignment = TaskAssignment::new(
                             subtask.description.clone(),
@@ -202,7 +197,7 @@ impl MasterAgent {
 
                         match self
                             .workers
-                            .delegate(worker, assignment, self.llm.clone(), self.watchdog.clone())
+                            .delegate(&worker, assignment, self.llm.clone(), self.watchdog.clone())
                             .await
                         {
                             Ok(session) => {
@@ -633,9 +628,8 @@ impl MasterAgent {
                         self.workers.select_worker()
                     } else {
                         self.workers
-                            .workers
-                            .iter()
-                            .find(|w| &w.info.name == worker && w.is_online())
+                            .find(worker)
+                            .filter(|w| w.is_online())
                     };
 
                     let Some(node) = selected else {
@@ -665,7 +659,7 @@ impl MasterAgent {
 
                     match self
                         .workers
-                        .delegate(node, assignment, self.llm.clone(), self.watchdog.clone())
+                        .delegate(&node, assignment, self.llm.clone(), self.watchdog.clone())
                         .await
                     {
                         Ok(session) => {
@@ -756,9 +750,9 @@ impl MasterAgent {
                 "{}\nConfigured workers (use these exact target_machine names): {}",
                 machines::describe_for_prompt(&self.memory.graph).unwrap_or_default(),
                 self.workers
-                    .workers
+                    .snapshot()
                     .iter()
-                    .map(|w| w.info.name.as_str())
+                    .map(|w| w.info.name.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -768,10 +762,10 @@ impl MasterAgent {
     fn named_request_targets(&self, input: &str) -> Vec<String> {
         let text = input.to_lowercase();
         self.workers
-            .workers
+            .snapshot()
             .iter()
-            .map(|w| w.info.name.as_str())
-            .chain(std::iter::once(self.master_name.as_str()))
+            .map(|w| w.info.name.clone())
+            .chain(std::iter::once(self.master_name.clone()))
             .filter(|name| {
                 let name = name.to_lowercase();
                 text.match_indices(&name).any(|(start, _)| {
@@ -783,7 +777,6 @@ impl MasterAgent {
                             .is_none_or(boundary)
                 })
             })
-            .map(str::to_owned)
             .collect()
     }
 
@@ -796,14 +789,9 @@ impl MasterAgent {
             if name == "local" || name == self.master_name {
                 return Ok(StepTarget::Local);
             }
-            let worker = self
-                .workers
-                .workers
-                .iter()
-                .find(|w| w.info.name == name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Unknown target machine '{name}'; no commands were executed")
-                })?;
+            let worker = self.workers.find(name).ok_or_else(|| {
+                anyhow::anyhow!("Unknown target machine '{name}'; no commands were executed")
+            })?;
             // Capabilities are hints for automatic placement, not a veto on
             // an explicitly named destination. The model can invent unrelated
             // requirements, and the graph can be unseeded or temporarily stale.
@@ -836,16 +824,13 @@ impl MasterAgent {
     /// because the graph is where placement decisions are meant to live once
     /// there is more than one machine to choose between — the query stays the
     /// same, the answer gets more interesting.
-    pub fn choose_worker(&self, capabilities: &[&str]) -> Option<&crate::workers::WorkerNode> {
+    pub fn choose_worker(&self, capabilities: &[&str]) -> Option<crate::workers::WorkerNode> {
         let ranked = machines::machines_with_capabilities(&self.memory.graph, capabilities)
             .unwrap_or_default();
 
-        let matched = ranked.iter().find_map(|m| {
-            self.workers
-                .workers
-                .iter()
-                .find(|w| w.info.name == m.name && w.is_online())
-        });
+        let matched = ranked
+            .iter()
+            .find_map(|m| self.workers.find(&m.name).filter(|w| w.is_online()));
         if matched.is_some() {
             return matched;
         }
@@ -878,7 +863,8 @@ impl MasterAgent {
         let local = machines::probe_local(&self.master_name).await;
         machines::project_into_graph(&self.memory.graph, &local)?;
 
-        let probes = self.workers.workers.iter().map(|w| {
+        let fleet = self.workers.snapshot();
+        let probes = fleet.iter().map(|w| {
             let name = w.info.name.clone();
             let target = w.info.ssh_target();
             let tags = w.info.tags.clone();
@@ -898,7 +884,7 @@ impl MasterAgent {
         // should run, so a decommissioned host is worse than absent: it invites
         // the planner to keep proposing it.
         let known: Vec<String> = std::iter::once(self.master_name.clone())
-            .chain(self.workers.workers.iter().map(|w| w.info.name.clone()))
+            .chain(fleet.iter().map(|w| w.info.name.clone()))
             .collect();
         let pruned = machines::prune_unknown(&self.memory.graph, &known)?;
         if !pruned.is_empty() {
@@ -971,7 +957,7 @@ mod placement_tests {
                 })
                 .collect(),
         );
-        pool.workers[0].set_status(WorkerStatus::Online);
+        pool.snapshot()[0].set_status(WorkerStatus::Online);
         MasterAgent::new(
             LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
             pool,
