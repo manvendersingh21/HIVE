@@ -594,7 +594,7 @@ async fn run_workers_health(project_root: &Path) -> anyhow::Result<()> {
     let pool = WorkerPool::new(config.workers);
     pool.refresh_health().await;
     println!("{:<18} {:<22} STATUS", "NAME", "HOST");
-    for node in &pool.workers {
+    for node in &pool.snapshot() {
         println!(
             "{:<18} {:<22} {:?}",
             node.info.name,
@@ -605,7 +605,7 @@ async fn run_workers_health(project_root: &Path) -> anyhow::Result<()> {
     println!(
         "\n{} of {} online.",
         pool.online_count(),
-        pool.workers.len()
+        pool.worker_count()
     );
     Ok(())
 }
