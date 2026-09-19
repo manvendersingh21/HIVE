@@ -38,6 +38,8 @@ struct ChatCompletionsResponse {
 #[derive(Deserialize)]
 struct Choice {
     message: ChoiceMessage,
+    #[serde(default)]
+    finish_reason: String,
 }
 
 #[derive(Deserialize)]
@@ -127,12 +129,22 @@ impl ZaiClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to parse Z.AI response: {e}"))?;
 
-        parsed
+        let choice = parsed
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("Z.AI returned no choices"))
+            .ok_or_else(|| anyhow::anyhow!("Z.AI returned no choices"))?;
+
+        anyhow::ensure!(
+            choice.finish_reason == "stop",
+            "Z.AI response incomplete or truncated (finish_reason: {})",
+            choice.finish_reason
+        );
+
+        let text = choice.message.content.trim();
+        anyhow::ensure!(!text.is_empty(), "Z.AI returned an empty final answer");
+
+        Ok(text.to_string())
     }
 
     /// Generate an embedding vector for `input` (used by the RAG index and
@@ -176,6 +188,74 @@ impl ZaiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::nvidia::tests::server;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn cfg(base_url: String) -> CloudLlmConfig {
+        CloudLlmConfig {
+            model: "test-model".into(),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            base_url: Some(base_url),
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_completions_are_rejected() {
+        let (url, _requests, task) = server(vec![(
+            200,
+            json!({"choices":[{"finish_reason":"length","message":{"content":"cut off mid-sent"}}]}),
+            Duration::ZERO,
+        )])
+        .await;
+        let client = ZaiClient::new(&cfg(url)).unwrap();
+        let err = client.complete("hi").await.unwrap_err();
+        assert!(err.to_string().contains("incomplete or truncated"), "{err}");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_finish_reason_is_treated_as_incomplete() {
+        let (url, _requests, task) = server(vec![(
+            200,
+            json!({"choices":[{"message":{"content":"whatever"}}]}),
+            Duration::ZERO,
+        )])
+        .await;
+        let client = ZaiClient::new(&cfg(url)).unwrap();
+        let err = client.complete("hi").await.unwrap_err();
+        assert!(err.to_string().contains("incomplete or truncated"), "{err}");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_content_is_rejected_even_with_finish_reason_stop() {
+        let (url, _requests, task) = server(vec![(
+            200,
+            json!({"choices":[{"finish_reason":"stop","message":{"content":""}}]}),
+            Duration::ZERO,
+        )])
+        .await;
+        let client = ZaiClient::new(&cfg(url)).unwrap();
+        let err = client.complete("hi").await.unwrap_err();
+        assert!(err.to_string().contains("empty final answer"), "{err}");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_complete_stop_response_is_accepted() {
+        let (url, _requests, task) = server(vec![(
+            200,
+            json!({"choices":[{"finish_reason":"stop","message":{"content":"full answer"}}]}),
+            Duration::ZERO,
+        )])
+        .await;
+        let client = ZaiClient::new(&cfg(url)).unwrap();
+        let text = client.complete("hi").await.unwrap();
+        assert_eq!(text, "full answer");
+        task.await.unwrap();
+    }
 
     /// Hits the real Z.AI coding-plan API. Run with:
     /// `Z_AI=... cargo test -p hive-core --offline zai:: -- --ignored --nocapture`
