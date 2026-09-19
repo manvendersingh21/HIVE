@@ -1,0 +1,268 @@
+@import "./extra.css";
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --panel: #171c24;
+  --line: #29313e;
+  --line2: #455268;
+  --text: #e6e8ee;
+  --dim: #a7b0c0;
+  --accent: #f5a623;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font:
+    15px/1.5 system-ui,
+    sans-serif;
+}
+a {
+  color: var(--accent);
+}
+h1 {
+  font-size: 24px;
+  margin: 0 0 16px;
+}
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+button,
+.button {
+  border: 1px solid var(--line2);
+  background: var(--panel);
+  border-radius: 7px;
+  padding: 8px 13px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+button:hover,
+.button:hover {
+  border-color: var(--accent);
+}
+button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+input,
+select,
+textarea {
+  border: 1px solid var(--line2);
+  border-radius: 7px;
+  padding: 9px;
+  background: var(--bg);
+  max-width: 100%;
+}
+label > input:not([type="checkbox"]),
+label > select {
+  display: block;
+  width: 100%;
+}
+input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.primary {
+  background: var(--accent);
+  color: #17120a;
+  border-color: var(--accent);
+}
+.danger {
+  color: #ff9b9b;
+}
+.ghost {
+  background: transparent;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--line);
+  min-height: 61px;
+}
+.brand {
+  font-weight: 750;
+  font-size: 20px;
+  text-decoration: none;
+}
+.topbar nav {
+  display: flex;
+  gap: 12px;
+  flex: 1;
+}
+.topbar nav a {
+  color: var(--dim);
+  text-decoration: none;
+  padding: 6px 10px;
+  border-radius: 5px;
+}
+.topbar nav a[aria-current="page"] {
+  color: var(--accent);
+  background: var(--panel);
+}
+.content {
+  max-width: 1150px;
+  margin: auto;
+  padding: 24px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px;
+  margin-bottom: 14px;
+}
+.row,
+.bar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.bar {
+  justify-content: space-between;
+}
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+.muted,
+small {
+  color: var(--dim);
+}
+.empty {
+  text-align: center;
+  color: var(--dim);
+  padding: 40px 15px;
+}
+.error {
+  color: #ffadad;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.badge,
+.pill {
+  font-size: 12px;
+  border: 1px solid var(--line2);
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  background: #788294;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot.on {
+  background: #6cda9b;
+}
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg);
+  padding: 12px;
+  border-radius: 6px;
+  max-height: 420px;
+  overflow: auto;
+}
+summary {
+  cursor: pointer;
+}
+.message > div {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.chat-sidebar input {
+  width: 100%;
+  margin-top: 12px;
+}
+.chat-feed {
+  max-width: 1000px;
+}
+.run-card {
+  margin-top: 12px;
+}
+.run-card textarea {
+  width: 100%;
+  margin-top: 8px;
+}
+.composer textarea {
+  min-width: 0;
+}
+.terminal-bar {
+  flex-wrap: wrap;
+}
+.terminal-bar strong {
+  overflow-wrap: anywhere;
+}
+.terminal {
+  overflow: hidden;
+}
+.notice {
+  padding: 12px;
+  color: var(--dim);
+}
+@media (max-width: 700px) {
+  .topbar {
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .topbar .brand {
+    font-size: 17px;
+  }
+  .topbar nav {
+    order: 3;
+    width: 100%;
+    justify-content: space-between;
+  }
+  .topbar > button {
+    margin-left: auto;
+  }
+  .chat-layout {
+    height: calc(100dvh - 106px);
+    flex-direction: column;
+  }
+  .chat-sidebar {
+    display: block;
+    width: 100%;
+    max-height: 180px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 8px 12px;
+  }
+  .chat-sidebar .chat-item {
+    padding: 6px;
+    margin-top: 5px;
+  }
+  .chat-main {
+    min-height: 0;
+  }
+  .chat-feed {
+    padding: 15px 12px;
+  }
+  .content {
+    padding: 16px;
+  }
+  .card.row > label {
+    width: 100%;
+  }
+  .composer {
+    padding: 10px;
+  }
+  .terminal-bar {
+    font-size: 12px;
+  }
+}

@@ -37,6 +37,22 @@ export HIVE_MASTER_NAME="your-master-name"
 export RUST_LOG="hive_web=info,hive_core=info"
 ```
 
+The browser frontend is a TypeScript Next.js app exported as static files. When
+the UI changes, rebuild it before rebuilding the Rust service:
+
+```bash
+cd hive-web/frontend
+npm ci
+npm run build
+cp -R out/. ../static/
+cd ../..
+cargo build --release -p hive-web
+```
+
+The Rust binary serves the generated export from `HIVE_WEB_STATIC` and keeps
+the existing `/api/*` and `/ws/*` endpoints; no separate Node.js process is
+needed in production.
+
 ## System Service Configuration
 
 ### systemd Service Unit

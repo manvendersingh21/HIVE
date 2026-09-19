@@ -21,8 +21,8 @@ use axum::{
     extract::{ws::WebSocketUpgrade, FromRef, Path, Query, State},
     http::StatusCode,
     middleware,
-    response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    response::{IntoResponse, Response},
+    routing::{get, get_service, post, MethodRouter},
     Json, Router,
 };
 use hive_common::config::{HiveConfig, WorkersConfig};
@@ -32,7 +32,7 @@ use hive_core::memory::MemorySystem;
 use hive_core::skills::SkillRegistry;
 use hive_core::workers::WorkerPool;
 use serde::Deserialize;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
 /// Router state: the password gate plus the agent (absent on worker hosts).
@@ -94,6 +94,7 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
         WorkersConfig::from_project_root(root).unwrap_or(WorkersConfig { workers: vec![] });
 
     let llm = LlmRouter::from_config(&config.llm);
+    chat::apply_persisted_master_agent(&llm);
 
     // History remains readable even when the configured inference server is down.
     if llm.uses_local_startup() && !llm.local_available().await {
@@ -217,16 +218,25 @@ async fn main() -> anyhow::Result<()> {
 
 fn app_router(state: AppState, static_dir: &str) -> Router {
     Router::new()
-        .route("/", get(dashboard))
-        .route("/sessions", get(sessions_page))
-        .route("/machines", get(machines_page))
-        .route("/incidents", get(incidents_page))
-        .route("/login", get(login_page).post(auth::login))
+        // Next.js owns the browser page shells. The Rust handlers below remain
+        // the JSON, auth, and WebSocket API.
+        .route("/", page_shell(static_dir, "index.html"))
+        .route("/sessions", page_shell(static_dir, "sessions/index.html"))
+        .route("/machines", page_shell(static_dir, "machines/index.html"))
+        .route("/incidents", page_shell(static_dir, "incidents/index.html"))
+        .route("/terminal", page_shell(static_dir, "terminal/index.html"))
+        .route(
+            "/login",
+            page_shell(static_dir, "login/index.html").post(auth::login),
+        )
         .route("/logout", post(auth::logout))
-        .route("/terminal/{name}", get(terminal_page))
         .route("/api/session-hosts", get(session_hosts))
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/capabilities", get(chat::capabilities))
+        .route(
+            "/api/settings/master-agent",
+            get(chat::master_agent_settings).post(chat::set_master_agent),
+        )
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}", axum::routing::delete(kill_session))
         .route("/api/chats", get(chat::list_chats).post(chat::create_chat))
@@ -239,7 +249,10 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         .route("/api/runs/{id}/messages", post(delegation::message))
         .route("/api/runs/{id}/replace", post(delegation::replace))
         .route("/api/runs/{id}/retry-setup", post(delegation::retry_setup))
-        .route("/api/runs/{id}/recovery", get(delegation::recovery).post(delegation::reconcile))
+        .route(
+            "/api/runs/{id}/recovery",
+            get(delegation::recovery).post(delegation::reconcile),
+        )
         .route("/api/machines", get(chat::machine_graph))
         .route("/api/machines/refresh", post(chat::refresh_machines))
         .route("/api/machines/prompt", get(chat::machines_prompt))
@@ -293,6 +306,7 @@ mod router_tests {
             "/",
             "/sessions",
             "/incidents",
+            "/terminal",
             "/index.html",
             "/chat.html",
             "/incidents.html",
@@ -361,25 +375,79 @@ mod router_tests {
             assert_eq!(response.status(), StatusCode::OK, "authenticated {path}");
         }
     }
+
+    #[tokio::test]
+    async fn page_shells_come_from_the_runtime_static_dir() {
+        let dir = std::env::temp_dir().join(format!("hive-web-shells-{}", uuid::Uuid::new_v4()));
+        let pages = [
+            ("/", "index.html"),
+            ("/sessions", "sessions/index.html"),
+            ("/machines", "machines/index.html"),
+            ("/incidents", "incidents/index.html"),
+            ("/terminal", "terminal/index.html"),
+            ("/login", "login/index.html"),
+        ];
+        for (_, file) in pages {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("<p>runtime {file}</p>")).unwrap();
+        }
+        let auth = auth::Auth::new("test-password".into());
+        let state = AppState {
+            auth,
+            agent: chat::AgentHandle::disabled(),
+            workers: workers::WorkerIngest::from_env(),
+            incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()),
+        };
+        let app = app_router(state, dir.to_str().unwrap());
+        let login = app
+            .clone()
+            .oneshot(
+                Request::post("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("password=test-password"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = login.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        for (path, file) in pages {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body, format!("<p>runtime {file}</p>").as_bytes(), "{path}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 // ---------------------------------------------------------------- pages
 
-/// The chat UI is the front door; the terminal list moved to /sessions.
-async fn dashboard() -> Html<&'static str> {
-    Html(include_str!("../static/chat.html"))
-}
-
-async fn sessions_page() -> Html<&'static str> {
-    Html(include_str!("../static/index.html"))
-}
-
-async fn machines_page() -> Html<&'static str> {
-    Html(include_str!("../static/machines.html"))
-}
-
-async fn incidents_page() -> Html<&'static str> {
-    Html(incidents::PAGE)
+/// Serve a Next.js page shell from the static export at request time.
+///
+/// Shells used to be `include_str!`'d, which pinned them to whatever export
+/// existed at compile time while their `_next/` chunks came from
+/// `HIVE_WEB_STATIC` at runtime — so pointing the server at a newer export
+/// served HTML that referenced chunk hashes the directory no longer had.
+fn page_shell(static_dir: &str, page: &str) -> MethodRouter<AppState> {
+    get_service(ServeFile::new(std::path::Path::new(static_dir).join(page)))
 }
 
 /// Short hostname, for naming the master in the machine graph.
@@ -393,14 +461,6 @@ fn hostname_or(fallback: &str) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fallback.to_string())
-}
-
-async fn login_page() -> Html<&'static str> {
-    Html(include_str!("../static/login.html"))
-}
-
-async fn terminal_page() -> Html<&'static str> {
-    Html(include_str!("../static/terminal.html"))
 }
 
 // ------------------------------------------------------------------ api
