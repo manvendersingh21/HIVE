@@ -98,6 +98,9 @@ pub struct LlmConfig {
     /// OpenAI Codex configuration.
     #[serde(default)]
     pub codex: Option<CloudLlmConfig>,
+    /// Z.AI (GLM) configuration.
+    #[serde(default)]
+    pub zai: Option<CloudLlmConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

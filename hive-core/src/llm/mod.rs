@@ -5,11 +5,13 @@ pub mod gemini;
 pub mod local;
 pub mod nvidia;
 pub mod openai;
+pub mod zai;
 
 pub use claude::ClaudeClient;
 pub use gemini::GeminiClient;
 pub use local::OllamaClient;
 pub use openai::OpenAiClient;
+pub use zai::ZaiClient;
 
 use hive_common::config::LlmConfig;
 use hive_common::{AiProvider, Complexity};
@@ -75,6 +77,7 @@ pub struct LlmRouter {
     gemini: Option<GeminiClient>,
     claude: Option<ClaudeClient>,
     codex: Option<OpenAiClient>,
+    zai: Option<ZaiClient>,
 }
 
 impl LlmRouter {
@@ -88,6 +91,7 @@ impl LlmRouter {
             gemini: None,
             claude: None,
             codex: None,
+            zai: None,
         }
     }
 
@@ -128,6 +132,14 @@ impl LlmRouter {
             }
         });
 
+        let zai = cfg.zai.as_ref().and_then(|c| match ZaiClient::new(c) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::warn!("Z.AI provider not available: {e}");
+                None
+            }
+        });
+
         let mut models = std::collections::HashMap::new();
         models.insert(AiProvider::Local, cfg.local.model.clone());
         models.insert(AiProvider::Nvidia, cfg.nvidia.model.clone());
@@ -135,6 +147,7 @@ impl LlmRouter {
             (AiProvider::GeminiFlash, &cfg.gemini),
             (AiProvider::Claude, &cfg.claude),
             (AiProvider::Codex, &cfg.codex),
+            (AiProvider::Zai, &cfg.zai),
         ] {
             if let Some(config) = config {
                 models.insert(provider, config.model.clone());
@@ -148,6 +161,7 @@ impl LlmRouter {
             gemini,
             claude,
             codex,
+            zai,
         }
     }
 
@@ -269,6 +283,12 @@ impl LlmRouter {
                 Some(client) => client.complete(prompt).await,
                 None => Err(anyhow::anyhow!(
                     "Codex is not configured (set OPENAI_API_KEY or [llm.codex] in hive.toml)"
+                )),
+            },
+            AiProvider::Zai => match &self.zai {
+                Some(client) => client.complete(prompt).await,
+                None => Err(anyhow::anyhow!(
+                    "Z.AI is not configured (set Z_AI or [llm.zai] in hive.toml)"
                 )),
             },
         };

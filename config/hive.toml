@@ -2,7 +2,12 @@
 listen_addr = "0.0.0.0:9090"
 
 [llm]
-single_provider = "local"
+single_provider = "zai"
+
+[llm.zai]
+model = "glm-4.6"
+# base_url defaults to https://api.z.ai/api/paas/v4
+# API key loaded from the Z_AI env var
 
 [llm.local]
 provider = "ollama"

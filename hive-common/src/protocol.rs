@@ -155,6 +155,8 @@ pub enum AiProvider {
     Claude,
     /// OpenAI Codex / GPT — code-heavy tasks.
     Codex,
+    /// Z.AI (GLM) — hosted cloud alternative to the local model.
+    Zai,
 }
 
 impl std::fmt::Display for AiProvider {
@@ -165,6 +167,7 @@ impl std::fmt::Display for AiProvider {
             AiProvider::GeminiFlash => write!(f, "Gemini Flash"),
             AiProvider::Claude => write!(f, "Claude"),
             AiProvider::Codex => write!(f, "Codex"),
+            AiProvider::Zai => write!(f, "Z.AI"),
         }
     }
 }

@@ -112,6 +112,7 @@ fn parse_provider(raw: &str) -> Option<AiProvider> {
         "gemini" | "gemini-flash" => Some(AiProvider::GeminiFlash),
         "claude" | "anthropic" => Some(AiProvider::Claude),
         "codex" | "openai" | "gpt" => Some(AiProvider::Codex),
+        "zai" | "z.ai" | "glm" => Some(AiProvider::Zai),
         other => {
             tracing::warn!(provider = %other, "unknown ai_provider in skill.toml; ignoring override");
             None
