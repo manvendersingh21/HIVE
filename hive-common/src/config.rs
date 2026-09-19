@@ -162,7 +162,7 @@ fn default_max_context() -> u32 {
 }
 
 /// Configuration for a cloud LLM provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloudLlmConfig {
     /// Model name/identifier.
     pub model: String,
@@ -291,6 +291,8 @@ pub enum EmbeddingProvider {
     #[serde(alias = "ollama")]
     Local,
     Nvidia,
+    #[serde(alias = "z.ai")]
+    Zai,
 }
 
 /// Memory / knowledge system settings.

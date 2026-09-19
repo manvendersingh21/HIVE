@@ -107,17 +107,32 @@ impl MemorySystem {
             Option<Arc<dyn extractor::Completer>>,
         ) = match config {
             Some(c) => {
-                let embed: Arc<dyn Embedder> = if c.memory.embedding_provider
-                    == Some(hive_common::config::EmbeddingProvider::Nvidia)
-                {
-                    let mut cfg = c.llm.nvidia.clone();
-                    cfg.model = c.memory.embedding_model.clone();
-                    Arc::new(crate::llm::nvidia::NvidiaClient::for_embeddings(&cfg))
-                } else {
-                    Arc::new(OllamaClient::new(
+                let embed: Arc<dyn Embedder> = match c.memory.embedding_provider {
+                    Some(hive_common::config::EmbeddingProvider::Nvidia) => {
+                        let mut cfg = c.llm.nvidia.clone();
+                        cfg.model = c.memory.embedding_model.clone();
+                        Arc::new(crate::llm::nvidia::NvidiaClient::for_embeddings(&cfg))
+                    }
+                    Some(hive_common::config::EmbeddingProvider::Zai) => {
+                        let mut cfg = c.llm.zai.clone().unwrap_or_default();
+                        cfg.model = c.memory.embedding_model.clone();
+                        match crate::llm::zai::ZaiClient::new(&cfg) {
+                            Ok(client) => Arc::new(client),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Z.AI embeddings not available ({e}); using local Ollama embeddings instead"
+                                );
+                                Arc::new(OllamaClient::new(
+                                    c.llm.local.base_url.clone(),
+                                    c.memory.embedding_model.clone(),
+                                ))
+                            }
+                        }
+                    }
+                    _ => Arc::new(OllamaClient::new(
                         c.llm.local.base_url.clone(),
                         c.memory.embedding_model.clone(),
-                    ))
+                    )),
                 };
                 (
                     embed,

@@ -47,6 +47,19 @@ impl Embedder for crate::llm::local::OllamaClient {
 }
 
 #[async_trait]
+impl Embedder for crate::llm::zai::ZaiClient {
+    fn provider(&self) -> &str {
+        "zai"
+    }
+    fn model(&self) -> &str {
+        self.model_name()
+    }
+    async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        crate::llm::zai::ZaiClient::embed(self, input).await
+    }
+}
+
+#[async_trait]
 impl Embedder for crate::llm::nvidia::NvidiaClient {
     async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
         self.embed(input, "passage").await

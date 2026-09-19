@@ -40,15 +40,37 @@ struct ChoiceMessage {
     content: String,
 }
 
+#[derive(Serialize)]
+struct EmbeddingsRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsResponse {
+    #[serde(default)]
+    data: Vec<EmbeddingData>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingData {
+    embedding: Vec<f32>,
+}
+
 impl ZaiClient {
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
     /// Build a client from config, resolving the API key from config or
     /// the `Z_AI` environment variable. Fails if no key is available anywhere.
     pub fn new(cfg: &CloudLlmConfig) -> anyhow::Result<Self> {
         let api_key = cfg.resolve_api_key("Z_AI")?;
+        // The coding-plan endpoint: general `/api/paas/v4` bills against a
+        // separate balance that a coding-plan key does not carry.
         let base_url = cfg
             .base_url
             .clone()
-            .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string());
+            .unwrap_or_else(|| "https://api.z.ai/api/coding/paas/v4".to_string());
         Ok(Self {
             http: reqwest::Client::new(),
             api_key,
@@ -94,5 +116,64 @@ impl ZaiClient {
             .next()
             .map(|c| c.message.content)
             .ok_or_else(|| anyhow::anyhow!("Z.AI returned no choices"))
+    }
+
+    /// Generate an embedding vector for `input` (used by the RAG index and
+    /// entity dedup).
+    pub async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
+        let req = EmbeddingsRequest {
+            model: &self.model,
+            input,
+        };
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to reach Z.AI API: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Z.AI API returned {status}: {body}");
+        }
+
+        let parsed: EmbeddingsResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Z.AI embeddings response: {e}"))?;
+
+        parsed
+            .data
+            .into_iter()
+            .next()
+            .map(|d| d.embedding)
+            .ok_or_else(|| anyhow::anyhow!("Z.AI returned no embedding data"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hits the real Z.AI coding-plan API. Run with:
+    /// `Z_AI=... cargo test -p hive-core --offline zai:: -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "hits the live Z.AI API; requires Z_AI in the environment"]
+    async fn live_coding_plan_completion() {
+        let cfg = CloudLlmConfig {
+            model: "glm-5.3".into(),
+            ..Default::default()
+        };
+        let client = ZaiClient::new(&cfg).expect("Z_AI must be set");
+        let text = client
+            .complete("Reply with exactly: OK")
+            .await
+            .expect("live Z.AI call failed");
+        assert!(text.contains("OK"), "unexpected response: {text}");
     }
 }

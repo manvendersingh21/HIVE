@@ -5,8 +5,10 @@ listen_addr = "0.0.0.0:9090"
 single_provider = "zai"
 
 [llm.zai]
-model = "glm-4.6"
-# base_url defaults to https://api.z.ai/api/paas/v4
+model = "glm-5.3"
+# base_url defaults to https://api.z.ai/api/coding/paas/v4 (the coding-plan
+# endpoint; the general /api/paas/v4 endpoint bills a separate balance that
+# a coding-plan key does not carry)
 # API key loaded from the Z_AI env var
 
 [llm.local]
@@ -43,8 +45,10 @@ auto_collect = true  # Automatically log successful interactions
 
 [memory]
 auto_index = true                    # Auto-index conversations on completion
-embedding_provider = "local"
-embedding_model = "nomic-embed-text"
+# Z.AI's coding plan has no embedding model; NVIDIA covers embeddings so
+# Ollama is not required for either chat or memory.
+embedding_provider = "nvidia"
+embedding_model = "nvidia/nemotron-3-embed-1b"
 chunk_size = 512                     # Tokens per RAG chunk
 chunk_overlap = 64                   # Overlap between chunks
 max_context_tokens = 2048            # Max tokens of retrieved context to inject
