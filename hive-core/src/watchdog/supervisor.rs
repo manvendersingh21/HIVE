@@ -9,10 +9,10 @@
 //!
 //! * **The watcher was anonymous.** Nothing held a handle to it. There was no
 //!   way to ask what was being supervised, no way to address one supervision,
-//!   and no way to stop one. `docs/STATUS.md` records `hive task` exiting a
-//!   few hundred milliseconds after delegating — so anything delegated through
-//!   the CLI was unwatched from that moment, and nothing in the process could
-//!   even report that.
+//!   and no way to stop one. `hive task` was measured exiting a few hundred
+//!   milliseconds after delegating — so anything delegated through the CLI
+//!   was unwatched from that moment, and nothing in the process could even
+//!   report that.
 //! * **An incident left no trace.** A Tier-1 hit produced a `tracing::warn!`
 //!   and an in-memory `TaskState`. Restart the master and every incident it
 //!   had ever raised was gone.
