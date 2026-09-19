@@ -2,6 +2,11 @@
 *.log
 graphify-out/
 
+# Next.js frontend build dependencies and local output.
+hive-web/frontend/node_modules/
+hive-web/frontend/.next/
+hive-web/frontend/out/
+
 # Secrets — never commit. This repo is public.
 .env
 .env.*
@@ -11,3 +16,6 @@ graphify-out/
 # Local fleet definition: real hostnames, SSH usernames, and machine tags.
 # Copy config/workers.example.toml to config/workers.toml and edit it there.
 config/workers.toml
+
+# HACP inter-agent collaboration state — local coordination scratch, not project output.
+.hacp/

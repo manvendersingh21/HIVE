@@ -98,6 +98,9 @@ pub struct LlmConfig {
     /// OpenAI Codex configuration.
     #[serde(default)]
     pub codex: Option<CloudLlmConfig>,
+    /// Z.ai (GLM) configuration.
+    #[serde(default)]
+    pub zai: Option<CloudLlmConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,7 +162,7 @@ fn default_max_context() -> u32 {
 }
 
 /// Configuration for a cloud LLM provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloudLlmConfig {
     /// Model name/identifier.
     pub model: String,

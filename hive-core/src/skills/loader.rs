@@ -64,11 +64,10 @@ struct Execution {
 /// optional beside it, `scripts/` noted for the prompt.
 pub fn load_skill_dir(dir: &Path) -> anyhow::Result<Skill> {
     let toml_path = dir.join("skill.toml");
-    let raw = std::fs::read_to_string(&toml_path).map_err(|e| {
-        anyhow::anyhow!("{}: {e}", toml_path.display())
-    })?;
-    let file: SkillFile = toml::from_str(&raw)
+    let raw = std::fs::read_to_string(&toml_path)
         .map_err(|e| anyhow::anyhow!("{}: {e}", toml_path.display()))?;
+    let file: SkillFile =
+        toml::from_str(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", toml_path.display()))?;
 
     let system_prompt = std::fs::read_to_string(dir.join("system_prompt.md"))
         .ok()
@@ -87,13 +86,21 @@ pub fn load_skill_dir(dir: &Path) -> anyhow::Result<Skill> {
             .into_iter()
             .map(|(name, spec)| super::SkillParameter {
                 name,
-                kind: if spec.kind.is_empty() { "string".into() } else { spec.kind },
+                kind: if spec.kind.is_empty() {
+                    "string".into()
+                } else {
+                    spec.kind
+                },
                 required: spec.required,
                 default: spec.default,
                 options: spec.options,
             })
             .collect(),
-        ai_provider: file.execution.ai_provider.as_deref().and_then(parse_provider),
+        ai_provider: file
+            .execution
+            .ai_provider
+            .as_deref()
+            .and_then(parse_provider),
         require_confirmation: file.execution.require_confirmation,
         system_prompt,
         has_scripts,
@@ -112,6 +119,7 @@ fn parse_provider(raw: &str) -> Option<AiProvider> {
         "gemini" | "gemini-flash" => Some(AiProvider::GeminiFlash),
         "claude" | "anthropic" => Some(AiProvider::Claude),
         "codex" | "openai" | "gpt" => Some(AiProvider::Codex),
+        "zai" | "z.ai" | "glm" => Some(AiProvider::Zai),
         other => {
             tracing::warn!(provider = %other, "unknown ai_provider in skill.toml; ignoring override");
             None
@@ -226,7 +234,11 @@ description = "does a thing"
     #[test]
     fn broken_skills_are_skipped_not_fatal() {
         let root = std::env::temp_dir().join(format!("hive-skill-broken-{}", std::process::id()));
-        write_skill(&root.join("good"), "[skill]\nname = \"good\"\ndescription = \"d\"\n", None);
+        write_skill(
+            &root.join("good"),
+            "[skill]\nname = \"good\"\ndescription = \"d\"\n",
+            None,
+        );
         std::fs::create_dir_all(root.join("bad")).unwrap();
         std::fs::write(root.join("bad/skill.toml"), "not = [valid").unwrap();
         std::fs::create_dir_all(root.join("empty")).unwrap();

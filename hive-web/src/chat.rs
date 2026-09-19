@@ -689,6 +689,187 @@ pub async fn capabilities(State(h): State<AgentHandle>) -> Json<Capabilities> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Master-agent model selection — local (Qwen/Ollama) or an API-key cloud
+// provider (Z.ai, NVIDIA). Picking a cloud provider fully disables fallback
+// to the local model (see `LlmRouter::set_provider`); the choice, and any
+// Z.ai key entered through this endpoint, are persisted outside the repo so
+// they survive a restart without leaking into a shared working tree.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct ProviderOption {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub requires_api_key: bool,
+    pub configured: bool,
+}
+
+#[derive(Serialize)]
+pub struct MasterAgentSettings {
+    pub provider: &'static str,
+    pub options: Vec<ProviderOption>,
+    pub local_model: String,
+    pub local_available: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SetMasterAgentRequest {
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+fn provider_id(provider: hive_common::AiProvider) -> &'static str {
+    match provider {
+        hive_common::AiProvider::Local => "local",
+        hive_common::AiProvider::Zai => "zai",
+        hive_common::AiProvider::Nvidia => "nvidia",
+        _ => "local",
+    }
+}
+
+fn parse_provider_id(id: &str) -> Result<hive_common::AiProvider, Response> {
+    match id {
+        "local" => Ok(hive_common::AiProvider::Local),
+        "zai" => Ok(hive_common::AiProvider::Zai),
+        "nvidia" => Ok(hive_common::AiProvider::Nvidia),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown provider '{other}' (expected local, zai, or nvidia)"),
+        )
+            .into_response()),
+    }
+}
+
+async fn master_agent_settings_view(agent: &MasterAgent) -> MasterAgentSettings {
+    MasterAgentSettings {
+        provider: provider_id(agent.llm.current_provider()),
+        options: vec![
+            ProviderOption {
+                id: "local",
+                label: "Local (Qwen via Ollama)",
+                requires_api_key: false,
+                configured: true,
+            },
+            ProviderOption {
+                id: "zai",
+                label: "Z.ai (GLM)",
+                requires_api_key: true,
+                configured: agent.llm.zai_configured(),
+            },
+            ProviderOption {
+                id: "nvidia",
+                label: "NVIDIA",
+                requires_api_key: true,
+                configured: agent.llm.nvidia_configured(),
+            },
+        ],
+        local_model: agent.llm.local_model_name(),
+        local_available: agent.llm.local_available().await,
+    }
+}
+
+pub async fn master_agent_settings(
+    State(h): State<AgentHandle>,
+) -> Result<Json<MasterAgentSettings>, Response> {
+    let agent = h.require()?;
+    Ok(Json(master_agent_settings_view(agent).await))
+}
+
+pub async fn set_master_agent(
+    State(h): State<AgentHandle>,
+    Json(req): Json<SetMasterAgentRequest>,
+) -> Result<Json<MasterAgentSettings>, Response> {
+    let agent = h.require()?;
+    let provider = parse_provider_id(&req.provider)?;
+
+    agent
+        .llm
+        .set_provider(provider, req.api_key.clone())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
+    if let Err(e) = save_master_agent_selection(&req.provider, req.api_key.as_deref()) {
+        warn!(error = %e, "failed to persist master-agent selection; it will revert to the configured default on restart");
+    }
+
+    info!(provider = %req.provider, "master agent provider switched");
+    Ok(Json(master_agent_settings_view(agent).await))
+}
+
+/// Where the master-agent provider selection (and any Z.ai key entered
+/// through the settings API) is persisted. Never inside the project
+/// directory — this can be a shared working tree.
+fn master_agent_state_path() -> Option<std::path::PathBuf> {
+    std::env::var("HOME").ok().map(|home| {
+        std::path::Path::new(&home)
+            .join(".hive")
+            .join("master-agent.json")
+    })
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PersistedMasterAgent {
+    provider: String,
+    #[serde(default)]
+    zai_api_key: Option<String>,
+}
+
+fn save_master_agent_selection(provider: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+    let path = master_agent_state_path()
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot persist master-agent selection"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Merge with whatever is already on disk so switching to `local` (no
+    // key) doesn't discard a previously entered Z.ai key.
+    let mut state = load_master_agent_state().unwrap_or_default();
+    state.provider = provider.to_string();
+    if let Some(key) = api_key {
+        state.zai_api_key = Some(key.to_string());
+    }
+
+    let contents = serde_json::to_string_pretty(&state)?;
+    std::fs::write(&path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn load_master_agent_state() -> Option<PersistedMasterAgent> {
+    let path = master_agent_state_path()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Apply a persisted master-agent selection to a freshly built router, if
+/// one was saved by an earlier run. Called once at startup, before the
+/// router is shared behind an `Arc`. Failures are logged, not fatal — the
+/// process falls back to whatever `hive.toml` configured.
+pub fn apply_persisted_master_agent(llm: &hive_core::llm::LlmRouter) {
+    let Some(state) = load_master_agent_state() else {
+        return;
+    };
+    let Ok(provider) = (match state.provider.as_str() {
+        "local" => Ok(hive_common::AiProvider::Local),
+        "zai" => Ok(hive_common::AiProvider::Zai),
+        "nvidia" => Ok(hive_common::AiProvider::Nvidia),
+        other => Err(anyhow::anyhow!("unknown persisted provider '{other}'")),
+    }) else {
+        warn!(provider = %state.provider, "ignoring unrecognized persisted master-agent provider");
+        return;
+    };
+    if let Err(e) = llm.set_provider(provider, state.zai_api_key.clone()) {
+        warn!(error = %e, provider = %state.provider, "could not restore persisted master-agent selection");
+    } else {
+        info!(provider = %state.provider, "restored persisted master-agent selection");
+    }
+}
+
 #[cfg(test)]
 mod deadline_tests {
     use super::*;

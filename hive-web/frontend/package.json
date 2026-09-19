@@ -1,0 +1,23 @@
+{
+  "name": "hive-web-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "next build",
+    "test:ui": "playwright test"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.3.0",
+    "next": "^16.3.5",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.6.0"
+  }
+}

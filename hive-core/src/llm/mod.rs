@@ -5,15 +5,30 @@ pub mod gemini;
 pub mod local;
 pub mod nvidia;
 pub mod openai;
+pub mod zai;
 
 pub use claude::ClaudeClient;
 pub use gemini::GeminiClient;
 pub use local::OllamaClient;
 pub use openai::OpenAiClient;
+pub use zai::ZaiClient;
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use hive_common::config::LlmConfig;
 use hive_common::{AiProvider, Complexity};
 use serde::{Deserialize, Serialize};
+
+/// Env var NVIDIA's client resolves its key from (see `nvidia::NvidiaClient::for_reasoning`).
+const NVIDIA_KEY_ENV: &str = "NVIDIA_API_KEY_FLASH";
+
+fn nvidia_key_configured() -> bool {
+    std::env::var(NVIDIA_KEY_ENV)
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .is_some()
+}
 
 /// A single turn in a chat-style LLM request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,26 +83,33 @@ pub struct LlmResponse {
 /// Single-provider mode overrides every recommendation and skill override,
 /// and propagates errors without switching providers.
 pub struct LlmRouter {
-    single_provider: Option<AiProvider>,
+    /// When set, overrides all routing and disables provider fallback.
+    /// Runtime-mutable so the master-agent settings API can switch it
+    /// without a restart.
+    single_provider: RwLock<Option<AiProvider>>,
     nvidia: nvidia::NvidiaClient,
-    models: std::collections::HashMap<AiProvider, String>,
+    models: RwLock<HashMap<AiProvider, String>>,
     local: OllamaClient,
     gemini: Option<GeminiClient>,
     claude: Option<ClaudeClient>,
     codex: Option<OpenAiClient>,
+    /// Runtime-mutable: `set_provider` can configure or replace this from a
+    /// caller-supplied API key without restarting the process.
+    zai: RwLock<Option<Arc<ZaiClient>>>,
 }
 
 impl LlmRouter {
     /// Create a router with only the local Ollama client configured.
     pub fn new(local_url: String, local_model: String) -> Self {
         Self {
-            models: [(AiProvider::Local, local_model.clone())].into(),
-            single_provider: None,
+            models: RwLock::new([(AiProvider::Local, local_model.clone())].into()),
+            single_provider: RwLock::new(None),
             nvidia: nvidia::NvidiaClient::for_reasoning(&Default::default()),
             local: OllamaClient::new(local_url, local_model),
             gemini: None,
             claude: None,
             codex: None,
+            zai: RwLock::new(None),
         }
     }
 
@@ -128,26 +150,36 @@ impl LlmRouter {
             }
         });
 
-        let mut models = std::collections::HashMap::new();
+        let zai = cfg.zai.as_ref().and_then(|c| match ZaiClient::new(c) {
+            Ok(client) => Some(Arc::new(client)),
+            Err(e) => {
+                tracing::warn!("Z.AI provider not available: {e}");
+                None
+            }
+        });
+
+        let mut models = HashMap::new();
         models.insert(AiProvider::Local, cfg.local.model.clone());
         models.insert(AiProvider::Nvidia, cfg.nvidia.model.clone());
         for (provider, config) in [
             (AiProvider::GeminiFlash, &cfg.gemini),
             (AiProvider::Claude, &cfg.claude),
             (AiProvider::Codex, &cfg.codex),
+            (AiProvider::Zai, &cfg.zai),
         ] {
             if let Some(config) = config {
                 models.insert(provider, config.model.clone());
             }
         }
         Self {
-            single_provider: cfg.single_provider,
+            single_provider: RwLock::new(cfg.single_provider),
             nvidia: nvidia::NvidiaClient::for_reasoning(&cfg.nvidia),
-            models,
+            models: RwLock::new(models),
             local,
             gemini,
             claude,
             codex,
+            zai: RwLock::new(zai),
         }
     }
 
@@ -172,7 +204,8 @@ impl LlmRouter {
 
     /// Auxiliary completion: NVIDIA master model, or local in legacy mode.
     pub async fn local_complete(&self, prompt: &str) -> anyhow::Result<String> {
-        if let Some(provider) = self.single_provider {
+        let single_provider = *self.single_provider.read().unwrap();
+        if let Some(provider) = single_provider {
             if provider == AiProvider::Nvidia {
                 return Ok(self.nvidia.complete(prompt, "low").await?.text);
             }
@@ -182,11 +215,83 @@ impl LlmRouter {
     }
 
     pub fn effective_provider(&self, provider: AiProvider) -> AiProvider {
-        self.single_provider.unwrap_or(provider)
+        self.single_provider.read().unwrap().unwrap_or(provider)
     }
 
     pub fn uses_local_startup(&self) -> bool {
-        self.single_provider.is_none() || self.single_provider == Some(AiProvider::Local)
+        let single_provider = *self.single_provider.read().unwrap();
+        single_provider.is_none() || single_provider == Some(AiProvider::Local)
+    }
+
+    /// Which provider the master agent currently answers with. Defaults to
+    /// `Local` when no single-provider mode is set (legacy multi-provider
+    /// routing still uses the local model as its classifier and fallback).
+    pub fn current_provider(&self) -> AiProvider {
+        self.single_provider
+            .read()
+            .unwrap()
+            .unwrap_or(AiProvider::Local)
+    }
+
+    /// Whether a Z.AI client is currently configured (via `hive.toml`/`Z_AI`
+    /// at startup, or a key supplied later through [`Self::set_provider`]).
+    pub fn zai_configured(&self) -> bool {
+        self.zai.read().unwrap().is_some()
+    }
+
+    /// Whether NVIDIA is configured, i.e. `NVIDIA_API_KEY_FLASH` is set.
+    pub fn nvidia_configured(&self) -> bool {
+        nvidia_key_configured()
+    }
+
+    /// The local (Ollama) model name, for display in the master-agent picker.
+    pub fn local_model_name(&self) -> String {
+        self.models
+            .read()
+            .unwrap()
+            .get(&AiProvider::Local)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Explicitly select the master agent's sole provider.
+    ///
+    /// `Local` always succeeds. `Zai` requires either an already-configured
+    /// client or a freshly supplied `api_key` (which replaces any previously
+    /// configured Z.AI client). `Nvidia` requires `NVIDIA_API_KEY_FLASH` to
+    /// already be set in the environment — no live key entry for it here.
+    /// Any other provider is rejected: those are routed automatically by
+    /// task complexity, not selectable as the master agent's sole provider.
+    ///
+    /// Once set, this disables fallback to the local model for every other
+    /// provider (see `complete_formatted`) — the caller has explicitly
+    /// opted out of ever silently running the local Qwen model again.
+    pub fn set_provider(
+        &self,
+        provider: AiProvider,
+        api_key: Option<String>,
+    ) -> anyhow::Result<()> {
+        match provider {
+            AiProvider::Local => {}
+            AiProvider::Zai => {
+                if let Some(key) = api_key {
+                    *self.zai.write().unwrap() = Some(Arc::new(ZaiClient::with_key(key)));
+                }
+                if self.zai.read().unwrap().is_none() {
+                    anyhow::bail!("Z.AI API key required");
+                }
+            }
+            AiProvider::Nvidia => {
+                if !nvidia_key_configured() {
+                    anyhow::bail!("NVIDIA is not configured: set {NVIDIA_KEY_ENV}");
+                }
+            }
+            other => {
+                anyhow::bail!("{other} cannot be selected as the master agent's sole provider")
+            }
+        }
+        *self.single_provider.write().unwrap() = Some(provider);
+        Ok(())
     }
 
     /// Route a prompt to the provider recommended for `complexity`, falling
@@ -271,15 +376,34 @@ impl LlmRouter {
                     "Codex is not configured (set OPENAI_API_KEY or [llm.codex] in hive.toml)"
                 )),
             },
+            AiProvider::Zai => {
+                // Clone the Arc and drop the read guard before the await —
+                // holding a std::sync::RwLock guard across an await point
+                // would poison the lock if this task is cancelled mid-hold.
+                let client = self.zai.read().unwrap().clone();
+                match client {
+                    Some(client) => client.complete(prompt).await,
+                    None => Err(anyhow::anyhow!(
+                        "Z.AI is not configured (set Z_AI or [llm.zai] in hive.toml, or select it from the master-agent settings with an API key)"
+                    )),
+                }
+            }
         };
 
+        let single_provider = *self.single_provider.read().unwrap();
         match result {
             Ok(text) => Ok(LlmResponse {
                 text,
                 provider,
-                model: self.models.get(&provider).cloned().unwrap_or_default(),
+                model: self
+                    .models
+                    .read()
+                    .unwrap()
+                    .get(&provider)
+                    .cloned()
+                    .unwrap_or_default(),
             }),
-            Err(e) if provider != AiProvider::Local && self.single_provider.is_none() => {
+            Err(e) if provider != AiProvider::Local && single_provider.is_none() => {
                 tracing::warn!(
                     "Provider {provider} unavailable ({e}), falling back to local model"
                 );
@@ -289,6 +413,8 @@ impl LlmRouter {
                     provider: AiProvider::Local,
                     model: self
                         .models
+                        .read()
+                        .unwrap()
                         .get(&AiProvider::Local)
                         .cloned()
                         .unwrap_or_default(),
@@ -296,5 +422,75 @@ impl LlmRouter {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hive_common::config::{LlmConfig, LocalLlmConfig, NvidiaConfig};
+
+    fn base_config() -> LlmConfig {
+        LlmConfig {
+            single_provider: None,
+            nvidia: NvidiaConfig::default(),
+            local: LocalLlmConfig::default(),
+            gemini: None,
+            claude: None,
+            codex: None,
+            zai: None,
+        }
+    }
+
+    #[test]
+    fn set_provider_refuses_zai_without_any_key() {
+        let router = LlmRouter::from_config(&base_config());
+        let err = router.set_provider(AiProvider::Zai, None).unwrap_err();
+        assert!(err.to_string().contains("API key"), "{err}");
+        assert_eq!(router.current_provider(), AiProvider::Local);
+        assert!(!router.zai_configured());
+    }
+
+    #[test]
+    fn set_provider_accepts_zai_with_a_key_and_local_always_succeeds() {
+        let router = LlmRouter::from_config(&base_config());
+        router
+            .set_provider(AiProvider::Zai, Some("test-key".into()))
+            .unwrap();
+        assert_eq!(router.current_provider(), AiProvider::Zai);
+        assert!(router.zai_configured());
+
+        router.set_provider(AiProvider::Local, None).unwrap();
+        assert_eq!(router.current_provider(), AiProvider::Local);
+        // Switching back to local does not drop the previously entered key.
+        assert!(router.zai_configured());
+    }
+
+    #[test]
+    fn set_provider_rejects_non_selectable_providers() {
+        let router = LlmRouter::from_config(&base_config());
+        let err = router.set_provider(AiProvider::Claude, None).unwrap_err();
+        assert!(err.to_string().contains("cannot be selected"), "{err}");
+    }
+
+    // The core "turn off local qwen" invariant: once Z.AI is the sole
+    // provider, a request never silently falls back to the local model —
+    // even when no Z.AI client is actually configured to serve it. A
+    // regression here would mean the master agent quietly keeps running
+    // local Qwen after the user asked to shift fully to Z.AI.
+    #[tokio::test]
+    async fn selecting_zai_disables_fallback_to_local_even_when_unconfigured() {
+        let mut cfg = base_config();
+        cfg.single_provider = Some(AiProvider::Zai);
+        // Unreachable on purpose: if this were ever hit, the test would hang
+        // or fail with a connection error instead of the expected message.
+        cfg.local.base_url = "http://127.0.0.1:1".into();
+        let router = LlmRouter::from_config(&cfg);
+        assert!(!router.zai_configured());
+
+        let result = router.complete_with("hello", AiProvider::Claude).await;
+        let err = result
+            .expect_err("must not silently fall back to local when Z.AI is the sole provider");
+        assert!(err.to_string().contains("Z.AI is not configured"), "{err}");
     }
 }
