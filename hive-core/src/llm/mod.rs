@@ -352,26 +352,39 @@ impl LlmRouter {
         schema: Option<&serde_json::Value>,
     ) -> anyhow::Result<LlmResponse> {
         let provider = self.effective_provider(provider);
+        // Only Ollama enforces the schema natively; cloud clients take a bare
+        // prompt, so without this they invent field names the strict callers
+        // (e.g. the delegation planner) reject. The local fallback below still
+        // gets the original prompt and the native schema.
+        let schema_prompt = match schema {
+            Some(s) if provider != AiProvider::Local => Some(with_schema_instructions(prompt, s)),
+            _ => None,
+        };
+        let cloud_prompt = schema_prompt.as_deref().unwrap_or(prompt);
         if provider == AiProvider::Nvidia {
-            return self.nvidia.complete(prompt, "high").await;
+            let mut response = self.nvidia.complete(cloud_prompt, "high").await?;
+            if schema.is_some() {
+                response.text = extract_json(&response.text);
+            }
+            return Ok(response);
         }
         let result = match provider {
             AiProvider::Nvidia => unreachable!(),
             AiProvider::Local => self.local_formatted(prompt, schema).await,
             AiProvider::GeminiFlash => match &self.gemini {
-                Some(client) => client.complete(prompt).await,
+                Some(client) => client.complete(cloud_prompt).await,
                 None => Err(anyhow::anyhow!(
                     "Gemini is not configured (set GEMINI_API_KEY or [llm.gemini] in hive.toml)"
                 )),
             },
             AiProvider::Claude => match &self.claude {
-                Some(client) => client.complete(prompt).await,
+                Some(client) => client.complete(cloud_prompt).await,
                 None => Err(anyhow::anyhow!(
                     "Claude is not configured (set ANTHROPIC_API_KEY or [llm.claude] in hive.toml)"
                 )),
             },
             AiProvider::Codex => match &self.codex {
-                Some(client) => client.complete(prompt).await,
+                Some(client) => client.complete(cloud_prompt).await,
                 None => Err(anyhow::anyhow!(
                     "Codex is not configured (set OPENAI_API_KEY or [llm.codex] in hive.toml)"
                 )),
@@ -382,7 +395,7 @@ impl LlmRouter {
                 // would poison the lock if this task is cancelled mid-hold.
                 let client = self.zai.read().unwrap().clone();
                 match client {
-                    Some(client) => client.complete(prompt).await,
+                    Some(client) => client.complete(cloud_prompt).await,
                     None => Err(anyhow::anyhow!(
                         "Z.AI is not configured (set Z_AI or [llm.zai] in hive.toml, or select it from the master-agent settings with an API key)"
                     )),
@@ -393,7 +406,7 @@ impl LlmRouter {
         let single_provider = *self.single_provider.read().unwrap();
         match result {
             Ok(text) => Ok(LlmResponse {
-                text,
+                text: if schema_prompt.is_some() { extract_json(&text) } else { text },
                 provider,
                 model: self
                     .models
@@ -425,6 +438,24 @@ impl LlmRouter {
     }
 }
 
+/// Appends the JSON Schema to a prompt for providers that cannot enforce it.
+fn with_schema_instructions(prompt: &str, schema: &serde_json::Value) -> String {
+    format!(
+        "{prompt}\n\nRespond with only one JSON object: no prose and no markdown fences. \
+         It must validate against this JSON Schema, using exactly these property names \
+         and no others:\n{schema}"
+    )
+}
+
+/// Pulls the JSON object out of a reply that wrapped it in fences or prose.
+fn extract_json(text: &str) -> String {
+    let trimmed = text.trim();
+    match (trimmed.find('{'), trimmed.rfind('}')) {
+        (Some(start), Some(end)) if start < end => trimmed[start..=end].to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +471,24 @@ mod tests {
             codex: None,
             zai: None,
         }
+    }
+
+
+    #[test]
+    fn schema_instructions_name_every_field() {
+        let schema = serde_json::json!({"properties": {"key": {}, "objective": {}}});
+        let prompt = with_schema_instructions("Plan it.", &schema);
+        assert!(prompt.starts_with("Plan it."));
+        assert!(prompt.contains("\"key\"") && prompt.contains("\"objective\""));
+        assert!(prompt.contains("no others"));
+    }
+
+    #[test]
+    fn extract_json_strips_fences_and_prose() {
+        assert_eq!(extract_json("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(extract_json("Here is the plan: {\"a\":{\"b\":2}} done"), "{\"a\":{\"b\":2}}");
+        assert_eq!(extract_json("  {\"a\":1}  "), "{\"a\":1}");
+        assert_eq!(extract_json("no json here"), "no json here");
     }
 
     #[test]
