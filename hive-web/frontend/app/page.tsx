@@ -50,6 +50,7 @@ type Message = {
   reply?: Reply;
 };
 type ChatData = { messages: Message[] };
+type RunEvent = { seq: number; [key: string]: unknown };
 const running = (messages: Message[]) =>
   ["planning", "executing", "awaiting_approval"].includes(
     messages.at(-1)?.status || "",
@@ -60,7 +61,9 @@ function RunCard({ run, refresh }: { run: Run; refresh: () => Promise<void> }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [events, setEvents] = useState<unknown>();
+  const [events, setEvents] = useState<RunEvent[]>();
+  const [moreEvents, setMoreEvents] = useState(false);
+  const [eventsBusy, setEventsBusy] = useState(false);
   async function act(path: string, body?: unknown) {
     setBusy(true);
     setError("");
@@ -80,12 +83,21 @@ function RunCard({ run, refresh }: { run: Run; refresh: () => Promise<void> }) {
       setBusy(false);
     }
   }
-  async function inspect() {
+  async function inspect(more = false) {
+    if (eventsBusy) return;
+    setEventsBusy(true);
     setError("");
     try {
-      setEvents(await api(`/api/runs/${encodeURIComponent(run.id)}/events`));
+      const after = more ? events?.at(-1)?.seq : undefined;
+      const next = await api<RunEvent[]>(
+        `/api/runs/${encodeURIComponent(run.id)}/events${after === undefined ? "" : `?after=${after}`}`,
+      );
+      setEvents((current) => more ? [...(current || []), ...next] : next);
+      setMoreEvents(next.length === 300);
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setEventsBusy(false);
     }
   }
   return (
@@ -105,7 +117,7 @@ function RunCard({ run, refresh }: { run: Run; refresh: () => Promise<void> }) {
         >
           Open terminal
         </Link>
-        <button onClick={() => void inspect()}>Refresh events</button>
+        <button disabled={eventsBusy} onClick={() => void inspect()}>Refresh events</button>
         {!run.runner_path &&
           ["needs-setup", "disconnected"].includes(run.state) && (
             <button disabled={busy} onClick={() => void act("retry-setup")}>
@@ -154,19 +166,25 @@ function RunCard({ run, refresh }: { run: Run; refresh: () => Promise<void> }) {
         <details open>
           <summary>Agent events</summary>
           <pre>{JSON.stringify(events, null, 2)}</pre>
+          {moreEvents && (
+            <button disabled={eventsBusy} onClick={() => void inspect(true)}>
+              Load more events
+            </button>
+          )}
         </details>
       )}
       <form
         onSubmit={async (e: FormEvent) => {
           e.preventDefault();
+          const draft = text;
           if (
-            text.trim() &&
+            !busy && draft.trim() &&
             (await act("messages", {
               id: requestId(),
-              text: text.trim(),
+              text: draft.trim(),
             }))
           )
-            setText("");
+            setText((current) => current === draft ? "" : current);
         }}
       >
         <label>
@@ -280,7 +298,8 @@ export default function AgentPage() {
     };
   }, [active]);
   async function send() {
-    const text = input.trim();
+    const draft = input;
+    const text = draft.trim();
     if (!text || busy || loading || running(messages) || !capable) return;
     setBusy(true);
     setError("");
@@ -305,7 +324,7 @@ export default function AgentPage() {
         }),
       });
       if (activeRef.current === id) {
-        setInput("");
+        setInput((current) => current === draft ? "" : current);
         await refresh(id);
       }
       await loadChats();
