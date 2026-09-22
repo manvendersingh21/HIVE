@@ -1,4 +1,4 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, Locator, Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { resolve, extname } from "node:path";
 
@@ -206,6 +206,73 @@ test("master agent provider settings loads and saves", async ({ page }) => {
   await expect(select).toHaveValue("zai");
   await expect(page.getByLabel("Z.AI API key")).toHaveValue("");
 });
+test("fleet settings add and remove only editable workers", async ({ page }) => {
+  const configured = { name: "worker-a", host: "ssh-a", user: "someone", port: null,
+    tags: ["linux"], status: "online", removable: false };
+  const added = { ...configured, name: "qa-worker", host: "ssh-qa", user: "tester",
+    tags: ["qa", "light"], removable: true };
+  let payload: unknown;
+  await page.route("**/api/fleet", async (route) => {
+    if (route.request().method() === "POST") {
+      payload = route.request().postDataJSON();
+      return route.fulfill({ json: [configured, added] });
+    }
+    await route.fulfill({ json: [configured] });
+  });
+  await page.route("**/api/fleet/qa-worker", async (route) => {
+    expect(route.request().method()).toBe("DELETE");
+    await route.fulfill({ json: [configured] });
+  });
+  await page.goto("/settings/");
+  await expect(page.getByRole("button", { name: "Remove", exact: true })).toHaveCount(0);
+  await page.getByLabel("Name", { exact: true }).fill(" qa-worker ");
+  await page.getByLabel("Host", { exact: true }).fill(" ssh-qa ");
+  await page.getByLabel("SSH user", { exact: true }).fill(" tester ");
+  await page.getByLabel("Tags (comma-separated, optional)").fill("qa, light, ");
+  await page.getByRole("button", { name: "Add machine" }).click();
+  await expect(page.locator("article").filter({ hasText: "qa-worker" })).toBeVisible();
+  expect(payload).toEqual({ name: "qa-worker", host: "ssh-qa", user: "tester", tags: ["qa", "light"] });
+  await expect(page.getByLabel("Name", { exact: true })).toHaveValue("");
+  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await expect(page.locator("article").filter({ hasText: "qa-worker" })).toHaveCount(0);
+  await expect(page.locator("article").filter({ hasText: "worker-a" })).toBeVisible();
+});
+
+test("fleet settings preserve failed additions and report removal errors", async ({ page }) => {
+  await page.route("**/api/fleet", async (route) => route.request().method() === "POST"
+    ? route.fulfill({ status: 409, body: "Worker already exists" })
+    : route.fulfill({ json: [{ name: "qa-worker", host: "ssh-qa", user: "tester", port: null,
+      tags: [], status: "offline", removable: true }] }));
+  await page.route("**/api/fleet/qa-worker", (route) =>
+    route.fulfill({ status: 503, body: "Could not save fleet" }));
+  await page.goto("/settings/");
+  await page.getByLabel("Name", { exact: true }).fill("qa-worker");
+  await page.getByLabel("Host", { exact: true }).fill("ssh-qa");
+  await page.getByLabel("SSH user", { exact: true }).fill("tester");
+  await page.getByRole("button", { name: "Add machine" }).click();
+  await expect(page.locator('p[role="alert"]')).toHaveText("Worker already exists");
+  await expect(page.getByLabel("Name", { exact: true })).toHaveValue("qa-worker");
+  await expect(page.getByRole("button", { name: "Add machine" })).toBeEnabled();
+  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await expect(page.locator('p[role="alert"]')).toHaveText("Could not save fleet");
+  await expect(page.locator("article").filter({ hasText: "qa-worker" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Remove", exact: true })).toBeEnabled();
+});
+
+test("provider save failure preserves key and allows retry", async ({ page }) => {
+  await page.route("**/api/settings/master-agent", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    await route.fulfill({ status: 503, body: "Provider unavailable" });
+  });
+  await page.goto("/settings/");
+  await page.getByLabel("Master agent provider").selectOption("zai");
+  await page.getByLabel("Z.AI API key").fill("qa-placeholder-key");
+  await page.getByRole("button", { name: "Save master agent" }).click();
+  await expect(page.locator('p[role="alert"]')).toHaveText("Provider unavailable");
+  await expect(page.getByLabel("Z.AI API key")).toHaveValue("qa-placeholder-key");
+  await expect(page.getByRole("button", { name: "Save master agent" })).toBeEnabled();
+});
+
 test("login reports bad credentials and recovers from network failure", async ({
   page,
 }) => {
@@ -240,7 +307,7 @@ test("login succeeds and sign out navigates to login", async ({ page }) => {
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page).toHaveURL("http://127.0.0.1:18081/");
   await page.getByRole("button", { name: "Sign out" }).click();
-  await expect(page).toHaveURL(/\/login\/$/);
+  await expect(page).toHaveURL(/\/login\/?$/);
 });
 test("sign out failure stays visible", async ({ page }) => {
   await page.route("**/logout", (route) => route.fulfill({ status: 500 }));
@@ -579,6 +646,27 @@ test("fleet cards show both agents, events, messages, decisions and setup retry"
     card.getByRole("link", { name: "Open terminal" }),
   ).toHaveAttribute("href", "/terminal/?name=agent-1&host=worker-a");
 });
+test("agent event viewer loads later pages without losing earlier evidence", async ({ page }) => {
+  await page.route("**/api/runs?*", (route) => route.fulfill({ json: [run] }));
+  await page.route("**/api/runs/run-1/events*", (route) => {
+    const after = new URL(route.request().url()).searchParams.get("after");
+    return route.fulfill({ json: after === "300"
+      ? [{ seq: 301, kind: "acknowledgment", payload: { message_id: "late-peer-message" } }]
+      : Array.from({ length: 300 }, (_, index) => ({ seq: index + 1, kind: "native", payload: { text: `event-${index + 1}` } })) });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: /Machine work/ }).click();
+  await page.getByRole("button", { name: "Refresh events" }).click();
+  await page.getByRole("button", { name: "Load more events" }).click();
+  const output = page.locator(".run-card details pre");
+  await expect(output).toContainText("late-peer-message");
+  expect(JSON.parse((await output.textContent())!)).toHaveLength(301);
+  await expect(page.getByRole("button", { name: "Load more events" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Refresh events" }).click();
+  await expect(page.getByRole("button", { name: "Load more events" })).toBeVisible();
+  expect(JSON.parse((await output.textContent())!)).toHaveLength(300);
+});
+
 test("terminal sends binary input and text resize; reconnect and back work", async ({
   page,
 }) => {
@@ -657,7 +745,7 @@ test("unauthorized API request returns user to login", async ({ page }) => {
     route.fulfill({ status: 401, body: "unauthorized" }),
   );
   await page.goto("/sessions/");
-  await expect(page).toHaveURL(/\/login\/$/);
+  await expect(page).toHaveURL(/\/login\/?$/);
 });
 
 test("reopening an active chat resumes polling and recovers the composer", async ({
@@ -757,6 +845,49 @@ test("message failures retain existing conversation and draft", async ({
     "Retry this command",
   );
 });
+test("chat preserves a new draft typed while the previous request is sending", async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let received = false;
+  await page.route("**/api/chat", async (route) => {
+    received = true;
+    await gate;
+    await route.fulfill({ json: { status: "planning" } });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: /Machine work/ }).click();
+  const input = page.getByLabel("Message Hive");
+  await input.fill("First request");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => received).toBe(true);
+  await input.fill("Keep my next request");
+  release();
+  await expect(page.getByRole("button", { name: "Sending…", exact: true })).toHaveCount(0);
+  await expect(input).toHaveValue("Keep my next request");
+});
+
+test("agent message preserves a new draft typed while sending", async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let received = false;
+  await page.route("**/api/runs?*", (route) => route.fulfill({ json: [run] }));
+  await page.route("**/api/runs/run-1/messages", async (route) => {
+    received = true;
+    await gate;
+    await route.fulfill({ json: { saved: true } });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: /Machine work/ }).click();
+  const input = page.getByLabel("Message codex on worker-a");
+  await input.fill("First message");
+  await page.getByRole("button", { name: "Send to agent" }).click();
+  await expect.poll(() => received).toBe(true);
+  await input.fill("Keep my next message");
+  release();
+  await expect(page.getByText("Request saved.")).toBeVisible();
+  await expect(input).toHaveValue("Keep my next message");
+});
+
 test("fleet message failure retains draft", async ({ page }) => {
   await page.route("**/api/runs?*", (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/messages", (route) =>
@@ -794,11 +925,7 @@ test("live local tmux: browser login, create, command, resize, kill, logout", as
   const name = "hive-ui-" + Date.now();
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.goto(url + "/login/");
-  await page
-    .getByLabel("Password", { exact: true })
-    .fill(process.env.HIVE_UI_TEST_PASSWORD!);
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await loginLive(page, url);
   await page.getByRole("link", { name: "Sessions", exact: true }).click();
   await page.getByLabel("Session name").fill(name);
   await page.getByLabel("Session type").selectOption("shell");
@@ -833,7 +960,8 @@ test("live local tmux: browser login, create, command, resize, kill, logout", as
     0,
   );
   await page.getByRole("button", { name: "Sign out" }).click();
-  await expect(page).toHaveURL(/\/login\/$/);
+  await expect(page).toHaveURL(/\/login\/?$/);
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -879,17 +1007,143 @@ async function prepareLive(page: Page) {
 
   return url;
 }
+
+async function loginLive(page: Page, url: string) {
+  await page.goto(url + "/login/");
+  await page
+    .getByLabel("Password", { exact: true })
+    .fill(process.env.HIVE_UI_TEST_PASSWORD!);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page).not.toHaveURL(/\/login\/?$/, { timeout: 10000 });
+  await expect(page.getByRole("button", { name: "Sign out" })).toBeVisible();
+}
+
+type LiveAssignment = { device: string; agent: string; model: string };
+type LiveRunEvidence = {
+  id: string;
+  assignment: LiveAssignment;
+  metadata: { actual_model?: string };
+};
+
+function lowerTierModel(variable: string, fallback: string) {
+  const selected = process.env[variable]?.trim() || fallback;
+  // These remote smoke tests must never silently launch a default/high model.
+  expect([
+    "gpt-5.6-luna", "haiku", "zai-coding-plan/glm-5.3-flash",
+    "opencode/mimo-v2.6-flash-free",
+  ], `${variable} must explicitly select an approved lower-tier QA model`).toContain(selected);
+  return selected;
+}
+
+async function expectLivePlacement(page: Page, expected: LiveAssignment[]) {
+  const details = page.locator(".message.assistant details pre").last();
+  await expect(details).toBeAttached();
+  const reply = JSON.parse((await details.textContent())!);
+  const runs: LiveRunEvidence[] = reply.delegation.runs;
+  const selected = (assignments: LiveAssignment[]) => assignments
+    .map(({ device, agent, model }) => ({ device, agent, model }))
+    .sort((a, b) => `${a.device}/${a.agent}`.localeCompare(`${b.device}/${b.agent}`));
+  expect(selected(runs.map((run) => run.assignment))).toEqual(selected(expected));
+  return { conversationId: reply.conversation_id as string, runs };
+}
+
+async function expectLivePlan(page: Page) {
+  const status = page.locator(".message.assistant small").last();
+  await expect(status).toHaveText(/^(completed|failed|interrupted)$/, { timeout: 300000 });
+  expect(await status.textContent(), await page.locator(".message.assistant").last().innerText())
+    .toBe("completed");
+}
+
+async function expectRuntimeModels(
+  page: Page,
+  placement: Awaited<ReturnType<typeof expectLivePlacement>>,
+) {
+  const url = new URL("/api/runs", page.url());
+  url.searchParams.set("conversation_id", placement.conversationId);
+  const response = await page.request.get(url.toString());
+  expect(response.ok()).toBe(true);
+  const runs: LiveRunEvidence[] = await response.json();
+  expect(runs).toHaveLength(placement.runs.length);
+  for (const planned of placement.runs) {
+    const actual = runs.find((run) => run.id === planned.id);
+    expect(actual?.assignment).toMatchObject(planned.assignment);
+    if (planned.assignment.model === "haiku") {
+      expect(actual?.metadata.actual_model).toMatch(/^claude-haiku-[\w.-]+$/);
+    } else {
+      expect(actual?.metadata.actual_model).toBe(planned.assignment.model);
+    }
+  }
+}
+
+async function completeLiveRun(page: Page, card: Locator) {
+  const deadline = Date.now() + 600000;
+  let retriedSetup = false;
+  while (Date.now() < deadline) {
+    const state = (await card.locator(".badge").textContent())?.trim();
+    if (state === "completed") return;
+    if (["disconnected", "needs-setup"].includes(state || "") && !retriedSetup) {
+      const retry = card.getByRole("button", { name: "Retry setup" });
+      if (await retry.isEnabled()) {
+        retriedSetup = true;
+        await retry.click();
+        await page.waitForTimeout(2000);
+        continue;
+      }
+    }
+    if (["failed", "disconnected", "needs-setup", "superseded"].includes(state || ""))
+      throw new Error(`Remote agent entered terminal state: ${state}`);
+    if (state === "awaiting-approval") {
+      const approve = card.getByRole("button", { name: "Continue agent" });
+      if (await approve.isEnabled()) await approve.click();
+    }
+    await page.waitForTimeout(2000);
+  }
+  throw new Error("Remote agent did not complete within 10 minutes.");
+}
+
+async function readLiveEvents(card: Locator): Promise<unknown[]> {
+  await card.getByRole("button", { name: "Refresh events" }).click();
+  await expect(card.getByRole("button", { name: "Refresh events" })).toBeEnabled();
+  const more = card.getByRole("button", { name: "Load more events" });
+  for (let pages = 0; await more.count(); pages++) {
+    expect(pages, "Bounded live event pagination").toBeLessThan(20);
+    await more.click();
+    await expect(card.getByRole("button", { name: "Refresh events" })).toBeEnabled();
+  }
+  const output = card.locator("details").filter({
+    has: card.page().locator("summary", { hasText: /^Agent events$/ }),
+  }).locator("pre");
+  await expect(output).toBeVisible();
+  const events: unknown = JSON.parse(await output.innerText());
+  expect(Array.isArray(events)).toBe(true);
+  return events as unknown[];
+}
+
+function expectPeerHandshake(events: unknown[]) {
+  // Require actual outbound peer traffic and acknowledgment of incoming traffic.
+  // Task descriptions and native prompt echoes are not execution evidence.
+  expect(events).toEqual(expect.arrayContaining([
+    ...["question", "answer"].map((kind) => expect.objectContaining({
+      kind: "peer",
+      payload: expect.objectContaining({
+        kind,
+        text: expect.stringContaining("HIVE_TWO_MACHINE_HANDSHAKE"),
+      }),
+    })),
+    expect.objectContaining({
+      kind: "acknowledgment",
+      payload: expect.objectContaining({ message_id: expect.stringMatching(/^(?!initial$).+/) }),
+    }),
+  ]));
+}
+
 test("live chat records a command request and shows its real outcome", async ({
   page,
 }) => {
   test.skip(!process.env.HIVE_UI_LIVE_URL, "Requires a real backend.");
   test.setTimeout(200000);
   const url = await prepareLive(page);
-  await page.goto(url + "/login/");
-  await page
-    .getByLabel("Password", { exact: true })
-    .fill(process.env.HIVE_UI_TEST_PASSWORD!);
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await loginLive(page, url);
   await page.getByRole("button", { name: "New chat" }).click();
   await page
     .getByLabel("Message Hive")
@@ -915,5 +1169,136 @@ test("live chat records a command request and shows its real outcome", async ({
   await page.getByLabel("Show history").check();
   await expect(page.locator('p[role="alert"]')).toHaveCount(0);
   await page.getByRole("button", { name: "Sign out" }).click();
-  await expect(page).toHaveURL(/\/login\/$/);
+  await expect(page).toHaveURL(/\/login\/?$/);
+});
+
+test("live named worker and two-machine collaboration", async ({ page }) => {
+  const workers = (process.env.HIVE_UI_REMOTE_WORKERS || "")
+    .split(",")
+    .map((worker) => worker.trim())
+    .filter(Boolean);
+  test.skip(
+    !process.env.HIVE_UI_LIVE_URL || workers.length !== 2,
+    "Requires a real backend and two comma-separated HIVE_UI_REMOTE_WORKERS.",
+  );
+  test.setTimeout(900000);
+  const [firstWorker, secondWorker] = workers;
+  const codexModel = lowerTierModel("HIVE_UI_CODEX_MODEL", "gpt-5.6-luna");
+  const claudeModel = lowerTierModel("HIVE_UI_CLAUDE_MODEL", "haiku");
+  const url = await prepareLive(page);
+  await loginLive(page, url);
+
+  await page.getByRole("button", { name: "New chat" }).click();
+  const singlePrompt = `Live QA only. Delegate exactly one assignment to the codex agent on ${firstWorker} using model ${codexModel}. Set assignment workspace to ~/hive-workspaces/qa-low-codex-${Date.now()} (keep the literal tilde prefix). This is already a disposable QA workspace; Hive's own bookkeeping files are allowed. Execute the single shell command printf HIVE_REMOTE_WORKER_OK as a standalone tool invocation, require exit code zero, and report its exact output. Do not create or remove extra directories, edit project files, or combine this command with cleanup commands. Do not use the local machine, any other worker, agent, or model. If the exact requested assignment is unavailable, report that instead of substituting.`;
+  await page.getByLabel("Message Hive").fill(singlePrompt);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.locator(".message.user")).toContainText(firstWorker);
+  await expectLivePlan(page);
+  const singlePlacement = await expectLivePlacement(page, [
+    { device: firstWorker, agent: "codex", model: codexModel },
+  ]);
+  await expect(page.locator(".run-card")).toHaveCount(1);
+  const singleRun = page.locator(".run-card").filter({
+    has: page.locator("strong", { hasText: `codex on ${firstWorker}` }),
+  });
+  await expect(singleRun).toHaveCount(1, { timeout: 30000 });
+  await completeLiveRun(page, singleRun);
+  expect(await readLiveEvents(singleRun)).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      kind: "native",
+      payload: expect.objectContaining({
+        method: "item/completed",
+        params: expect.objectContaining({
+          item: expect.objectContaining({
+            type: "commandExecution",
+            exitCode: 0,
+            aggregatedOutput: expect.stringContaining("HIVE_REMOTE_WORKER_OK"),
+          }),
+        }),
+      }),
+    }),
+  ]));
+  await expectRuntimeModels(page, singlePlacement);
+
+  await page.getByRole("button", { name: "New chat" }).click();
+  const collaborationPrompt = `Live QA only. Delegate exactly two collaborating assignments: codex on ${firstWorker} using model ${codexModel} and claude on ${secondWorker} using model ${claudeModel}. Set each assignment workspace to a unique child of ~/hive-workspaces/qa-low-peer-${Date.now()} (keep the literal tilde prefix). Each agent must send the other a peer question containing HIVE_TWO_MACHINE_HANDSHAKE, send a peer answer acknowledging the received question and quoting HIVE_TWO_MACHINE_HANDSHAKE, and then report completion without modifying persistent files. Do not use the local machine, any other worker, agent, or model. If an exact requested assignment is unavailable, report that instead of substituting.`;
+  await page.getByLabel("Message Hive").fill(collaborationPrompt);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.locator(".message.user")).toContainText(secondWorker);
+  await expectLivePlan(page);
+
+  const peerPlacement = await expectLivePlacement(page, [
+    { device: firstWorker, agent: "codex", model: codexModel },
+    { device: secondWorker, agent: "claude", model: claudeModel },
+  ]);
+  const cards = page.locator(".run-card");
+  await expect(cards).toHaveCount(2, { timeout: 30000 });
+  const firstCard = cards.filter({
+    has: page.locator("strong", { hasText: `codex on ${firstWorker}` }),
+  });
+  const secondCard = cards.filter({
+    has: page.locator("strong", { hasText: `claude on ${secondWorker}` }),
+  });
+  await expect(firstCard).toHaveCount(1);
+  await expect(secondCard).toHaveCount(1);
+  await Promise.all([
+    completeLiveRun(page, firstCard),
+    completeLiveRun(page, secondCard),
+  ]);
+  expectPeerHandshake(await readLiveEvents(firstCard));
+  expectPeerHandshake(await readLiveEvents(secondCard));
+  await expectRuntimeModels(page, peerPlacement);
+  await page.screenshot({
+    path: "/tmp/hive-ui-live-two-machine-collaboration.png",
+    fullPage: true,
+  });
+});
+
+test("live named opencode worker", async ({ page }) => {
+  const worker = process.env.HIVE_UI_OPENCODE_WORKER?.trim() || "";
+  test.skip(
+    !process.env.HIVE_UI_LIVE_URL || !worker,
+    "Requires a real backend and HIVE_UI_OPENCODE_WORKER.",
+  );
+  const model = lowerTierModel("HIVE_UI_OPENCODE_MODEL", "zai-coding-plan/glm-5.3-flash");
+  test.setTimeout(600000);
+  const url = await prepareLive(page);
+  await loginLive(page, url);
+
+  await page.getByRole("button", { name: "New chat" }).click();
+  await page
+    .getByLabel("Message Hive")
+    .fill(
+      `Live QA only. Delegate exactly one assignment to the opencode agent on ${worker} using model ${model}. Set assignment workspace to ~/hive-workspaces/qa-low-opencode-${Date.now()} (keep the literal tilde prefix). This is already a disposable QA workspace; Hive's own bookkeeping files are allowed. Execute the single shell command printf HIVE_OPENCODE_WORKER_OK as a standalone tool invocation, require exit code zero, and report its exact output. Do not create or remove extra directories, edit project files, or combine this command with cleanup commands. Do not use the local machine, another worker, agent, or model. If the exact requested assignment is unavailable, report that instead of substituting.`,
+    );
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.locator(".message.user")).toContainText(worker);
+  await expectLivePlan(page);
+  const placement = await expectLivePlacement(page, [
+    { device: worker, agent: "opencode", model },
+  ]);
+  await expect(page.locator(".run-card")).toHaveCount(1);
+  const run = page.locator(".run-card").filter({
+    has: page.locator("strong", { hasText: `opencode on ${worker}` }),
+  });
+  await expect(run).toHaveCount(1, { timeout: 30000 });
+  await completeLiveRun(page, run);
+  expect(await readLiveEvents(run)).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      kind: "native",
+      payload: expect.objectContaining({
+        parts: expect.arrayContaining([
+          expect.objectContaining({
+            type: "tool",
+            tool: "bash",
+            state: expect.objectContaining({
+              status: "completed",
+              output: expect.stringContaining("HIVE_OPENCODE_WORKER_OK"),
+            }),
+          }),
+        ]),
+      }),
+    }),
+  ]));
+  await expectRuntimeModels(page, placement);
 });

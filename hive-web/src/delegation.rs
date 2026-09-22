@@ -17,6 +17,9 @@ use hive_core::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+/// How long a run waits after a failed sync before it is attempted again.
+const SYNC_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn store(h: &AgentHandle) -> anyhow::Result<RunStore> {
     let agent = h
         .agent
@@ -319,6 +322,10 @@ pub fn start(h: AgentHandle) {
                                 if let Err(error) = sync_run(&h, &store, &run, &runs).await {
                                     let _ =
                                         store.state(&run.id, "disconnected", &error.to_string());
+                                    // Holding the task open keeps this run out of the
+                                    // loop, so an unreachable or overloaded worker is
+                                    // not hit with a fresh SSH session every 3s.
+                                    tokio::time::sleep(SYNC_RETRY_BACKOFF).await;
                                 }
                             }),
                         );
@@ -330,12 +337,36 @@ pub fn start(h: AgentHandle) {
     });
 }
 
+/// Copies runtime evidence into a device-agent record; returns whether it changed.
+fn apply_runtime_evidence(attrs: &mut Value, metadata: &Value) -> bool {
+    let before = attrs.clone();
+    if !metadata["invocation"].is_null() {
+        attrs["invocation"] = metadata["invocation"].clone();
+    }
+    if metadata["available_models"].is_array() {
+        attrs["models"] = metadata["available_models"].clone();
+    }
+    *attrs != before
+}
+
+/// A completed run only changes again once Hive has something to deliver to
+/// it: a coordinator follow-up, a user message or a decision. Polling it anyway
+/// costs an SSH round trip and a remote runner process every loop.
+fn idle(store: &RunStore, run: &Run) -> anyhow::Result<bool> {
+    Ok(run.state == "completed"
+        && store.pending_decisions(&run.id)?.is_empty()
+        && store.pending_messages(&run.id)?.is_empty())
+}
+
 async fn sync_run(
     h: &AgentHandle,
     store: &RunStore,
     run: &Run,
     runs: &[Run],
 ) -> anyhow::Result<()> {
+    if idle(store, run)? {
+        return Ok(());
+    }
     let agent = h.agent.as_ref().unwrap();
     let worker = agent
         .workers
@@ -405,10 +436,13 @@ async fn sync_run(
                 return Ok(());
             }
         }
-        let raw = transport::ssh(
+        // The probe starts every agent CLI to read versions and auth, which
+        // takes close to a minute on a loaded worker.
+        let raw = transport::ssh_timeout(
             &worker.info,
             &format!("python3 {} probe", transport::quote(&runner)),
             None,
+            150,
         )
         .await?;
         inventory::project(
@@ -525,18 +559,19 @@ async fn sync_run(
         transport::control(&worker.info, runner, "enqueue", &run.id, 0, Some(&message)).await?;
         store.message_delivered(message["id"].as_str().unwrap())?;
     }
-    // Evidence is learned from a completed native invocation, not installation.
-    if !snapshot["metadata"]["invocation"].is_null() {
+    // Only a completed native invocation proves a model works; the runtime's
+    // own catalog is recorded even when that first call failed, so the user
+    // can explicitly pick another listed model.
+    let metadata = &snapshot["metadata"];
+    if !metadata["invocation"].is_null() || metadata["available_models"].is_array() {
         let id = hive_core::memory::graph::entity_id(
             "device-agent",
             &format!("{}/{}", run.assignment.device, run.assignment.agent),
         );
         if let Some(mut record) = agent.memory.graph.entity(&id)? {
-            record.attrs["invocation"] = snapshot["metadata"]["invocation"].clone();
-            if snapshot["metadata"]["available_models"].is_array() {
-                record.attrs["models"] = snapshot["metadata"]["available_models"].clone();
+            if apply_runtime_evidence(&mut record.attrs, metadata) {
+                agent.memory.graph.upsert_entity(&record)?;
             }
-            agent.memory.graph.upsert_entity(&record)?;
         }
     }
     Ok(())
@@ -576,6 +611,42 @@ fn enrich_approvals(snapshot: &mut Value, stored: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_catalog_is_kept_even_when_the_invocation_failed() {
+        let mut attrs = json!({"models":[],"invocation":null});
+        let failed = json!({"invocation":null,"available_models":["zai/glm-5.2","zai/glm-5.3"]});
+        assert!(apply_runtime_evidence(&mut attrs, &failed));
+        assert_eq!(attrs["models"], json!(["zai/glm-5.2","zai/glm-5.3"]));
+        assert!(attrs["invocation"].is_null());
+        assert!(!apply_runtime_evidence(&mut attrs, &failed));
+        let succeeded = json!({"invocation":{"model":"zai/glm-5.2"},"available_models":["zai/glm-5.2","zai/glm-5.3"]});
+        assert!(apply_runtime_evidence(&mut attrs, &succeeded));
+        assert_eq!(attrs["invocation"]["model"], "zai/glm-5.2");
+        assert!(!apply_runtime_evidence(&mut attrs, &json!({"invocation":null})));
+        assert_eq!(attrs["invocation"]["model"], "zai/glm-5.2");
+    }
+
+    #[test]
+    fn completed_runs_are_polled_only_when_something_is_pending() {
+        let path = std::env::temp_dir().join(format!("hive-idle-{}.db", uuid::Uuid::new_v4()));
+        let graph = hive_core::memory::graph::KnowledgeGraph::open(&path).unwrap();
+        let store = RunStore::new(graph.shared_conn()).unwrap();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"claude","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        let id = store.create("task", "chat", &plan).unwrap().remove(0).id;
+        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        store.state(&id, "completed", "").unwrap();
+        assert!(idle(&store, &store.get(&id).unwrap()).unwrap());
+        store
+            .message("follow-up", "user", &id, &json!({"id":"follow-up","text":"verify"}))
+            .unwrap();
+        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        store.message_delivered("follow-up").unwrap();
+        assert!(idle(&store, &store.get(&id).unwrap()).unwrap());
+        drop(store);
+        drop(graph);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn approval_details_match_native_item_without_changing_grant() {
