@@ -169,7 +169,9 @@ listen_addr = "127.0.0.1:0"
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        env.update(HIVE_CONFIG_ROOT=tmp, HIVE_WEB_ADDR=f"127.0.0.1:{port}", HIVE_WEB_PASSWORD="smoke-password", HIVE_WEB_STATIC=str(ROOT / "hive-web/static"), RUST_LOG="warn")
+        # Own HOME too: the server reads ~/.hive/master-agent.json, and an
+        # operator's saved provider would bypass the mock NVIDIA endpoint.
+        env.update(HOME=tmp, HIVE_CONFIG_ROOT=tmp, HIVE_WEB_ADDR=f"127.0.0.1:{port}", HIVE_WEB_PASSWORD="smoke-password", HIVE_WEB_STATIC=str(ROOT / "hive-web/static"), RUST_LOG="warn")
         with (root / "web.log").open("w+") as log:
             web = subprocess.Popen([str(ROOT / "target/debug/hive-web")], cwd=tmp, env=env, stdout=log, stderr=log)
             try:

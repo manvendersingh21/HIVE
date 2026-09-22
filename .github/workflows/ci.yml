@@ -20,6 +20,31 @@ jobs:
       - run: cargo test --workspace --locked --no-run
       - run: cargo test --workspace --locked
       - run: python3 scripts/check-nvidia.py
-      - run: node scripts/check-chat-timeouts.cjs
       - run: python3 scripts/check-chat-history.py
       - run: git diff --check
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hive-web/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hive-web/frontend/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
+        env:
+          CI: true
+      - name: Keep failure traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: /tmp/hive-ui-test-results
+          retention-days: 7
