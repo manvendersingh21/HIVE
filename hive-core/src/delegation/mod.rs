@@ -79,11 +79,17 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             !a.key.is_empty() && keys.insert(a.key.clone()),
             "Assignment keys must be unique"
         );
-        anyhow::ensure!(
-            agent.workers.find(&a.device).is_some(),
-            "Unknown device: {}",
-            a.device
-        );
+        if agent.workers.find(&a.device).is_none() {
+            // Delegation reaches devices only over SSH, so the coordinator's
+            // own hostname — which the planner sees in the fleet — is not a
+            // target unless it is also configured as a worker.
+            anyhow::ensure!(
+                a.device != agent.master_name(),
+                "{} is the Hive coordinator and can't run delegated agents. Add it as an SSH worker in Settings → Machines (for example host localhost, under a different name) to use it.",
+                a.device
+            );
+            anyhow::bail!("Unknown device: {}", a.device);
+        }
         anyhow::ensure!(
             ["claude", "codex", "agy", "opencode"].contains(&a.agent.as_str()),
             "Unknown agent: {}",
@@ -229,6 +235,17 @@ pub fn validate_explicit(
     Ok(())
 }
 
+/// Tells the planner the coordinator's own hostname — which it sees in the
+/// fleet — is not a delegation target unless it is also an SSH worker.
+fn coordinator_note(agent: &MasterAgent) -> String {
+    if agent.workers.find(agent.master_name()).is_some() {
+        return String::new();
+    }
+    format!("{} is this Hive coordinator (the machine the user is talking to, e.g. their \"mac mini\"). It is not a delegation device: \
+        never assign work to it. If the user asks for it, explain in summary that it must first be added as an SSH worker, with no assignments.\n",
+        agent.master_name())
+}
+
 pub async fn plan(
     agent: &MasterAgent,
     request: &str,
@@ -238,6 +255,7 @@ pub async fn plan(
     inventory::refresh(agent).await?;
     let fleet = crate::memory::machines::describe_for_prompt(&agent.memory.graph)?;
     let agents = inventory::describe(&agent.memory.graph)?;
+    let coordinator = coordinator_note(agent);
     let mut prompt = format!("You are Hive's coordinator. Plan work for real agent conversations on configured devices. \
         Return structured assignments, never shell commands or file contents. The complete fleet is below. \
         Select device, installed agent and available model automatically; explicit user device/agent/model choices take precedence. \
@@ -251,7 +269,7 @@ pub async fn plan(
         dependencies are assignment keys that must complete before this starts; peers that must negotiate concurrently have no dependency on each other. \
         Acceptance criteria must require implementation, independent verification, deployment evidence when requested and peer agreement. \
         For questions that need no work, answer in summary and use an empty assignments list.\n\
-        Fleet:\n{fleet}\nAgent inventory (installation, authentication, runtime, models and invocation evidence are distinct):\n{agents}\n\
+        Fleet:\n{fleet}\n{coordinator}Agent inventory (installation, authentication, runtime, models and invocation evidence are distinct):\n{agents}\n\
         Prior conversation (context only):\n{history}\nUser request:\n{request}");
     let schema = json!({"type":"object","additionalProperties":false,"required":["summary","assignments"],"properties":{
     "summary":{"type":"string"},"assignments":{"type":"array","items":{"type":"object","additionalProperties":false,
@@ -389,6 +407,9 @@ mod tests {
         assert!(validate(&p, &agent).is_ok());
         p.assignments[0].device = "ssh-alias".into();
         assert!(validate(&p, &agent).is_err());
+        p.assignments[0].device = agent.master_name().to_string();
+        let err = validate(&p, &agent).unwrap_err().to_string();
+        assert!(err.contains("Hive coordinator"), "{err}");
         p.assignments[0].device = "air".into();
         p.assignments[0].dependencies = vec!["a".into()];
         assert!(validate(&p, &agent).is_err());
@@ -398,6 +419,28 @@ mod tests {
         p.assignments[0].workspace = "~/hive-workspaces/test".into();
         p.assignments[0].required_capabilities = vec!["heavy-compute".into()];
         assert!(validate(&p, &agent).is_err());
+    }
+    #[test]
+    fn coordinator_is_rejected_unless_it_is_also_a_worker() {
+        let agent = agent().with_master_name("mac-mini");
+        let mut p = plan();
+        p.assignments[0].device = "mac-mini".into();
+        let err = validate(&p, &agent).unwrap_err().to_string();
+        assert!(err.contains("mac-mini is the Hive coordinator"), "{err}");
+        assert!(err.contains("Settings"), "the error says how to fix it: {err}");
+        // Any other unknown name keeps the plain error.
+        p.assignments[0].device = "nowhere".into();
+        assert_eq!(validate(&p, &agent).unwrap_err().to_string(), "Unknown device: nowhere");
+        // A coordinator that is also a configured worker is a normal device.
+        let both = super::tests::agent().with_master_name("air");
+        assert!(validate(&plan(), &both).is_ok());
+    }
+    #[test]
+    fn planner_is_told_the_coordinator_is_not_a_device() {
+        let note = coordinator_note(&agent().with_master_name("mac-mini"));
+        assert!(note.starts_with("mac-mini is this Hive coordinator"), "{note}");
+        assert!(note.contains("never assign work to it"));
+        assert!(coordinator_note(&agent().with_master_name("air")).is_empty());
     }
     #[test]
     fn explicit_agent_device_choices_override_automatic_placement() {

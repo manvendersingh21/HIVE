@@ -1,0 +1,318 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Hive · incidents</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115; --panel: #161a21; --line: #262c38; --line2: #39424f;
+    --text: #e6e8ee; --dim: #8b93a7; --accent: #f5a623; --ok: #35d07f; --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  header {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 14px; padding: 12px 18px;
+    background: #0f1115ee; backdrop-filter: blur(8px); border-bottom: 1px solid #1e242e;
+  }
+  h1 { margin: 0; font-size: 17px; }
+  nav { display: flex; gap: 4px; margin-left: auto; }
+  nav a { color: var(--dim); text-decoration: none; font-size: 13px; padding: 6px 11px; border-radius: 7px; }
+  nav a:hover { color: var(--text); background: var(--panel); }
+  nav a.on { color: var(--accent); background: var(--panel); }
+
+  main { max-width: 840px; margin: 0 auto; padding: 20px 18px 40px; }
+  .bar { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+  .bar p { margin: 0; color: var(--dim); font-size: 13.5px; flex: 1; }
+  label.toggle { color: var(--dim); font-size: 13px; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
+  button {
+    padding: 8px 15px; border: 1px solid var(--line2); border-radius: 8px; cursor: pointer;
+    background: transparent; color: var(--text); font-size: 13px; font-weight: 600;
+  }
+  button:hover { border-color: var(--text); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #17181c; }
+  button.primary:hover { background: #ffb733; }
+  button.danger { border-color: #6b2f2f; color: var(--bad); }
+  button.danger:hover { border-color: var(--bad); }
+
+  input[type=text] {
+    flex: 1 1 180px; min-width: 0; padding: 8px 11px; font-size: 15px;
+    background: var(--bg); border: 1px solid #2c333f; border-radius: 8px; color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+  .incident {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 13px; padding: 17px 19px; margin-bottom: 14px;
+  }
+  .incident.pending { border-color: #5a4526; }
+  .i-head { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin-bottom: 8px; }
+  .sev {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line2); color: var(--dim);
+  }
+  .sev.low { border-color: #35506b; color: #7fb3ff; }
+  .sev.medium { border-color: #6b5a26; color: var(--accent); }
+  .sev.high { border-color: #6b3f26; color: #ff9d5c; }
+  .sev.critical { border-color: var(--bad); color: var(--bad); }
+  .cat { font-size: 15px; font-weight: 650; }
+  .when { color: var(--dim); font-size: 12.5px; margin-left: auto; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 11px; }
+  .chip {
+    font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line2); color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+  .field { margin-bottom: 10px; }
+  .field-name {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--dim); margin-bottom: 4px;
+  }
+  .field-body { font-size: 13.5px; }
+  pre {
+    margin: 0; padding: 12px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12.5px;
+    white-space: pre-wrap; word-break: break-word; overflow-x: auto; color: var(--text);
+    max-height: 320px; overflow-y: auto;
+  }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .action-row { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
+  .outcome {
+    margin-top: 13px; padding-top: 12px; border-top: 1px solid var(--line);
+    color: var(--dim); font-size: 13px;
+  }
+  .outcome b { color: var(--text); font-weight: 600; }
+  .outcome code {
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12.5px; color: var(--accent);
+  }
+  .err { color: var(--bad); font-size: 13px; margin-top: 10px; }
+  .empty { color: var(--dim); text-align: center; padding: 50px 20px; }
+  .note {
+    margin-top: 26px; padding: 15px 17px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 11px; color: var(--dim); font-size: 13px;
+  }
+  .note b { color: var(--text); font-weight: 600; }
+</style>
+
+<header>
+  <h1>🐝 Hive</h1>
+  <nav>
+    <a href="/">Agent</a>
+    <a href="/sessions">Sessions</a>
+    <a href="/machines">Machines</a>
+    <a href="/incidents" class="on">Incidents</a>
+  </nav>
+</header>
+
+<main>
+  <div class="bar">
+    <p>Sessions the watchdog suspended. They are stopped, not killed — nothing moves until you answer.</p>
+    <label class="toggle"><input type="checkbox" id="history"> Show reviewed</label>
+    <button id="refresh">Refresh</button>
+  </div>
+  <div id="list"><div class="empty">Loading…</div></div>
+  <div class="note">
+    <b>Why suspended and not killed?</b> A SIGSTOP is reversible and loses no work: the
+    process keeps its file descriptors, its half-written buffers and its place in the task.
+    That is what makes a human answer worth waiting for — <i>resume</i> is a real option, not
+    a euphemism for "start over". The cost is that a suspended session holds its resources
+    until someone decides, which is why this page exists.
+  </div>
+</main>
+
+<script>
+  // Everything below builds nodes and sets textContent. Nothing on this page
+  // parses a server string as markup, and that is not a stylistic preference:
+  // `flagged_output` is whatever a supervised agent printed — it is here
+  // *because* it looked dangerous — and `reason` quotes the matched line
+  // verbatim. Parsing either as HTML would let any command an agent runs plant
+  // script in the operator's browser. A Rust test in src/incidents.rs asserts
+  // this file contains no HTML-parsing sink; keep it passing.
+  const $ = id => document.getElementById(id);
+
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  };
+
+  const ago = iso => {
+    const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+  };
+
+  // HumanDecision is an externally tagged enum: "resume" / "abort" for the
+  // unit variants, {"resume_with_note": "…"} for the ones carrying text.
+  const describeDecision = d => {
+    if (d === 'resume') return ['Resumed', null];
+    if (d === 'abort') return ['Aborted', null];
+    if (d && typeof d === 'object') {
+      if ('resume_with_note' in d) return ['Resumed with a note', d.resume_with_note];
+      if ('modify_and_resume' in d) return ['Resumed with a corrected command', d.modify_and_resume];
+    }
+    return ['Reviewed', null];
+  };
+
+  function field(name, body) {
+    const wrap = el('div', 'field');
+    wrap.append(el('div', 'field-name', name), el('div', 'field-body', body));
+    return wrap;
+  }
+
+  function flaggedOutput(text) {
+    const wrap = el('div', 'field');
+    wrap.append(el('div', 'field-name', 'flagged output'), el('pre', null, text));
+    return wrap;
+  }
+
+  function decisionControls(view, card) {
+    const box = el('div', 'actions');
+    const err = el('div', 'err');
+
+    const send = async decision => {
+      err.textContent = '';
+      box.querySelectorAll('button').forEach(b => b.disabled = true);
+      let r;
+      try {
+        r = await fetch(`/api/incidents/${encodeURIComponent(view.id)}/decide`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(decision)
+        });
+      } catch (e) {
+        err.textContent = e.message;
+        box.querySelectorAll('button').forEach(b => b.disabled = false);
+        return;
+      }
+      if (r.status === 401) return location.href = '/login';
+      if (r.ok) return load();
+      // 409 is the expected loss when a second operator has this page open;
+      // showing the store's message tells this one which answer won.
+      const body = await r.json().catch(() => ({}));
+      err.textContent = (r.status === 409 ? 'Already decided — ' : '') +
+        (body.error || `${r.status} ${r.statusText}`);
+      if (r.status === 409 || r.status === 404) setTimeout(load, 1200);
+      else box.querySelectorAll('button').forEach(b => b.disabled = false);
+    };
+
+    const top = el('div', 'action-row');
+    const resume = el('button', 'primary', 'Resume');
+    resume.addEventListener('click', () => send('resume'));
+    const abort = el('button', 'danger', 'Abort');
+    abort.addEventListener('click', () => {
+      if (confirm('Abort this task? The session stops for good.')) send('abort');
+    });
+    top.append(resume, abort);
+
+    const noteRow = el('div', 'action-row');
+    const note = el('input');
+    note.type = 'text';
+    note.placeholder = 'note to add to the session context';
+    const noteBtn = el('button', null, 'Resume with note');
+    noteBtn.addEventListener('click', () => {
+      if (note.value.trim()) send({ resume_with_note: note.value });
+    });
+    noteRow.append(note, noteBtn);
+
+    const cmdRow = el('div', 'action-row');
+    const cmd = el('input');
+    cmd.type = 'text';
+    cmd.placeholder = 'corrected command to run instead';
+    const cmdBtn = el('button', null, 'Modify & resume');
+    cmdBtn.addEventListener('click', () => {
+      if (cmd.value.trim()) send({ modify_and_resume: cmd.value });
+    });
+    cmdRow.append(cmd, cmdBtn);
+
+    box.append(top, noteRow, cmdRow, err);
+    card.append(box);
+  }
+
+  function card(view) {
+    const pending = view.review_state === 'pending_review';
+    const node = el('div', 'incident' + (pending ? ' pending' : ''));
+    const a = view.analysis || {};
+    const severity = String(a.severity || 'low').toLowerCase();
+
+    const head = el('div', 'i-head');
+    head.append(
+      el('span', 'sev ' + severity, severity),
+      el('span', 'cat', a.category ? String(a.category).replace(/_/g, ' ') : 'flagged output'),
+      el('span', 'when', ago(view.created_at))
+    );
+    node.append(head);
+
+    const chips = el('div', 'chips');
+    for (const c of [view.worker, view.tmux_session, 'task ' + view.task_id]) {
+      chips.append(el('span', 'chip', c));
+    }
+    node.append(chips);
+
+    node.append(field('why it was flagged', a.reason || '—'));
+    if (a.suggested_action) node.append(field('suggested action', a.suggested_action));
+    node.append(flaggedOutput(view.flagged_output));
+
+    if (pending) {
+      decisionControls(view, node);
+    } else {
+      const [what, detail] = describeDecision(view.decision);
+      const out = el('div', 'outcome');
+      out.append(el('b', null, what));
+      out.append(document.createTextNode(
+        view.resolved_at ? ` · ${ago(view.resolved_at)}` : ''));
+      if (detail) {
+        out.append(document.createElement('br'));
+        out.append(el('code', null, detail));
+      }
+      node.append(out);
+    }
+    return node;
+  }
+
+  async function load() {
+    const list = $('list');
+    let r;
+    try {
+      r = await fetch('/api/incidents' + ($('history').checked ? '?all=1' : ''));
+    } catch (e) {
+      list.replaceChildren(el('div', 'empty', e.message));
+      return;
+    }
+    if (r.status === 401) return location.href = '/login';
+    if (!r.ok) {
+      list.replaceChildren(el('div', 'empty', `${r.status} ${r.statusText}`));
+      return;
+    }
+    const incidents = await r.json();
+    if (!incidents.length) {
+      list.replaceChildren(el('div', 'empty', $('history').checked
+        ? 'No incidents recorded yet.'
+        : 'Nothing awaiting review. Every supervised session is running.'));
+      return;
+    }
+    list.replaceChildren(...incidents.map(card));
+  }
+
+  $('refresh').addEventListener('click', load);
+  $('history').addEventListener('change', load);
+
+  // Poll, but never yank a half-typed note out from under the operator.
+  setInterval(() => {
+    if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+    load();
+  }, 6000);
+
+  load();
+</script>

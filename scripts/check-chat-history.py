@@ -102,7 +102,9 @@ with tempfile.TemporaryDirectory(prefix='hive-chat-history-') as tmp:
     (root/'config/hive.toml').write_text(config)
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
-    env = dict(os.environ, HIVE_CONFIG_ROOT=tmp, HIVE_WEB_ADDR=f'127.0.0.1:{port}', HIVE_WEB_PASSWORD='history-test-password', HIVE_WEB_STATIC=str(ROOT/'hive-web/static'), RUST_LOG='warn')
+    # Own HOME too: the server reads ~/.hive/master-agent.json, and an operator's
+    # saved provider would route these fixtures to a real model.
+    env = dict(os.environ, HOME=tmp, HIVE_CONFIG_ROOT=tmp, HIVE_WEB_ADDR=f'127.0.0.1:{port}', HIVE_WEB_PASSWORD='history-test-password', HIVE_WEB_STATIC=str(ROOT/'hive-web/static'), RUST_LOG='warn')
     for key in ('NVIDIA_API_KEY_FLASH','NVIDIA_API_KEY_EMBEDDING','OPENAI_API_KEY','GEMINI_API_KEY','ANTHROPIC_API_KEY'):
         env.pop(key, None)
     web = None

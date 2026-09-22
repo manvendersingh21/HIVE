@@ -1,31 +1,10 @@
 "use client";
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { api, requestId, terminalUrl } from "../lib/api";
 import { Shell } from "../components/Nav";
+import { Run, RunSummary } from "../components/RunView";
 type Chat = { id: string; title?: string; updated_at?: string };
-type Run = {
-  id: string;
-  tmux_name: string;
-  state: string;
-  runner_path?: string;
-  assignment: {
-    device: string;
-    agent: string;
-    objective: string;
-    workspace: string;
-  };
-  metadata?: {
-    error?: string;
-    approvals?: {
-      id: string;
-      fingerprint: string;
-      consumed: number;
-      [key: string]: unknown;
-    }[];
-  };
-  review?: { status?: string; summary?: string };
-};
 type Reply = {
   run?: {
     id: string;
@@ -40,7 +19,7 @@ type Reply = {
     awaiting_approval: number[];
     sessions: { session_name: string; worker_name: string }[];
   };
-  delegation?: { runs: Run[] };
+  delegation?: { task_id?: string; runs: Run[] };
 };
 type Message = {
   id?: number;
@@ -50,165 +29,11 @@ type Message = {
   reply?: Reply;
 };
 type ChatData = { messages: Message[] };
-type RunEvent = { seq: number; [key: string]: unknown };
 const running = (messages: Message[]) =>
   ["planning", "executing", "awaiting_approval"].includes(
     messages.at(-1)?.status || "",
   );
 
-function RunCard({ run, refresh }: { run: Run; refresh: () => Promise<void> }) {
-  const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [events, setEvents] = useState<RunEvent[]>();
-  const [moreEvents, setMoreEvents] = useState(false);
-  const [eventsBusy, setEventsBusy] = useState(false);
-  async function act(path: string, body?: unknown) {
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await api(`/api/runs/${encodeURIComponent(run.id)}/${path}`, {
-        method: "POST",
-        body: JSON.stringify(body || {}),
-      });
-      setNotice("Request saved.");
-      await refresh();
-      return true;
-    } catch (e) {
-      setError((e as Error).message);
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function inspect(more = false) {
-    if (eventsBusy) return;
-    setEventsBusy(true);
-    setError("");
-    try {
-      const after = more ? events?.at(-1)?.seq : undefined;
-      const next = await api<RunEvent[]>(
-        `/api/runs/${encodeURIComponent(run.id)}/events${after === undefined ? "" : `?after=${after}`}`,
-      );
-      setEvents((current) => more ? [...(current || []), ...next] : next);
-      setMoreEvents(next.length === 300);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setEventsBusy(false);
-    }
-  }
-  return (
-    <article className="card run-card">
-      <div className="bar">
-        <strong>
-          {run.assignment.agent} on {run.assignment.device}
-        </strong>
-        <span className="badge">{run.state}</span>
-      </div>
-      <p>{run.assignment.objective}</p>
-      <p className="muted">{run.assignment.workspace}</p>
-      <div className="row">
-        <Link
-          className="button"
-          href={terminalUrl(run.tmux_name, run.assignment.device)}
-        >
-          Open terminal
-        </Link>
-        <button disabled={eventsBusy} onClick={() => void inspect()}>Refresh events</button>
-        {!run.runner_path &&
-          ["needs-setup", "disconnected"].includes(run.state) && (
-            <button disabled={busy} onClick={() => void act("retry-setup")}>
-              Retry setup
-            </button>
-          )}
-      </div>
-      {run.review?.summary && (
-        <p>
-          {run.review.status}: {run.review.summary}
-        </p>
-      )}
-      {run.metadata?.error && <p className="error">{run.metadata.error}</p>}
-      {run.metadata?.approvals
-        ?.filter((a) => a.consumed === 0)
-        .map((a) => (
-          <div className="card" key={a.id}>
-            <pre>{JSON.stringify(a, null, 2)}</pre>
-            <button
-              disabled={busy}
-              onClick={() =>
-                void act("decisions", {
-                  id: a.id,
-                  fingerprint: a.fingerprint,
-                  decision: "continue",
-                })
-              }
-            >
-              Continue agent
-            </button>{" "}
-            <button
-              disabled={busy}
-              onClick={() =>
-                void act("decisions", {
-                  id: a.id,
-                  fingerprint: a.fingerprint,
-                  decision: "stop",
-                })
-              }
-            >
-              Stop agent
-            </button>
-          </div>
-        ))}
-      {events !== undefined && (
-        <details open>
-          <summary>Agent events</summary>
-          <pre>{JSON.stringify(events, null, 2)}</pre>
-          {moreEvents && (
-            <button disabled={eventsBusy} onClick={() => void inspect(true)}>
-              Load more events
-            </button>
-          )}
-        </details>
-      )}
-      <form
-        onSubmit={async (e: FormEvent) => {
-          e.preventDefault();
-          const draft = text;
-          if (
-            !busy && draft.trim() &&
-            (await act("messages", {
-              id: requestId(),
-              text: draft.trim(),
-            }))
-          )
-            setText((current) => current === draft ? "" : current);
-        }}
-      >
-        <label>
-          Message {run.assignment.agent} on {run.assignment.device}
-          <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            maxLength={16000}
-            rows={2}
-          />
-        </label>
-        <button disabled={busy || !text.trim() || run.state === "superseded"}>
-          Send to agent
-        </button>
-      </form>
-      {notice && <p role="status">{notice}</p>}
-      {error && (
-        <p role="alert" className="error">
-          {error}
-        </p>
-      )}
-    </article>
-  );
-}
 export default function AgentPage() {
   const [chats, setChats] = useState<Chat[]>([]);
   const [active, setActive] = useState<string>();
@@ -269,6 +94,8 @@ export default function AgentPage() {
       .then((data) => {
         setCapable(data.chat);
         if (data.chat) void loadChats("", 0);
+        const linked = new URLSearchParams(window.location.search).get("chat");
+        if (data.chat && linked) void open(linked);
       })
       .catch((e) => setError(e.message));
   }, []);
@@ -353,6 +180,14 @@ export default function AgentPage() {
       setBusy(false);
     }
   }
+  // Each turn's runs render under the reply that dispatched them; a run whose
+  // turn isn't loaded still shows at the end.
+  const runsFor = (message: Message) => {
+    const task = message.reply?.delegation?.task_id;
+    return task ? runs.filter((r) => r.task_id === task) : [];
+  };
+  const tasks = new Set(messages.map((m) => m.reply?.delegation?.task_id).filter(Boolean));
+  const orphans = runs.filter((r) => !tasks.has(r.task_id));
   return (
     <Shell>
       <div className="chat-layout">
@@ -467,6 +302,14 @@ export default function AgentPage() {
                         </button>
                       </div>
                     ))}
+                {runsFor(message).map((run) => (
+                  <RunSummary
+                    key={run.id}
+                    run={run}
+                    siblings={runsFor(message)}
+                    refresh={() => refreshRuns()}
+                  />
+                ))}
                 {message.reply && (
                   <details>
                     <summary>Execution details</summary>
@@ -475,8 +318,13 @@ export default function AgentPage() {
                 )}
               </article>
             ))}
-            {runs.map((run) => (
-              <RunCard key={run.id} run={run} refresh={() => refreshRuns()} />
+            {orphans.map((run) => (
+              <RunSummary
+                key={run.id}
+                run={run}
+                siblings={runs.filter((r) => r.task_id === run.task_id)}
+                refresh={() => refreshRuns()}
+              />
             ))}
             {error && (
               <p role="alert" className="error">

@@ -226,6 +226,7 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         .route("/machines", page_shell(static_dir, "machines/index.html"))
         .route("/incidents", page_shell(static_dir, "incidents/index.html"))
         .route("/terminal", page_shell(static_dir, "terminal/index.html"))
+        .route("/session", page_shell(static_dir, "session/index.html"))
         .route(
             "/login",
             page_shell(static_dir, "login/index.html").post(auth::login),
@@ -316,6 +317,7 @@ mod router_tests {
             "/sessions",
             "/incidents",
             "/terminal",
+            "/session",
             "/index.html",
             "/chat.html",
             "/incidents.html",
@@ -370,7 +372,7 @@ mod router_tests {
             .split(';')
             .next()
             .unwrap();
-        for path in ["/index.html", "/chat.html", "/incidents.html"] {
+        for path in ["/index.html", "/incidents.html", "/session/index.html"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -394,6 +396,7 @@ mod router_tests {
             ("/machines", "machines/index.html"),
             ("/incidents", "incidents/index.html"),
             ("/terminal", "terminal/index.html"),
+            ("/session", "session/index.html"),
             ("/login", "login/index.html"),
         ];
         for (_, file) in pages {

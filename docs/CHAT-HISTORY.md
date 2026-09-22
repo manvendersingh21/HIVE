@@ -50,11 +50,10 @@ cargo build --workspace --locked
 cargo test --workspace --locked --no-run
 cargo test --workspace --locked
 python3 scripts/check-chat-history.py
-node scripts/check-chat-timeouts.cjs
 git diff --check
 ```
 
-The integration test uses a disposable SQLite database, fake Ollama, no cloud
+The integration test uses a disposable SQLite database and HOME, fake Ollama, no cloud
 keys, and no workers. It checks persistence, search, authentication, context
 isolation, duplicate requests, restart recovery, model failures, browser
 disconnects, and approvals without command replay. Optional Playwright checks
