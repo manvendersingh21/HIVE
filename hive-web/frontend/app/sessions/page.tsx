@@ -3,6 +3,8 @@ import { FormEvent, useEffect, useState } from "react";
 import Link from "next/link";
 import { api, request, terminalUrl } from "../../lib/api";
 import { Shell } from "../../components/Nav";
+import { Run, StateChip, sessionUrl } from "../../components/RunView";
+import { stateTone } from "../../lib/runEvents";
 type Session = {
   name: string;
   host: string;
@@ -10,8 +12,15 @@ type Session = {
   attached: boolean;
   current_command: string;
   window_name: string;
-  run?: { state: string };
+  run?: Run;
 };
+// Delegated runs, grouped by what they need from a person.
+const GROUPS: [string, (state: string) => boolean][] = [
+  ["Needs attention", (s) => ["attention", "bad"].includes(stateTone(s))],
+  ["Running", (s) => stateTone(s) === "running"],
+  ["Queued", (s) => stateTone(s) === "queued"],
+  ["Finished", (s) => ["done", "stale"].includes(stateTone(s))],
+];
 type Host = { host: string; name: string };
 export default function SessionsPage() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -94,11 +103,13 @@ export default function SessionsPage() {
       setBusy(false);
     }
   }
+  const agents = sessions.filter((s) => s.run);
+  const terminals = sessions.filter((s) => !s.run && s.windows > 0);
   return (
     <Shell>
       <main className="content">
         <h1>Sessions</h1>
-        <form className="card row" onSubmit={create}>
+        <form className="card row" onSubmit={create} aria-label="Start a terminal">
           <label>
             Session name
             <input
@@ -158,13 +169,44 @@ export default function SessionsPage() {
             Some machines could not be listed: {warning}
           </p>
         )}
+        <h2>Agent sessions</h2>
+        {!loaded && <div className="empty">Loading sessions…</div>}
+        {loaded && !agents.length && (
+          <div className="empty">No agent sessions yet. Ask Hive to delegate work from the Agent tab.</div>
+        )}
+        {GROUPS.map(([label, match]) => {
+          const group = agents.filter((s) => match(s.run!.state));
+          if (!group.length) return null;
+          return (
+            <section key={label} className="session-group">
+              <h3>
+                {label} <span className="muted">{group.length}</span>
+              </h3>
+              <div className="session-cards">
+                {group.map(({ run }) => (
+                  <Link key={run!.id} href={sessionUrl(run!.id)} className="card session-card">
+                    <div className="bar">
+                      <strong>
+                        {run!.assignment.agent} on {run!.assignment.device}
+                      </strong>
+                      <StateChip state={run!.state} />
+                    </div>
+                    <p className="clamp">{run!.assignment.objective}</p>
+                    <span className="muted small mono">{run!.assignment.workspace}</span>
+                  </Link>
+                ))}
+              </div>
+            </section>
+          );
+        })}
+        <h2>Terminals</h2>
         <div className="grid">
-          {!sessions.length && (
+          {!terminals.length && (
             <div className="empty">
-              {loaded ? "No tmux sessions." : "Loading sessions…"}
+              {loaded ? "No terminal sessions. Start one above." : "Loading sessions…"}
             </div>
           )}
-          {sessions.map((session) => (
+          {terminals.map((session) => (
             <article
               className="card row"
               key={`${session.host}/${session.name}`}
@@ -174,29 +216,22 @@ export default function SessionsPage() {
                 <strong>{session.name}</strong>
                 <div className="muted">
                   {session.host} ·{" "}
-                  {session.window_name || session.current_command}{" "}
-                  {session.run && `· ${session.run.state}`}
+                  {session.window_name || session.current_command}
                 </div>
               </div>
-              {session.windows > 0 ? (
-                <>
-                  <Link
-                    className="button primary"
-                    href={terminalUrl(session.name, session.host)}
-                  >
-                    Open
-                  </Link>
-                  <button
-                    className="danger"
-                    disabled={busy}
-                    onClick={() => void kill(session)}
-                  >
-                    Kill
-                  </button>
-                </>
-              ) : (
-                <span className="muted">Terminal unavailable</span>
-              )}
+              <Link
+                className="button primary"
+                href={terminalUrl(session.name, session.host)}
+              >
+                Open
+              </Link>
+              <button
+                className="danger"
+                disabled={busy}
+                onClick={() => void kill(session)}
+              >
+                Kill
+              </button>
             </article>
           ))}
         </div>

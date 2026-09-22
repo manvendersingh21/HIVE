@@ -60,6 +60,8 @@ pub struct RunQuery {
     pub conversation_id: Option<String>,
     #[serde(default)]
     pub after: i64,
+    /// Latest N events in order, for opening a long session at its end.
+    pub tail: Option<usize>,
 }
 pub async fn list(State(h): State<AgentHandle>, Query(q): Query<RunQuery>) -> Response {
     match store(&h).and_then(|s| s.list()) {
@@ -83,7 +85,10 @@ pub async fn events(
 ) -> Response {
     match store(&h).and_then(|s| {
         s.get(&id)?;
-        s.events(&id, q.after.max(0))
+        match q.tail {
+            Some(n) => s.recent_events(&id, n),
+            None => s.events(&id, q.after.max(0)),
+        }
     }) {
         Ok(v) => Json(v).into_response(),
         Err(e) => error(e),
@@ -611,6 +616,68 @@ fn enrich_approvals(snapshot: &mut Value, stored: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn handle() -> AgentHandle {
+        let agent = hive_core::agent::MasterAgent::new(
+            hive_core::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            hive_core::workers::WorkerPool::new(vec![]),
+            hive_core::skills::SkillRegistry::new(),
+            hive_core::memory::MemorySystem::new(),
+        );
+        AgentHandle {
+            agent: Some(std::sync::Arc::new(agent)),
+            history: None,
+            master_name: "master".into(),
+        }
+    }
+    fn run_with_events(h: &AgentHandle, count: i64) -> String {
+        let store = store(h).unwrap();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"codex","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        let id = store.create("task", "chat", &plan).unwrap().remove(0).id;
+        let events: Vec<Value> = (1..=count)
+            .map(|seq| json!({"id":format!("e{seq}"),"seq":seq,"kind":"native","payload":{"seq":seq}}))
+            .collect();
+        store
+            .sync(&id, &json!({"metadata":{"state":"working"},"events":events,"approvals":[]}))
+            .unwrap();
+        id
+    }
+    async fn fetch(h: &AgentHandle, id: &str, q: RunQuery) -> (StatusCode, Value) {
+        let response = events(State(h.clone()), Path(id.to_string()), Query(q)).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+    fn seqs(v: &Value) -> Vec<i64> {
+        v.as_array().unwrap().iter().map(|e| e["seq"].as_i64().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn events_tail_opens_a_long_session_at_its_latest_activity() {
+        let h = handle();
+        let id = run_with_events(&h, 450);
+        let (status, body) = fetch(&h, &id, RunQuery { tail: Some(5), ..Default::default() }).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seqs(&body), vec![446, 447, 448, 449, 450]);
+        // Without tail the API still pages forward from `after`, 300 at a time.
+        let (_, first) = fetch(&h, &id, RunQuery::default()).await;
+        assert_eq!(seqs(&first).len(), 300);
+        assert_eq!(seqs(&first)[0], 1);
+        let (_, next) = fetch(&h, &id, RunQuery { after: 300, ..Default::default() }).await;
+        assert_eq!(seqs(&next), (301..=450).collect::<Vec<_>>());
+        // A tail larger than the history returns all of it, in order.
+        let (_, all) = fetch(&h, &id, RunQuery { tail: Some(1000), ..Default::default() }).await;
+        assert_eq!(seqs(&all), (1..=450).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn events_for_an_unknown_run_are_refused() {
+        let h = handle();
+        let (status, _) = fetch(&h, "missing", RunQuery { tail: Some(5), ..Default::default() }).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = fetch(&AgentHandle::disabled(), "missing", RunQuery::default()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn runtime_catalog_is_kept_even_when_the_invocation_failed() {

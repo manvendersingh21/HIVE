@@ -13,17 +13,29 @@ const session = {
 };
 const run = {
   id: "run-1",
+  task_id: "turn-1",
+  conversation_id: "chat-1",
   tmux_name: "agent-1",
   state: "working",
   runner_path: "/tmp/runner",
   assignment: {
+    key: "codex-a",
     device: "worker-a",
     agent: "codex",
     objective: "Collaborate with agent on worker-b",
     workspace: "~/hive-workspaces/test",
+    dependencies: [],
+    acceptance_criteria: ["Verified output"],
   },
   metadata: {},
 };
+// Codex app-server journal: a streamed delta, the completed items, a command.
+const codexEvents = [
+  { seq: 1, kind: "state", payload: { state: "working" } },
+  { seq: 2, kind: "native", payload: { method: "item/agentMessage/delta", params: { delta: "Checking" } } },
+  { seq: 3, kind: "native", payload: { method: "item/completed", params: { item: { type: "agentMessage", text: "Checking the workspace first." } } } },
+  { seq: 4, kind: "native", payload: { method: "item/completed", params: { item: { type: "commandExecution", command: "/usr/bin/bash -lc pwd", commandActions: [{ command: "pwd" }], cwd: "/home/u/ws", exitCode: 0, aggregatedOutput: "/home/u/ws\n" } } } },
+];
 const incident = {
   id: "incident-1",
   worker: "worker-a",
@@ -396,7 +408,7 @@ test("kill checks errors and accepts a successful empty response", async ({
   });
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Kill" }).click();
-  await expect(page.getByText("No tmux sessions.")).toBeVisible();
+  await expect(page.getByText("No terminal sessions. Start one above.")).toBeVisible();
 });
 test("machine graph renders facts and tools; re-probe success and failure", async ({
   page,
@@ -581,17 +593,24 @@ for (const allowed of [true, false]) {
     },
   );
 }
-test("fleet cards show both agents, events, messages, decisions and setup retry", async ({
+test("chat run cards show both agents, approvals, setup retry and link to the session", async ({
   page,
 }) => {
-  let message: any;
   const decisions: any[] = [];
   const pending = {
     ...run,
     state: "needs-setup",
     runner_path: null,
     metadata: {
-      approvals: [{ id: "ap-1", fingerprint: "digest", consumed: 0 }],
+      approvals: [
+        {
+          id: "ap-1",
+          fingerprint: "digest",
+          consumed: 0,
+          reason: "Shell expansion requires review",
+          action: JSON.stringify({ arguments: { command: "bash -lc 'ls'", commandActions: [{ command: "ls -la" }], cwd: "/home/u/ws" } }),
+        },
+      ],
     },
   };
   await page.route("**/api/runs?*", (route) =>
@@ -602,22 +621,11 @@ test("fleet cards show both agents, events, messages, decisions and setup retry"
           ...run,
           id: "run-2",
           tmux_name: "agent-2",
-          assignment: {
-            ...run.assignment,
-            device: "worker-b",
-            agent: "claude",
-          },
+          assignment: { ...run.assignment, key: "claude-b", device: "worker-b", agent: "claude" },
         },
       ],
     }),
   );
-  await page.route("**/api/runs/run-1/events", (route) =>
-    route.fulfill({ json: [{ kind: "peer-message", text: "hello worker-b" }] }),
-  );
-  await page.route("**/api/runs/run-1/messages", (route) => {
-    message = route.request().postDataJSON();
-    return route.fulfill({ json: { saved: true } });
-  });
   await page.route("**/api/runs/run-1/decisions", (route) => {
     decisions.push(route.request().postDataJSON());
     return route.fulfill({ json: { saved: true } });
@@ -627,44 +635,155 @@ test("fleet cards show both agents, events, messages, decisions and setup retry"
   );
   await page.goto("/");
   await page.getByRole("button", { name: /Machine work/ }).click();
-  await expect(
-    page.getByText("claude on worker-b", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByText("claude on worker-b", { exact: true })).toBeVisible();
   const card = page.locator(".run-card").first();
-  await card.getByRole("button", { name: "Refresh events" }).click();
-  await expect(card.getByText(/hello worker-b/)).toBeVisible();
-  await card.getByLabel("Message codex on worker-a").fill("Talk to worker-b");
-  await card.getByRole("button", { name: "Send to agent" }).click();
-  await expect(card.getByRole("status")).toHaveText("Request saved.");
-  expect(message.text).toBe("Talk to worker-b");
-  for (const name of ["Continue agent", "Stop agent", "Retry setup"]) {
+  await expect(card.locator(".approval pre")).toHaveText("ls -la");
+  await expect(card.getByText("Shell expansion requires review")).toBeVisible();
+  for (const name of ["Approve", "Deny and stop", "Retry setup"]) {
     await card.getByRole("button", { name }).click();
     await expect(card.getByRole("button", { name })).toBeEnabled();
   }
   expect(decisions.map((d) => d.decision)).toEqual(["continue", "stop"]);
-  await expect(
-    card.getByRole("link", { name: "Open terminal" }),
-  ).toHaveAttribute("href", "/terminal/?name=agent-1&host=worker-a");
+  expect(decisions[0]).toMatchObject({ id: "ap-1", fingerprint: "digest" });
+  await expect(card.getByRole("link", { name: "Open session" })).toHaveAttribute(
+    "href",
+    "/session/?run=run-1",
+  );
 });
-test("agent event viewer loads later pages without losing earlier evidence", async ({ page }) => {
-  await page.route("**/api/runs?*", (route) => route.fulfill({ json: [run] }));
+test("session page renders a readable transcript and streams new events", async ({ page }) => {
+  const requests: string[] = [];
+  await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/events*", (route) => {
-    const after = new URL(route.request().url()).searchParams.get("after");
-    return route.fulfill({ json: after === "300"
-      ? [{ seq: 301, kind: "acknowledgment", payload: { message_id: "late-peer-message" } }]
-      : Array.from({ length: 300 }, (_, index) => ({ seq: index + 1, kind: "native", payload: { text: `event-${index + 1}` } })) });
+    const query = new URL(route.request().url()).searchParams;
+    requests.push(query.toString());
+    if (query.get("tail")) return route.fulfill({ json: codexEvents });
+    return route.fulfill({
+      json: query.get("after") === "4"
+        ? [{ seq: 5, kind: "native", payload: { method: "item/completed", params: { item: { type: "agentMessage", text: "All criteria verified." } } } }]
+        : [],
+    });
   });
-  await page.goto("/");
-  await page.getByRole("button", { name: /Machine work/ }).click();
-  await page.getByRole("button", { name: "Refresh events" }).click();
-  await page.getByRole("button", { name: "Load more events" }).click();
-  const output = page.locator(".run-card details pre");
-  await expect(output).toContainText("late-peer-message");
-  expect(JSON.parse((await output.textContent())!)).toHaveLength(301);
-  await expect(page.getByRole("button", { name: "Load more events" })).toHaveCount(0);
-  await page.getByRole("button", { name: "Refresh events" }).click();
-  await expect(page.getByRole("button", { name: "Load more events" })).toBeVisible();
-  expect(JSON.parse((await output.textContent())!)).toHaveLength(300);
+  await page.goto("/session/?run=run-1");
+  await expect(page.getByText("codex on worker-a", { exact: true })).toBeVisible();
+  await expect(page.getByText("Checking the workspace first.")).toBeVisible();
+  await expect(page.locator(".t-cmd summary").first()).toContainText("$ pwd");
+  await expect(page.locator(".t-cmd summary").first()).toContainText("exit 0");
+  // Deltas are folded into the completed message, never shown on their own.
+  await expect(page.locator(".t-agent", { hasText: /^Checking$/ })).toHaveCount(0);
+  await expect(page.getByText("All criteria verified.")).toBeVisible();
+  expect(requests[0]).toBe("tail=500");
+  expect(requests).toContain("after=4");
+  await page.getByLabel("Raw events").check();
+  await expect(page.locator(".transcript pre")).toContainText("item/agentMessage/delta");
+  await expect(page.getByRole("link", { name: "Open chat" })).toHaveAttribute("href", "/?chat=chat-1");
+  await expect(page.getByRole("link", { name: "Raw terminal" })).toHaveAttribute(
+    "href",
+    "/terminal/?name=agent-1&host=worker-a",
+  );
+});
+test("session opened at its tail can page back to earlier activity", async ({ page }) => {
+  const message = (seq: number, text: string) => ({
+    seq,
+    kind: "native",
+    payload: { method: "item/completed", params: { item: { type: "agentMessage", text } } },
+  });
+  await page.route("**/api/runs", (route) => route.fulfill({ json: [{ ...run, state: "completed" }] }));
+  await page.route("**/api/runs/run-1/events*", (route) => {
+    const query = new URL(route.request().url()).searchParams;
+    if (query.get("tail")) return route.fulfill({ json: [message(700, "Newest update")] });
+    // after=399 returns 400..699; the view keeps only what precedes its first event.
+    return route.fulfill({
+      json: query.get("after") === "399" ? [message(400, "Earlier update"), message(700, "Newest update")] : [],
+    });
+  });
+  await page.goto("/session/?run=run-1");
+  await expect(page.getByText("Newest update")).toBeVisible();
+  await page.getByRole("button", { name: "Show earlier activity" }).click();
+  await expect(page.getByText("Earlier update")).toBeVisible();
+  await expect(page.getByText("Newest update")).toHaveCount(1);
+});
+test("failed session explains why and queued session names what it waits for", async ({ page }) => {
+  const failed = { ...run, state: "failed" };
+  const queued = {
+    ...run,
+    id: "run-2",
+    state: "queued",
+    assignment: { ...run.assignment, key: "consumer", device: "worker-b", dependencies: ["codex-a"] },
+  };
+  await page.route("**/api/runs", (route) => route.fulfill({ json: [failed, queued] }));
+  await page.route("**/api/runs/*/events*", (route) =>
+    route.fulfill({
+      json: route.request().url().includes("run-1")
+        ? [
+            { seq: 1, kind: "native", payload: { method: "turn/completed", params: { turn: { error: { message: "You've hit your usage limit." } } } } },
+            { seq: 2, kind: "error", payload: { message: JSON.stringify({ error: { message: "You've hit your usage limit." } }) } },
+          ]
+        : [],
+    }),
+  );
+  await page.goto("/session/?run=run-1");
+  await expect(page.locator(".banner.bad")).toContainText("You've hit your usage limit.");
+  // The turn error and the runner's error event describe one failure.
+  await expect(page.locator(".t-error")).toHaveCount(1);
+  await page.goto("/session/?run=run-2");
+  const waiting = page.locator(".banner", { hasText: "Waiting to start" });
+  await expect(waiting).toContainText("codex on worker-a");
+  await expect(waiting.locator("[data-state=failed]")).toBeVisible();
+});
+test("sessions page separates agent sessions by attention from terminals", async ({ page }) => {
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({
+      json: [
+        session,
+        { ...session, name: "agent-1", windows: 1, run: { ...run, state: "awaiting-approval" } },
+        { ...session, name: "agent-2", windows: 0, run: { ...run, id: "run-2", state: "completed" } },
+      ],
+    }),
+  );
+  await page.goto("/sessions/");
+  const attention = page.locator(".session-group", { hasText: "Needs attention" });
+  await expect(attention.locator(".session-card")).toHaveCount(1);
+  await expect(attention.locator(".session-card")).toHaveAttribute("href", "/session/?run=run-1");
+  await expect(page.locator(".session-group", { hasText: "Finished" }).locator(".session-card")).toHaveCount(1);
+  await expect(page.getByRole("link", { name: "Open", exact: true })).toHaveAttribute(
+    "href",
+    "/terminal/?name=ui-test&host=worker-a",
+  );
+});
+test("chat shows each turn's runs under the reply that dispatched them", async ({ page }) => {
+  const reply = (task: string, text: string) => ({
+    role: "assistant",
+    content: text,
+    status: "completed",
+    reply: { delegation: { task_id: task, runs: [] } },
+  });
+  await page.route("**/api/chats/chat-1", (route) =>
+    route.fulfill({
+      json: {
+        messages: [
+          { role: "user", content: "first" },
+          reply("turn-1", "First plan"),
+          { role: "user", content: "again" },
+          reply("turn-2", "Second plan"),
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/runs?*", (route) =>
+    route.fulfill({
+      json: [
+        run,
+        { ...run, id: "run-2", task_id: "turn-2", assignment: { ...run.assignment, device: "worker-b" } },
+      ],
+    }),
+  );
+  await page.goto("/?chat=chat-1");
+  const second = page.locator(".message.assistant", { hasText: "Second plan" });
+  await expect(second.locator(".run-card")).toHaveCount(1);
+  await expect(second.locator(".run-card")).toContainText("codex on worker-b");
+  await expect(
+    page.locator(".message.assistant", { hasText: "First plan" }).locator(".run-card"),
+  ).toContainText("codex on worker-a");
 });
 
 test("terminal sends binary input and text resize; reconnect and back work", async ({
@@ -704,7 +823,7 @@ test("terminal sends binary input and text resize; reconnect and back work", asy
   await page.getByRole("button", { name: "Reconnect" }).click();
   await expect.poll(() => connections).toBe(2);
   await page.getByRole("link", { name: "Back to sessions" }).click();
-  await expect(page.getByRole("heading", { name: "Sessions" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
 });
 test("terminal without target reports missing session", async ({ page }) => {
   await page.goto("/terminal/");
@@ -725,7 +844,7 @@ test("mobile preserves chat history and all navigation", async ({ page }) => {
   ).toBe(true);
   for (const label of ["Sessions", "Machines", "Incidents"]) {
     await page.getByRole("link", { name: label, exact: true }).click();
-    await expect(page.getByRole("heading", { name: label })).toBeVisible();
+    await expect(page.getByRole("heading", { name: label, exact: true })).toBeVisible();
   }
 });
 test("terminal-only host disables chat and links sessions", async ({
@@ -869,35 +988,33 @@ test("chat preserves a new draft typed while the previous request is sending", a
 test("agent message preserves a new draft typed while sending", async ({ page }) => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
-  let received = false;
-  await page.route("**/api/runs?*", (route) => route.fulfill({ json: [run] }));
+  let received: any;
+  await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/messages", async (route) => {
-    received = true;
+    received = route.request().postDataJSON();
     await gate;
     await route.fulfill({ json: { saved: true } });
   });
-  await page.goto("/");
-  await page.getByRole("button", { name: /Machine work/ }).click();
+  await page.goto("/session/?run=run-1");
   const input = page.getByLabel("Message codex on worker-a");
   await input.fill("First message");
-  await page.getByRole("button", { name: "Send to agent" }).click();
-  await expect.poll(() => received).toBe(true);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => received?.text).toBe("First message");
   await input.fill("Keep my next message");
   release();
-  await expect(page.getByText("Request saved.")).toBeVisible();
+  await expect(page.getByText("Sent. The agent receives it on its next turn.")).toBeVisible();
   await expect(input).toHaveValue("Keep my next message");
 });
 
 test("fleet message failure retains draft", async ({ page }) => {
-  await page.route("**/api/runs?*", (route) => route.fulfill({ json: [run] }));
+  await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/messages", (route) =>
     route.fulfill({ status: 503, body: "Agent unreachable" }),
   );
-  await page.goto("/");
-  await page.getByRole("button", { name: /Machine work/ }).click();
+  await page.goto("/session/?run=run-1");
   await page.getByLabel("Message codex on worker-a").fill("Keep this");
-  await page.getByRole("button", { name: "Send to agent" }).click();
-  await expect(page.locator('p[role="alert"]')).toHaveText("Agent unreachable");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.locator(".run-composer [role=alert]")).toHaveText("Agent unreachable");
   await expect(page.getByLabel("Message codex on worker-a")).toHaveValue(
     "Keep this",
   );
@@ -1079,7 +1196,7 @@ async function completeLiveRun(page: Page, card: Locator) {
   const deadline = Date.now() + 600000;
   let retriedSetup = false;
   while (Date.now() < deadline) {
-    const state = (await card.locator(".badge").textContent())?.trim();
+    const state = await card.locator(".bar [data-state]").first().getAttribute("data-state");
     if (state === "completed") return;
     if (["disconnected", "needs-setup"].includes(state || "") && !retriedSetup) {
       const retry = card.getByRole("button", { name: "Retry setup" });
@@ -1093,30 +1210,30 @@ async function completeLiveRun(page: Page, card: Locator) {
     if (["failed", "disconnected", "needs-setup", "superseded"].includes(state || ""))
       throw new Error(`Remote agent entered terminal state: ${state}`);
     if (state === "awaiting-approval") {
-      const approve = card.getByRole("button", { name: "Continue agent" });
-      if (await approve.isEnabled()) await approve.click();
+      const approve = card.getByRole("button", { name: "Approve" });
+      if (await approve.count() && await approve.isEnabled()) await approve.click();
     }
     await page.waitForTimeout(2000);
   }
   throw new Error("Remote agent did not complete within 10 minutes.");
 }
 
+// The journal itself, paged through the API the session view reads.
 async function readLiveEvents(card: Locator): Promise<unknown[]> {
-  await card.getByRole("button", { name: "Refresh events" }).click();
-  await expect(card.getByRole("button", { name: "Refresh events" })).toBeEnabled();
-  const more = card.getByRole("button", { name: "Load more events" });
-  for (let pages = 0; await more.count(); pages++) {
+  const href = await card.getByRole("link", { name: "Open session" }).getAttribute("href");
+  const id = new URL(href!, card.page().url()).searchParams.get("run")!;
+  const events: { seq: number }[] = [];
+  for (let pages = 0; ; pages++) {
     expect(pages, "Bounded live event pagination").toBeLessThan(20);
-    await more.click();
-    await expect(card.getByRole("button", { name: "Refresh events" })).toBeEnabled();
+    const after = events.at(-1)?.seq ?? 0;
+    const response = await card.page().request.get(
+      new URL(`/api/runs/${encodeURIComponent(id)}/events?after=${after}`, card.page().url()).toString(),
+    );
+    expect(response.ok()).toBe(true);
+    const page: { seq: number }[] = await response.json();
+    events.push(...page);
+    if (page.length < 300) return events;
   }
-  const output = card.locator("details").filter({
-    has: card.page().locator("summary", { hasText: /^Agent events$/ }),
-  }).locator("pre");
-  await expect(output).toBeVisible();
-  const events: unknown = JSON.parse(await output.innerText());
-  expect(Array.isArray(events)).toBe(true);
-  return events as unknown[];
 }
 
 function expectPeerHandshake(events: unknown[]) {
@@ -1301,4 +1418,283 @@ test("live named opencode worker", async ({ page }) => {
     }),
   ]));
   await expectRuntimeModels(page, placement);
+});
+
+test.describe("delegated sessions", () => {
+  const approval = (extra: Record<string, unknown> = {}) => ({
+    id: "ap-1",
+    fingerprint: "digest",
+    consumed: 0,
+    reason: "Needs review",
+    action: JSON.stringify({ arguments: { commandActions: [{ command: "make deploy" }], cwd: "/ws" } }),
+    ...extra,
+  });
+  const withRuns = (page: Page, runs: unknown[]) =>
+    page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: runs }));
+
+  test("nav badge counts sessions waiting on a person", async ({ page }) => {
+    await withRuns(page, [
+      { ...run, state: "awaiting-approval" },
+      { ...run, id: "run-2", state: "needs-setup" },
+      { ...run, id: "run-3", state: "failed" },
+      { ...run, id: "run-4", state: "working" },
+    ]);
+    await page.goto("/machines/");
+    await expect(page.locator(".nav-count")).toHaveText("2");
+  });
+
+  test("nav badge is hidden when nothing needs attention or runs are unavailable", async ({ page }) => {
+    await withRuns(page, [{ ...run, state: "working" }]);
+    await page.goto("/machines/");
+    await expect(page.getByRole("heading", { name: "Machines" })).toBeVisible();
+    await expect(page.locator(".nav-count")).toHaveCount(0);
+    await page.route(/\/api\/runs$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
+    await page.goto("/incidents/");
+    await expect(page.locator(".nav-count")).toHaveCount(0);
+    await expect(page.locator('p[role="alert"]')).toHaveCount(0);
+  });
+
+  test("an approval on a disconnected agent explains it can't be answered", async ({ page }) => {
+    await withRuns(page, [{ ...run, state: "disconnected", metadata: { approvals: [approval()] } }]);
+    await page.goto("/session/?run=run-1");
+    await expect(page.locator(".approval")).toContainText("make deploy");
+    await expect(page.locator(".approval")).toContainText("approving now has no effect");
+    await expect(page.getByRole("button", { name: "Approve" })).toHaveCount(0);
+  });
+
+  test("a saved decision waits for the agent instead of asking again", async ({ page }) => {
+    await withRuns(page, [{ ...run, state: "awaiting-approval", metadata: { approvals: [approval({ decision: "stop" })] } }]);
+    await page.goto("/session/?run=run-1");
+    await expect(page.locator(".approval [role=status]")).toContainText("You chose deny");
+    await expect(page.getByRole("button", { name: "Approve" })).toHaveCount(0);
+  });
+
+  test("consumed approvals are not shown as pending", async ({ page }) => {
+    await withRuns(page, [{ ...run, metadata: { approvals: [approval({ consumed: 1 })] } }]);
+    await page.goto("/session/?run=run-1");
+    await expect(page.getByText("codex on worker-a", { exact: true })).toBeVisible();
+    await expect(page.locator(".approval")).toHaveCount(0);
+  });
+
+  test("a rejected decision shows the server error and can be retried", async ({ page }) => {
+    let calls = 0;
+    await withRuns(page, [{ ...run, state: "awaiting-approval", metadata: { approvals: [approval()] } }]);
+    await page.route("**/api/runs/run-1/decisions", (route) => {
+      calls++;
+      return calls === 1
+        ? route.fulfill({ status: 400, body: "Approval fingerprint changed" })
+        : route.fulfill({ json: { saved: true } });
+    });
+    await page.goto("/session/?run=run-1");
+    await page.getByRole("button", { name: "Approve" }).click();
+    await expect(page.locator(".approval [role=alert]")).toHaveText("Approval fingerprint changed");
+    await page.getByRole("button", { name: "Approve" }).click();
+    await expect.poll(() => calls).toBe(2);
+    await expect(page.locator(".approval [role=alert]")).toHaveCount(0);
+  });
+
+  test("file-change approvals name the files instead of a command", async ({ page }) => {
+    await withRuns(page, [
+      {
+        ...run,
+        state: "awaiting-approval",
+        metadata: {
+          approvals: [
+            approval({
+              action: JSON.stringify({ tool: "item/fileChange/requestApproval", arguments: { itemId: "c" } }),
+              details: { changes: [{ path: "/ws/app.py" }] },
+            }),
+          ],
+        },
+      },
+    ]);
+    await page.goto("/session/?run=run-1");
+    await expect(page.locator(".approval strong").first()).toHaveText("codex wants to change files");
+    await expect(page.locator(".approval pre")).toHaveText("Edit /ws/app.py");
+  });
+
+  test("session page handles a missing run id and a deleted run", async ({ page }) => {
+    await withRuns(page, [run]);
+    await page.goto("/session/");
+    await expect(page.getByText("No session selected.")).toBeVisible();
+    await page.goto("/session/?run=gone");
+    await expect(page.getByText("This session no longer exists.")).toBeVisible();
+  });
+
+  test("session page reports a runs API failure", async ({ page }) => {
+    await page.route(/\/api\/runs$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
+    await page.goto("/session/?run=run-1");
+    await expect(page.locator('main [role="alert"]')).toHaveText("Delegation unavailable");
+  });
+
+  test("kill asks first and deletes the run's tmux session on its device", async ({ page }) => {
+    const deletes: string[] = [];
+    await withRuns(page, [run]);
+    await page.route("**/api/sessions/**", (route) => {
+      deletes.push(new URL(route.request().url()).pathname + new URL(route.request().url()).search);
+      return route.fulfill({ status: 204 });
+    });
+    await page.goto("/session/?run=run-1");
+    page.once("dialog", (dialog) => dialog.dismiss());
+    await page.getByRole("button", { name: "Kill session" }).click();
+    expect(deletes).toEqual([]);
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Kill session" }).click();
+    await expect.poll(() => deletes).toEqual(["/api/sessions/agent-1?host=worker-a"]);
+  });
+
+  test("kill failure is shown on the session page", async ({ page }) => {
+    await withRuns(page, [run]);
+    await page.route("**/api/sessions/**", (route) => route.fulfill({ status: 502, body: "SSH unavailable" }));
+    await page.goto("/session/?run=run-1");
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Kill session" }).click();
+    await expect(page.locator('main > [role="alert"]')).toHaveText("SSH unavailable");
+  });
+
+  test("same-task sessions link to each other and load their own activity", async ({ page }) => {
+    const peer = { ...run, id: "run-2", assignment: { ...run.assignment, key: "claude-b", device: "worker-b", agent: "claude" } };
+    await withRuns(page, [run, peer, { ...run, id: "run-9", task_id: "other-task" }]);
+    await page.route("**/api/runs/*/events*", (route) => {
+      const own = route.request().url().includes("/run-2/") ? "Peer answer ready." : "Codex asked a question.";
+      return route.fulfill({
+        json: new URL(route.request().url()).searchParams.get("tail")
+          ? [{ seq: 1, kind: "native", payload: { method: "item/completed", params: { item: { type: "agentMessage", text: own } } } }]
+          : [],
+      });
+    });
+    await page.goto("/session/?run=run-1");
+    await expect(page.getByText("Codex asked a question.")).toBeVisible();
+    const siblings = page.locator(".sibling");
+    await expect(siblings).toHaveCount(2);
+    await siblings.filter({ hasText: "claude on worker-b" }).click();
+    await expect(page).toHaveURL(/run=run-2/);
+    await expect(page.getByText("Peer answer ready.")).toBeVisible();
+    await expect(page.getByText("Codex asked a question.")).toHaveCount(0);
+  });
+
+  test("finished sessions load once and stop polling", async ({ page }) => {
+    const requests: string[] = [];
+    await withRuns(page, [{ ...run, state: "completed" }]);
+    await page.route("**/api/runs/run-1/events*", (route) => {
+      requests.push(new URL(route.request().url()).search);
+      return route.fulfill({ json: [] });
+    });
+    await page.goto("/session/?run=run-1");
+    await expect(page.getByText("No agent activity yet.")).toBeVisible();
+    await page.waitForTimeout(4500);
+    expect(requests).toEqual(["?tail=500"]);
+  });
+
+  test("Enter sends to the agent, Shift+Enter adds a line, superseded runs can't be messaged", async ({ page }) => {
+    const sent: string[] = [];
+    await withRuns(page, [run, { ...run, id: "run-2", state: "superseded" }]);
+    await page.route("**/api/runs/run-1/messages", (route) => {
+      sent.push(route.request().postDataJSON().text);
+      return route.fulfill({ json: { saved: true } });
+    });
+    await page.goto("/session/?run=run-1");
+    const input = page.getByLabel("Message codex on worker-a");
+    await input.fill("line one");
+    await input.press("Shift+Enter");
+    await input.pressSequentially("line two");
+    await input.press("Enter");
+    await expect.poll(() => sent).toEqual(["line one\nline two"]);
+    await expect(input).toHaveValue("");
+    await page.goto("/session/?run=run-2");
+    await expect(page.getByLabel("Message codex on worker-a")).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  });
+
+  test("retry setup is offered for a run that never launched", async ({ page }) => {
+    let retried = false;
+    await withRuns(page, [{ ...run, state: "needs-setup", runner_path: null }]);
+    await page.route("**/api/runs/run-1/retry-setup", (route) => {
+      retried = true;
+      return route.fulfill({ json: { saved: true } });
+    });
+    await page.goto("/session/?run=run-1");
+    await expect(page.locator(".banner")).toContainText("The agent never launched on worker-a");
+    await page.getByRole("button", { name: "Retry setup" }).click();
+    await expect.poll(() => retried).toBe(true);
+  });
+
+  test("a Claude session renders its commands, tools and failures", async ({ page }) => {
+    await withRuns(page, [{ ...run, assignment: { ...run.assignment, agent: "claude" } }]);
+    await page.route("**/api/runs/run-1/events*", (route) =>
+      route.fulfill({
+        json: new URL(route.request().url()).searchParams.get("tail")
+          ? [
+              { seq: 1, kind: "native", payload: { type: "system", subtype: "init" } },
+              { seq: 2, kind: "native", payload: { type: "assistant", message: { content: [{ type: "text", text: "Writing tests." }] } } },
+              { seq: 3, kind: "native", payload: { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "python3 -m unittest" } }] } } },
+              { seq: 4, kind: "native", payload: { type: "user", message: { content: [{ type: "tool_result", is_error: true, content: "1 test failed" }] } } },
+              { seq: 5, kind: "native", payload: { type: "assistant", message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: "a.py" } }] } } },
+            ]
+          : [],
+      }),
+    );
+    await page.goto("/session/?run=run-1");
+    await expect(page.locator(".t-agent")).toHaveText("Writing tests.");
+    await expect(page.locator(".t-cmd summary").first()).toContainText("$ python3 -m unittest");
+    await expect(page.locator(".t-error")).toHaveText("1 test failed");
+    await expect(page.locator(".t-cmd summary").nth(1)).toContainText("Tool Edit");
+  });
+
+  test("a failed command opens its output; successful ones stay collapsed", async ({ page }) => {
+    await withRuns(page, [{ ...run, state: "completed" }]);
+    const command = (seq: number, exitCode: number, out: string) => ({
+      seq,
+      kind: "native",
+      payload: { method: "item/completed", params: { item: { type: "commandExecution", commandActions: [{ command: `step${seq}` }], exitCode, aggregatedOutput: out } } },
+    });
+    await page.route("**/api/runs/run-1/events*", (route) =>
+      route.fulfill({ json: [command(1, 0, "fine-output"), command(2, 3, "boom-output")] }),
+    );
+    await page.goto("/session/?run=run-1");
+    await expect(page.getByText("boom-output")).toBeVisible();
+    await expect(page.getByText("fine-output")).toBeHidden();
+    await expect(page.locator(".exit.bad")).toHaveText("exit 3");
+  });
+
+  test("chat cards show the latest agent message and why a run failed", async ({ page }) => {
+    await withRuns(page, [{ ...run, state: "failed" }]);
+    await page.route("**/api/runs/run-1/events*", (route) =>
+      route.fulfill({
+        json: [
+          { seq: 1, kind: "native", payload: { method: "item/completed", params: { item: { type: "agentMessage", text: "Starting the server." } } } },
+          { seq: 2, kind: "error", payload: { message: "Port 8080 already in use" } },
+        ],
+      }),
+    );
+    await page.goto("/?chat=chat-1");
+    const card = page.locator(".run-card");
+    await expect(card.locator(".latest")).toContainText("Starting the server.");
+    await expect(card.locator(".banner.bad")).toContainText("Port 8080 already in use");
+    await expect(card.locator("[data-state]").first()).toHaveAttribute("data-state", "failed");
+  });
+
+  test("chat runs from a turn that isn't loaded still appear at the end", async ({ page }) => {
+    await withRuns(page, [{ ...run, task_id: "older-turn" }]);
+    await page.goto("/?chat=chat-1");
+    await expect(page.locator(".chat-feed > .run-card")).toHaveCount(1);
+    await expect(page.locator(".message .run-card")).toHaveCount(0);
+  });
+
+  test("sessions page shows running and queued groups and an empty state", async ({ page }) => {
+    let list: unknown[] = [
+      { ...session, name: "a", run: { ...run, state: "working" } },
+      { ...session, name: "b", run: { ...run, id: "run-2", state: "waiting-for-peer" } },
+      { ...session, name: "c", windows: 0, run: { ...run, id: "run-3", state: "queued" } },
+    ];
+    await page.route("**/api/sessions", (route) => route.fulfill({ json: list }));
+    await page.goto("/sessions/");
+    await expect(page.locator(".session-group", { hasText: "Running" }).locator(".session-card")).toHaveCount(2);
+    await expect(page.locator(".session-group", { hasText: "Queued" }).locator(".session-card")).toHaveCount(1);
+    await expect(page.locator(".session-group", { hasText: "Needs attention" })).toHaveCount(0);
+    list = [];
+    await page.reload();
+    await expect(page.getByText("No agent sessions yet.", { exact: false })).toBeVisible();
+    await expect(page.getByText("No terminal sessions. Start one above.")).toBeVisible();
+  });
 });
