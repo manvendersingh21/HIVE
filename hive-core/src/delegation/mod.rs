@@ -35,6 +35,39 @@ pub fn enabled() -> bool {
     std::env::var("HIVE_DELEGATION").as_deref() == Ok("1")
 }
 
+fn valid_workspace(workspace: &str) -> bool {
+    workspace.starts_with("~/hive-workspaces/")
+        && workspace.len() > 18
+        && !workspace
+            .split('/')
+            .any(|c| c == ".." || c == "." || c.is_empty())
+        && !workspace.contains(['\n', '\r', '\0'])
+}
+
+/// Workspaces are Hive bookkeeping, not a user choice: a planner that puts one
+/// elsewhere (e.g. "in a temporary directory") gets a fresh generated child of
+/// ~/hive-workspaces instead of failing the plan. validate() still checks it.
+fn repair_workspaces(plan: &mut DelegationPlan) {
+    for a in &mut plan.assignments {
+        if !valid_workspace(&a.workspace) {
+            let key: String = a
+                .key
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .take(48)
+                .collect();
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            a.workspace = format!("~/hive-workspaces/{}-{}", &id[..8], key);
+        }
+    }
+}
+
 pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
     anyhow::ensure!(
         plan.assignments.len() <= 16,
@@ -57,13 +90,7 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             a.agent
         );
         anyhow::ensure!(
-            a.workspace.starts_with("~/hive-workspaces/")
-                && a.workspace.len() > 18
-                && !a
-                    .workspace
-                    .split('/')
-                    .any(|c| c == ".." || c == "." || c.is_empty())
-                && !a.workspace.contains(['\n', '\r', '\0']),
+            valid_workspace(&a.workspace),
             "Workspace must be a child of ~/hive-workspaces"
         );
         anyhow::ensure!(
@@ -130,28 +157,73 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
     Ok(())
 }
 
-/// Canonical device/agent pairs named by the user are hard constraints, even
-/// when a generated plan proposes an otherwise valid different placement.
+/// Canonical device/agent pairs (and models) named by the user are hard
+/// constraints, even when a generated plan proposes an otherwise valid
+/// different placement. "exactly N assignments" also bounds the plan, and with
+/// named placements every assignment must be one of them.
 pub fn validate_explicit(
     request: &str,
     plan: &DelegationPlan,
     agent: &MasterAgent,
 ) -> anyhow::Result<()> {
+    let mut placements = Vec::new();
     for worker in &agent.workers.snapshot() {
         let pattern = format!(
-            r"(?i)\b(claude|codex|agy|opencode)\s+on\s+{}(?:$|[^[:alnum:]_.-])",
+            r"(?i)\b(claude|codex|agy|opencode)(?:\s+agent)?\s+on\s+{}(?:\s+(?:using|with)\s+(?:the\s+)?model\s+([[:alnum:]][[:alnum:]_.:/@\[\]-]*[[:alnum:]_\]])|(?:$|\.(?:\s|$)|[^[:alnum:]_.-]))",
             regex::escape(&worker.info.name)
         );
         for captures in regex::Regex::new(&pattern)?.captures_iter(request) {
             let selected = captures[1].to_ascii_lowercase();
+            let model = captures.get(2).map(|m| m.as_str().to_string());
+            let matches = |a: &Assignment| {
+                a.device == worker.info.name
+                    && a.agent == selected
+                    && model.as_ref().is_none_or(|m| a.model.as_ref() == Some(m))
+            };
             anyhow::ensure!(
-                plan.assignments
-                    .iter()
-                    .any(|a| a.device == worker.info.name && a.agent == selected),
-                "Explicit placement requires {} on {}",
+                plan.assignments.iter().any(matches),
+                "Explicit placement requires {} on {}{}",
                 selected,
-                worker.info.name
+                worker.info.name,
+                model
+                    .as_ref()
+                    .map(|m| format!(" using model {m}"))
+                    .unwrap_or_default()
             );
+            placements.push((worker.info.name.clone(), selected, model));
+        }
+    }
+    let count = regex::Regex::new(
+        r"(?i)\bexactly\s+(\d+|one|two|three|four|five|six|seven|eight)\s+(?:[[:alpha:]-]+\s+)?assignments?\b",
+    )?;
+    if let Some(captures) = count.captures(request) {
+        let words = [
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ];
+        let word = captures[1].to_ascii_lowercase();
+        let expected = match words.iter().position(|w| *w == word) {
+            Some(i) => i + 1,
+            None => word.parse()?,
+        };
+        anyhow::ensure!(
+            plan.assignments.len() == expected,
+            "Request requires exactly {expected} assignments, plan has {}",
+            plan.assignments.len()
+        );
+        if !placements.is_empty() {
+            for a in &plan.assignments {
+                anyhow::ensure!(
+                    placements.iter().any(|(device, agent, model)| {
+                        &a.device == device
+                            && &a.agent == agent
+                            && model.as_ref().is_none_or(|m| a.model.as_ref() == Some(m))
+                    }),
+                    "Assignment {} ({} on {}) was not requested",
+                    a.key,
+                    a.agent,
+                    a.device
+                );
+            }
         }
     }
     Ok(())
@@ -196,7 +268,8 @@ pub async fn plan(
             .await?;
         let parsed = serde_json::from_str::<DelegationPlan>(&response.text)
             .map_err(anyhow::Error::from)
-            .and_then(|p| {
+            .and_then(|mut p| {
+                repair_workspaces(&mut p);
                 validate(&p, agent)?;
                 validate_explicit(request, &p, agent)?;
                 Ok(p)
@@ -249,10 +322,13 @@ pub fn setup_reason(
         return Ok(Some(format!("{device}: {} {reason}", assignment.agent)));
     }
     if let Some(model) = &assignment.model {
-        if !a["models"]
+        // `models` holds the CLI's aliases (e.g. "sonnet"); a model that was
+        // actually invoked on this device is verified evidence too.
+        let listed = a["models"]
             .as_array()
-            .is_some_and(|models| models.iter().any(|m| m == model))
-        {
+            .is_some_and(|models| models.iter().any(|m| m == model));
+        let invoked = a["invocation"]["model"] == model.as_str();
+        if !listed && !invoked {
             return Ok(Some(format!(
                 "{device}: {} model {model} has not been verified available",
                 assignment.agent
@@ -340,6 +416,92 @@ mod tests {
         assert!(validate_explicit("Use Claude on air", &changed, &agent).is_err());
     }
     #[test]
+    fn invalid_workspaces_are_replaced_and_valid_ones_kept() {
+        let agent = agent();
+        for bad in [
+            "/tmp/hive-qa",
+            "hive-workspaces/x",
+            "~/hive-workspaces/../secret",
+            "",
+            "~/hive-workspaces/",
+        ] {
+            let mut p = plan();
+            p.assignments[0].key = "qa step/1".into();
+            p.assignments[0].workspace = bad.into();
+            let before = p.assignments[0].clone();
+            repair_workspaces(&mut p);
+            let a = &p.assignments[0];
+            assert!(
+                a.workspace.starts_with("~/hive-workspaces/")
+                    && a.workspace.ends_with("-qa-step-1"),
+                "{bad} -> {}",
+                a.workspace
+            );
+            assert!(validate(&p, &agent).is_ok(), "{bad}");
+            assert_eq!(
+                (&a.device, &a.agent, &a.model, &a.objective),
+                (
+                    &before.device,
+                    &before.agent,
+                    &before.model,
+                    &before.objective
+                )
+            );
+        }
+        let mut p = plan();
+        repair_workspaces(&mut p);
+        assert_eq!(p.assignments[0].workspace, "~/hive-workspaces/test");
+        let mut twice = plan();
+        twice.assignments[0].workspace = "/tmp".into();
+        let mut other = twice.clone();
+        repair_workspaces(&mut twice);
+        repair_workspaces(&mut other);
+        assert_ne!(
+            twice.assignments[0].workspace,
+            other.assignments[0].workspace
+        );
+    }
+    #[test]
+    fn explicit_models_and_assignment_counts_are_enforced() {
+        let agent = agent();
+        let mut p = plan();
+        p.assignments[0].agent = "codex".into();
+        p.assignments[0].model = Some("gpt-5.6-luna".into());
+        let one =
+            "Delegate exactly one assignment to the codex agent on air using model gpt-5.6-luna.";
+        assert!(validate_explicit(one, &p, &agent).is_ok());
+        assert!(validate_explicit("Use codex on air.", &p, &agent).is_ok());
+        assert!(validate_explicit("Use claude on air.", &p, &agent).is_err());
+        let mut wrong = p.clone();
+        wrong.assignments[0].model = Some("gpt-6-astra".into());
+        assert!(validate_explicit(one, &wrong, &agent).is_err());
+        wrong.assignments[0].model = None;
+        assert!(validate_explicit(one, &wrong, &agent).is_err());
+        let mut extra = p.clone();
+        let mut second = extra.assignments[0].clone();
+        second.key = "b".into();
+        extra.assignments.push(second.clone());
+        assert!(validate_explicit(one, &extra, &agent).is_err());
+        assert!(validate_explicit("Do it with exactly 1 assignment", &extra, &agent).is_err());
+        assert!(validate_explicit("Pick any workers you like", &extra, &agent).is_ok());
+        let two = "Delegate exactly two collaborating assignments: codex on air using model gpt-5.6-luna and claude on air using model haiku";
+        extra.assignments[1].agent = "claude".into();
+        extra.assignments[1].model = Some("haiku".into());
+        assert!(validate_explicit(two, &extra, &agent).is_ok());
+        extra.assignments[1].model = Some("sonnet".into());
+        assert!(validate_explicit(two, &extra, &agent).is_err());
+        extra.assignments[1].model = Some("haiku".into());
+        extra.assignments[1].agent = "opencode".into();
+        assert!(validate_explicit(two, &extra, &agent).is_err());
+        let slash = "Delegate exactly one assignment to the opencode agent on air using model zai-coding-plan/glm-5.3-flash";
+        let mut oc = p.clone();
+        oc.assignments[0].agent = "opencode".into();
+        oc.assignments[0].model = Some("zai-coding-plan/glm-5.3-flash".into());
+        assert!(validate_explicit(slash, &oc, &agent).is_ok());
+        oc.assignments[0].model = Some("zai-coding-plan/glm-5.2".into());
+        assert!(validate_explicit(slash, &oc, &agent).is_err());
+    }
+    #[test]
     fn missing_agent_and_unverified_model_report_exact_device() {
         let agent = agent();
         let mut p = plan();
@@ -354,5 +516,18 @@ mod tests {
             .unwrap()
             .unwrap()
             .contains("unavailable"));
+    }
+    #[test]
+    fn verified_invocation_model_counts_as_available() {
+        let agent = agent();
+        let mut p = plan();
+        inventory::project(&agent.memory.graph,"air",&[json!({"agent":"claude","executable":"/claude","runtime_ready":true,"authentication":"authenticated","models":["sonnet"],"invocation":{"model":"claude-sonnet-5","verified_at":1}})]).unwrap();
+        p.assignments[0].model = Some("claude-sonnet-5".into());
+        assert!(setup_reason(&agent, &p.assignments[0]).unwrap().is_none());
+        p.assignments[0].model = Some("claude-other".into());
+        assert!(setup_reason(&agent, &p.assignments[0])
+            .unwrap()
+            .unwrap()
+            .contains("claude-other"));
     }
 }
