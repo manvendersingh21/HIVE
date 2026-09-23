@@ -49,6 +49,12 @@ const incident = {
   },
   flagged_output: "<img src=x onerror=alert(1)>",
 };
+// The static export paints buttons before React attaches their handlers, so a
+// click right after a full page load can land on a dead button. The chat
+// history only appears once React has run.
+async function hydrated(page: Page) {
+  await expect(page.getByRole("button", { name: /Machine work/ })).toBeVisible();
+}
 async function defaults(page: Page) {
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -318,12 +324,14 @@ test("login succeeds and sign out navigates to login", async ({ page }) => {
   await page.getByLabel("Password", { exact: true }).fill("test-password");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page).toHaveURL("http://127.0.0.1:18081/");
+  await hydrated(page);
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page).toHaveURL(/\/login\/?$/);
 });
 test("sign out failure stays visible", async ({ page }) => {
   await page.route("**/logout", (route) => route.fulfill({ status: 500 }));
   await page.goto("/");
+  await hydrated(page);
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.locator('p[role="alert"]')).toContainText(
     "Sign out failed",
