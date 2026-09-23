@@ -3,7 +3,8 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { api, requestId, terminalUrl } from "../lib/api";
 import { Shell } from "../components/Nav";
-import { Run, RunSummary } from "../components/RunView";
+import { ApprovalPrompt, Run, RunSummary } from "../components/RunView";
+import { Markdown } from "../lib/markdown";
 type Chat = { id: string; title?: string; updated_at?: string };
 type Reply = {
   run?: {
@@ -29,6 +30,13 @@ type Message = {
   reply?: Reply;
 };
 type ChatData = { messages: Message[] };
+const STATUS_LABELS: Record<string, string> = {
+  planning: "Planning…",
+  executing: "Running…",
+  awaiting_approval: "Needs approval",
+  failed: "Failed",
+  interrupted: "Interrupted",
+};
 const running = (messages: Message[]) =>
   ["planning", "executing", "awaiting_approval"].includes(
     messages.at(-1)?.status || "",
@@ -47,7 +55,24 @@ export default function AgentPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [capable, setCapable] = useState(true);
+  // A chat runs one turn at a time. A message sent meanwhile waits here and
+  // goes out when the turn finishes.
+  const [queued, setQueued] = useState<{ chat: string; text: string }>();
   const searchVersion = useRef(0);
+  const feed = useRef<HTMLDivElement>(null);
+  // Follow the conversation while the reader is at the bottom; run cards
+  // load their own activity, so watch the feed's DOM rather than state.
+  const stick = useRef(true);
+  useEffect(() => {
+    const el = feed.current;
+    if (!el) return;
+    const follow = () => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    };
+    const observer = new MutationObserver(follow);
+    observer.observe(el, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
+  }, []);
   async function loadChats(q = query, page = 0) {
     const version = ++searchVersion.current;
     try {
@@ -73,7 +98,16 @@ export default function AgentPage() {
     const data = await api<ChatData>(`/api/chats/${encodeURIComponent(id)}`);
     if (activeRef.current === id) setMessages(data.messages);
   }
+  // Hand a queued message back to the composer instead of dropping it.
+  function unqueue() {
+    if (!queued) return;
+    const text = queued.text;
+    setInput((current) => (current.trim() ? `${text}\n${current}` : text));
+    setQueued(undefined);
+  }
   async function open(id: string) {
+    if (queued && queued.chat !== id) unqueue();
+    stick.current = true;
     activeRef.current = id;
     setActive(id);
     setMessages([]);
@@ -127,9 +161,22 @@ export default function AgentPage() {
   async function send() {
     const draft = input;
     const text = draft.trim();
-    if (!text || busy || loading || running(messages) || !capable) return;
+    if (!text || busy || loading || !capable) return;
+    const id = activeRef.current;
+    if (id && running(messages)) {
+      setQueued((q) => ({ chat: id, text: q?.chat === id ? `${q.text}\n\n${text}` : text }));
+      setInput((current) => (current === draft ? "" : current));
+      stick.current = true;
+      return;
+    }
+    await submit(text, draft);
+  }
+  // `draft` is the composer text being sent; a queued message has none, so a
+  // failure puts it back in the composer.
+  async function submit(text: string, draft?: string) {
     setBusy(true);
     setError("");
+    stick.current = true;
     let id = activeRef.current;
     try {
       if (!id) {
@@ -151,16 +198,24 @@ export default function AgentPage() {
         }),
       });
       if (activeRef.current === id) {
-        setInput((current) => current === draft ? "" : current);
+        if (draft !== undefined)
+          setInput((current) => (current === draft ? "" : current));
         await refresh(id);
       }
       await loadChats();
     } catch (e) {
       setError((e as Error).message);
+      if (draft === undefined)
+        setInput((current) => (current.trim() ? `${text}\n${current}` : text));
     } finally {
       setBusy(false);
     }
   }
+  useEffect(() => {
+    if (!queued || queued.chat !== active || busy || loading || running(messages)) return;
+    setQueued(undefined);
+    void submit(queued.text);
+  }, [queued, active, busy, loading, messages]);
   async function approve(runId: string, stepId: number, allowed: boolean) {
     setBusy(true);
     setError("");
@@ -202,6 +257,7 @@ export default function AgentPage() {
                 setMessages([]);
                 setRuns([]);
                 setInput("");
+                unqueue();
                 setError("");
                 setLoading(false);
               }}
@@ -233,7 +289,14 @@ export default function AgentPage() {
           )}
         </aside>
         <main className="chat-main">
-          <div className="chat-feed">
+          <div
+            className="chat-feed"
+            ref={feed}
+            onScroll={(e) => {
+              const el = e.currentTarget;
+              stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+            }}
+          >
             {!capable && (
               <p role="status">
                 This host serves terminals only. Open{" "}
@@ -250,13 +313,20 @@ export default function AgentPage() {
             {messages.map((message, index) => (
               <article
                 className={`message ${message.role}`}
+                data-status={message.status}
                 key={message.id || index}
               >
                 <span className="badge">
                   {message.role === "user" ? "You" : "Hive"}
                 </span>{" "}
-                {message.status && <small>{message.status}</small>}
-                <div>{message.content}</div>
+                {message.status && message.status !== "completed" && (
+                  <small>{STATUS_LABELS[message.status] || message.status}</small>
+                )}
+                {message.role === "user" ? (
+                  <div>{message.content}</div>
+                ) : (
+                  <Markdown text={message.content} />
+                )}
                 {message.reply?.result?.sessions?.map((session) => (
                   <p key={`${session.worker_name}/${session.session_name}`}>
                     <Link
@@ -277,30 +347,16 @@ export default function AgentPage() {
                       ),
                     )
                     .map((step) => (
-                      <div className="card" key={step.id}>
-                        <strong>
-                          {step.target.worker || step.target.kind}
-                        </strong>
-                        <pre>{step.command}</pre>
-                        <p>{step.risk?.reason}</p>
-                        <button
-                          disabled={busy}
-                          className="primary"
-                          onClick={() =>
-                            void approve(message.reply!.run!.id, step.id, true)
-                          }
-                        >
-                          Approve command
-                        </button>{" "}
-                        <button
-                          disabled={busy}
-                          onClick={() =>
-                            void approve(message.reply!.run!.id, step.id, false)
-                          }
-                        >
-                          Deny command
-                        </button>
-                      </div>
+                      <ApprovalPrompt
+                        key={step.id}
+                        title={`Hive wants to run a command on ${step.target.worker || step.target.kind}`}
+                        reason={step.risk?.reason}
+                        command={step.command}
+                        denyLabel="Deny"
+                        busy={busy}
+                        onApprove={() => void approve(message.reply!.run!.id, step.id, true)}
+                        onDeny={() => void approve(message.reply!.run!.id, step.id, false)}
+                      />
                     ))}
                 {runsFor(message).map((run) => (
                   <RunSummary
@@ -326,6 +382,20 @@ export default function AgentPage() {
                 refresh={() => refreshRuns()}
               />
             ))}
+            {queued && queued.chat === active && (
+              <article className="message user queued">
+                <span className="badge">You</span>{" "}
+                <small>
+                  {messages.at(-1)?.status === "awaiting_approval"
+                    ? "Queued: sends after you answer the approval above"
+                    : "Queued: sends when Hive finishes"}
+                </small>
+                <div>{queued.text}</div>
+                <button type="button" className="ghost small" onClick={unqueue}>
+                  Edit
+                </button>
+              </article>
+            )}
             {error && (
               <p role="alert" className="error">
                 {error}
@@ -359,15 +429,9 @@ export default function AgentPage() {
             />
             <button
               className="primary"
-              disabled={
-                busy ||
-                loading ||
-                running(messages) ||
-                !input.trim() ||
-                !capable
-              }
+              disabled={busy || loading || !input.trim() || !capable}
             >
-              {busy ? "Sending…" : running(messages) ? "Running…" : "Send"}
+              {busy ? "Sending…" : running(messages) ? "Queue" : "Send"}
             </button>
           </form>
         </main>
