@@ -73,3 +73,22 @@ pre.cmd { background: #0a0c10; border: 1px solid var(--line); margin: 6px 0; fon
   .session-page { padding: 12px 16px; }
   .transcript { height: 60vh; padding: 10px 12px 14px; }
 }
+
+/* Rendered Markdown in Hive and agent replies. */
+.message > .md { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md blockquote { margin: 0 0 10px; }
+.md ul, .md ol { padding-left: 22px; }
+.md li + li { margin-top: 3px; }
+.md .md-h { font-weight: 650; margin: 14px 0 6px; }
+.md .md-h1 { font-size: 17px; }
+.md .md-h2 { font-size: 16px; }
+.md blockquote { border-left: 3px solid var(--line2); padding-left: 10px; color: var(--dim); }
+.md code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.md pre.md-code { margin: 0 0 10px; border: 1px solid var(--line); }
+.md pre.md-code code { background: none; border: 0; padding: 0; }
+.transcript .md { overflow-wrap: anywhere; }
+.message.assistant .approval { margin-top: 12px; }
+.message.queued > div { opacity: 0.75; border-style: dashed; }
+.message.queued button { margin-top: 6px; }

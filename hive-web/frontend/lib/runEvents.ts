@@ -23,15 +23,23 @@ export type Entry =
       exitCode?: number | null;
       output?: string;
       status?: string;
+      toolId?: string;
     }
-  | { type: "files"; seq: number; changes: { path: string; kind: string; diff?: string }[] }
+  | {
+      type: "files";
+      seq: number;
+      changes: { path: string; kind: string; diff?: string }[];
+      toolId?: string;
+    }
   | {
       type: "tool";
       seq: number;
       name: string;
       input?: string;
+      output?: string;
       status?: string;
       error?: string;
+      toolId?: string;
     }
   | { type: "approval"; seq: number; id?: string; command: string; cwd?: string; reason?: string }
   | { type: "approval-resolved"; seq: number; decision: string }
@@ -170,6 +178,37 @@ function codex(seq: number, p: any): Entry[] {
   }
 }
 
+// Claude's file tools carry the edit itself; show it as a diff, not JSON.
+const lines = (text: unknown, mark: string) =>
+  str(text).split("\n").map((line) => mark + line).join("\n");
+function claudeFiles(seq: number, c: any): Entry | undefined {
+  const input = c.input || {};
+  const path = str(input.file_path || input.notebook_path);
+  const edits: any[] =
+    c.name === "Edit" ? [input] : c.name === "MultiEdit" && Array.isArray(input.edits) ? input.edits : [];
+  if (c.name === "Write")
+    return { type: "files", seq, toolId: c.id, changes: [{ path, kind: "write", diff: lines(input.content, "+") }] };
+  if (edits.length && edits.some((e) => e.old_string || e.new_string))
+    return {
+      type: "files",
+      seq,
+      toolId: c.id,
+      changes: [
+        {
+          path,
+          kind: "edit",
+          diff: edits.map((e) => `${lines(e.old_string, "-")}\n${lines(e.new_string, "+")}`).join("\n\n"),
+        },
+      ],
+    };
+  return undefined;
+}
+
+const resultText = (c: any) =>
+  Array.isArray(c.content)
+    ? c.content.map((x: any) => str(x.text)).filter(Boolean).join("\n")
+    : str(c.content);
+
 function claude(seq: number, p: any): Entry[] {
   const content: any[] = Array.isArray(p.message?.content) ? p.message.content : [];
   switch (p.type) {
@@ -178,22 +217,41 @@ function claude(seq: number, p: any): Entry[] {
         if (c.type === "text" && c.text?.trim()) return [{ type: "agent", seq, text: c.text }];
         if (c.type === "tool_use") {
           if (c.name === "Bash")
-            return [{ type: "command", seq, command: str(c.input?.command), status: "started" }];
-          return [{ type: "tool", seq, name: str(c.name), input: JSON.stringify(c.input, null, 2) }];
+            return [{ type: "command", seq, toolId: c.id, command: str(c.input?.command), status: "started" }];
+          const files = claudeFiles(seq, c);
+          if (files) return [files];
+          return [{ type: "tool", seq, toolId: c.id, name: str(c.name), input: JSON.stringify(c.input, null, 2) }];
         }
         return [];
-      });
-    case "user":
-      return content.flatMap((c): Entry[] => {
-        if (c.type !== "tool_result" || !c.is_error) return [];
-        const text = Array.isArray(c.content) ? c.content.map((x: any) => str(x.text)).join("\n") : str(c.content);
-        return [{ type: "error", seq, text }];
       });
     case "result":
       return [{ type: "result", seq, text: str(p.result || p.subtype), error: !!p.is_error }];
     default:
       return [];
   }
+}
+
+// A Claude tool result answers the tool_use with the same id. Attach its
+// output there; a failure nothing claims is still shown as an error.
+function claudeResults(out: Entry[], seq: number, p: any): Entry[] {
+  const content: any[] = Array.isArray(p.message?.content) ? p.message.content : [];
+  return content.flatMap((c): Entry[] => {
+    if (c.type !== "tool_result") return [];
+    const text = resultText(c);
+    const use = c.tool_use_id && out.findLast((x) => "toolId" in x && x.toolId === c.tool_use_id);
+    if (use && use.type === "command") {
+      use.output = text || undefined;
+      use.status = c.is_error ? "failed" : "completed";
+      return [];
+    }
+    if (use && use.type === "tool") {
+      if (c.is_error) use.error = text || "failed";
+      else use.output = text || undefined;
+      use.status = c.is_error ? "failed" : "completed";
+      return [];
+    }
+    return c.is_error ? [{ type: "error", seq, text }] : [];
+  });
 }
 
 // opencode reports whole messages as `{info, parts: [...]}`.
@@ -269,7 +327,9 @@ export function transcript(events: RunEvent[]): Entry[] {
           ? codex(e.seq, p)
           : Array.isArray(p.parts)
             ? opencode(e.seq, p)
-            : claude(e.seq, p)
+            : p.type === "user"
+              ? claudeResults(out, e.seq, p)
+              : claude(e.seq, p)
         ).forEach(push);
         break;
     }

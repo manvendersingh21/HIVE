@@ -571,13 +571,9 @@ for (const allowed of [true, false]) {
       await page.goto("/");
       await page.getByRole("button", { name: /Machine work/ }).click();
       await page.getByLabel("Message Hive").fill("another command");
-      await expect(
-        page.getByRole("button", { name: "Running…" }),
-      ).toBeDisabled();
+      await expect(page.getByRole("button", { name: "Queue" })).toBeEnabled();
       await page
-        .getByRole("button", {
-          name: allowed ? "Approve command" : "Deny command",
-        })
+        .getByRole("button", { name: allowed ? "Approve" : "Deny", exact: true })
         .click();
       await expect(
         page.getByRole("button", { name: "Send", exact: true }),
@@ -786,6 +782,103 @@ test("chat shows each turn's runs under the reply that dispatched them", async (
   ).toContainText("codex on worker-a");
 });
 
+test("Hive replies render Markdown as elements, never as HTML", async ({ page }) => {
+  await page.route("**/api/chats/chat-1", (route) =>
+    route.fulfill({
+      json: {
+        messages: [
+          { role: "user", content: "**not bold** <b>x</b>" },
+          {
+            role: "assistant",
+            status: "completed",
+            content:
+              "## Result\nRan `ls` on **worker-a**:\n\n- a.py\n- b.py\n\n```sh\nls -la\n```\n<img src=x onerror=alert(1)> [docs](https://example.com) [bad](javascript:alert(1))",
+          },
+          { role: "user", content: "and?" },
+          {
+            role: "assistant",
+            status: "completed",
+            content:
+              "Set tool_use_id in check_chat_history.py and __init__.py; globs *.ts and *.rs; _really_ *yes*.\n\n1. Run:\n   ```sh\n   make\n\n   make test\n   ```\n2. Next",
+          },
+        ],
+      },
+    }),
+  );
+  await page.goto("/?chat=chat-1");
+  const reply = page.locator(".message.assistant").first();
+  await expect(reply.locator("strong", { hasText: "worker-a" })).toBeVisible();
+  await expect(reply.locator("code", { hasText: /^ls$/ })).toBeVisible();
+  await expect(reply.locator("li")).toHaveText(["a.py", "b.py"]);
+  await expect(reply.locator("pre.md-code")).toHaveText("ls -la");
+  await expect(reply.getByRole("link", { name: "docs" })).toHaveAttribute("href", "https://example.com");
+  await expect(reply.locator("img")).toHaveCount(0);
+  await expect(reply).toContainText("<img src=x onerror=alert(1)>");
+  await expect(reply.getByRole("link", { name: "bad" })).toHaveCount(0);
+  await expect(page.locator(".message.user").first()).toContainText("**not bold** <b>x</b>");
+  const second = page.locator(".message.assistant").nth(1);
+  await expect(second).toContainText(
+    "Set tool_use_id in check_chat_history.py and __init__.py; globs *.ts and *.rs;",
+  );
+  await expect(second.locator("em")).toHaveText(["really", "yes"]);
+  await expect(second.locator("pre.md-code")).toHaveText("   make\n\n   make test");
+  await expect(second.locator("ol")).toHaveCount(2);
+  await expect(second.locator("ol").nth(1)).toHaveAttribute("start", "2");
+  await expect(second.locator("ol").nth(1)).toHaveText("Next");
+  // Finished turns carry no status label; the raw status stays on the element.
+  await expect(reply.locator("small")).toHaveCount(0);
+  await expect(reply).toHaveAttribute("data-status", "completed");
+});
+
+test("the chat follows new replies unless the reader has scrolled up", async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  const messages = Array.from({ length: 30 }, (_, i) => ({
+    role: i % 2 ? "assistant" : "user",
+    content: `message ${i}`,
+    status: i % 2 ? "completed" : undefined,
+  }));
+  await page.route("**/api/chats/chat-1", (route) => route.fulfill({ json: { messages } }));
+  await page.goto("/?chat=chat-1");
+  const feed = page.locator(".chat-feed");
+  await expect(page.getByText("message 29")).toBeInViewport();
+  messages.push({ role: "assistant", content: "message 30", status: "completed" });
+  await expect(page.getByText("message 30")).toBeInViewport();
+  await feed.evaluate((el) => el.scrollTo({ top: 0 }));
+  await expect(page.getByText("message 0", { exact: true })).toBeInViewport();
+  messages.push({ role: "assistant", content: "message 31", status: "completed" });
+  await expect(page.getByText("message 31")).toBeAttached();
+  await expect(page.getByText("message 0", { exact: true })).toBeInViewport();
+});
+
+test("chat approvals use the same card as agent approvals", async ({ page }) => {
+  await page.route("**/api/chats/chat-1", (route) =>
+    route.fulfill({
+      json: {
+        messages: [
+          {
+            role: "assistant",
+            content: "Review command",
+            status: "awaiting_approval",
+            reply: {
+              run: {
+                id: "plan-1",
+                steps: [{ id: 7, command: "rm -rf build", target: { kind: "remote", worker: "worker-a" }, risk: { reason: "Deletes files" } }],
+              },
+              result: { awaiting_approval: [7], sessions: [] },
+            },
+          },
+        ],
+      },
+    }),
+  );
+  await page.goto("/?chat=chat-1");
+  const card = page.locator(".message.assistant .approval");
+  await expect(card).toContainText("Hive wants to run a command on worker-a");
+  await expect(card).toContainText("Deletes files");
+  await expect(card.locator("pre.cmd")).toHaveText("rm -rf build");
+  await expect(page.locator(".message.assistant small")).toHaveText("Needs approval");
+});
+
 test("terminal sends binary input and text resize; reconnect and back work", async ({
   page,
 }) => {
@@ -890,13 +983,95 @@ test("reopening an active chat resumes polling and recovers the composer", async
   await page.getByRole("button", { name: /Machine work/ }).click();
   await expect(page.getByText("Planning request")).toBeVisible();
   await page.getByLabel("Message Hive").fill("Next request");
-  await expect(page.getByRole("button", { name: "Running…" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Queue" })).toBeEnabled();
   completed = true;
   await expect(page.getByText("Finished after reconnect")).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Send", exact: true }),
   ).toBeEnabled();
 });
+test("a message sent while Hive is busy queues and goes out when the turn ends", async ({ page }) => {
+  let status = "awaiting_approval";
+  const sent: any[] = [];
+  await page.route("**/api/chats/chat-1", (route) =>
+    route.fulfill({
+      json: { messages: [{ role: "assistant", content: "Working on it", status }] },
+    }),
+  );
+  await page.route("**/api/chat", (route) => {
+    sent.push(route.request().postDataJSON());
+    return route.fulfill({ json: { status: "planning" } });
+  });
+  await page.goto("/?chat=chat-1");
+  await expect(page.getByText("Working on it")).toBeVisible();
+  const box = page.getByLabel("Message Hive");
+  await box.fill("first follow-up");
+  await box.press("Enter");
+  await box.fill("second follow-up");
+  await page.getByRole("button", { name: "Queue" }).click();
+  const queued = page.locator(".message.queued");
+  await expect(queued).toContainText("sends after you answer the approval above");
+  await expect(queued.locator("div")).toHaveText("first follow-up\n\nsecond follow-up");
+  await expect(box).toHaveValue("");
+  // Taking it back returns the text to the composer and sends nothing.
+  await queued.getByRole("button", { name: "Edit" }).click();
+  await expect(queued).toHaveCount(0);
+  await expect(box).toHaveValue("first follow-up\n\nsecond follow-up");
+  await page.getByRole("button", { name: "Queue" }).click();
+  await expect(queued).toContainText("first follow-up");
+  expect(sent).toEqual([]);
+  status = "completed";
+  await expect.poll(() => sent.length).toBe(1);
+  expect(sent[0]).toMatchObject({
+    message: "first follow-up\n\nsecond follow-up",
+    conversation_id: "chat-1",
+    background: true,
+  });
+  await expect(queued).toHaveCount(0);
+});
+
+test("a queued message that fails to send returns to the composer", async ({ page }) => {
+  let status = "planning";
+  await page.route("**/api/chats/chat-1", (route) =>
+    route.fulfill({
+      json: { messages: [{ role: "assistant", content: "Planning request", status }] },
+    }),
+  );
+  await page.route("**/api/chat", (route) =>
+    route.fulfill({ status: 409, body: "This chat is still busy." }),
+  );
+  await page.goto("/?chat=chat-1");
+  await expect(page.getByText("Planning request")).toBeVisible();
+  await page.getByLabel("Message Hive").fill("follow-up");
+  await page.getByRole("button", { name: "Queue" }).click();
+  await expect(page.locator(".message.queued")).toContainText("sends when Hive finishes");
+  status = "completed";
+  await expect(page.locator("p.error")).toHaveText("This chat is still busy.");
+  await expect(page.locator(".message.queued")).toHaveCount(0);
+  await expect(page.getByLabel("Message Hive")).toHaveValue("follow-up");
+});
+
+test("switching chats hands a queued message back to the composer", async ({ page }) => {
+  await page.route("**/api/chats/chat-1", (route) =>
+    route.fulfill({
+      json: { messages: [{ role: "assistant", content: "Planning request", status: "planning" }] },
+    }),
+  );
+  let posted = false;
+  await page.route("**/api/chat", (route) => {
+    posted = true;
+    return route.fulfill({ json: {} });
+  });
+  await page.goto("/?chat=chat-1");
+  await expect(page.getByText("Planning request")).toBeVisible();
+  await page.getByLabel("Message Hive").fill("follow-up");
+  await page.getByRole("button", { name: "Queue" }).click();
+  await page.getByRole("button", { name: "New chat" }).click();
+  await expect(page.locator(".message.queued")).toHaveCount(0);
+  await expect(page.getByLabel("Message Hive")).toHaveValue("follow-up");
+  expect(posted).toBe(false);
+});
+
 test("slow history responses cannot overwrite a new chat", async ({ page }) => {
   let release: () => void = () => {};
   const delayed = new Promise<void>((resolve) => {
@@ -1269,7 +1444,8 @@ test("live chat records a command request and shows its real outcome", async ({
     );
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect(page.locator(".message.user")).toContainText("HIVE_CHAT_UI_OK");
-  await expect(page.locator(".message.assistant small")).toHaveText(
+  await expect(page.locator(".message.assistant")).toHaveAttribute(
+    "data-status",
     /completed|failed|interrupted|awaiting_approval/,
     { timeout: 180000 },
   );
@@ -1621,24 +1797,41 @@ test.describe("delegated sessions", () => {
 
   test("a Claude session renders its commands, tools and failures", async ({ page }) => {
     await withRuns(page, [{ ...run, assignment: { ...run.assignment, agent: "claude" } }]);
+    const use = (id: string, name: string, input: unknown) => ({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } });
+    const result = (id: string, content: unknown, is_error = false) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error, content }] } });
     await page.route("**/api/runs/run-1/events*", (route) =>
       route.fulfill({
         json: new URL(route.request().url()).searchParams.get("tail")
           ? [
               { seq: 1, kind: "native", payload: { type: "system", subtype: "init" } },
-              { seq: 2, kind: "native", payload: { type: "assistant", message: { content: [{ type: "text", text: "Writing tests." }] } } },
-              { seq: 3, kind: "native", payload: { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "python3 -m unittest" } }] } } },
-              { seq: 4, kind: "native", payload: { type: "user", message: { content: [{ type: "tool_result", is_error: true, content: "1 test failed" }] } } },
-              { seq: 5, kind: "native", payload: { type: "assistant", message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: "a.py" } }] } } },
+              { seq: 2, kind: "native", payload: { type: "assistant", message: { content: [{ type: "text", text: "Writing **tests**." }] } } },
+              { seq: 3, kind: "native", payload: use("t1", "Bash", { command: "python3 -m unittest" }) },
+              { seq: 4, kind: "native", payload: result("t1", "1 test failed", true) },
+              { seq: 5, kind: "native", payload: use("t2", "Edit", { file_path: "/w/a.py", old_string: "x = 1", new_string: "x = 2" }) },
+              { seq: 6, kind: "native", payload: use("t3", "Grep", { pattern: "x" }) },
+              { seq: 7, kind: "native", payload: result("t3", [{ type: "text", text: "a.py:1:x = 2" }]) },
+              { seq: 8, kind: "native", payload: { type: "user", message: { content: [{ type: "tool_result", is_error: true, content: "orphan failure" }] } } },
             ]
           : [],
       }),
     );
     await page.goto("/session/?run=run-1");
     await expect(page.locator(".t-agent")).toHaveText("Writing tests.");
-    await expect(page.locator(".t-cmd summary").first()).toContainText("$ python3 -m unittest");
-    await expect(page.locator(".t-error")).toHaveText("1 test failed");
-    await expect(page.locator(".t-cmd summary").nth(1)).toContainText("Tool Edit");
+    await expect(page.locator(".t-agent strong")).toHaveText("tests");
+    // The failed command opens with its output instead of a separate error.
+    const cmd = page.locator(".t-cmd").first();
+    await expect(cmd.locator("summary")).toContainText("$ python3 -m unittest");
+    await expect(cmd.locator(".exit.bad")).toHaveText("failed");
+    await expect(cmd.locator("pre")).toHaveText("1 test failed");
+    const edit = page.locator(".t-cmd").nth(1);
+    await expect(edit.locator("summary")).toContainText("Changed 1 file: a.py");
+    await edit.locator("summary").click();
+    await expect(edit.locator("pre")).toHaveText("-x = 1\n+x = 2");
+    const grep = page.locator(".t-cmd").nth(2);
+    await expect(grep.locator("summary")).toContainText("Tool Grep");
+    await grep.locator("summary").click();
+    await expect(grep.locator("pre").last()).toHaveText("a.py:1:x = 2");
+    await expect(page.locator(".t-error")).toHaveText("orphan failure");
   });
 
   test("a failed command opens its output; successful ones stay collapsed", async ({ page }) => {

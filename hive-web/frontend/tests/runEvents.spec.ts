@@ -247,13 +247,50 @@ test.describe("Claude stream-json events", () => {
     const entries = transcript([
       assistant({ type: "thinking", thinking: "secret" }, { type: "text", text: "Creating the workspace." }),
       assistant({ type: "tool_use", name: "Bash", input: { command: "mkdir -p ws && ls" } }),
-      assistant({ type: "tool_use", name: "Write", input: { file_path: "a.py" } }),
+      assistant({ type: "tool_use", name: "Read", input: { file_path: "a.py" } }),
       assistant({ type: "text", text: "   " }),
     ]);
     expect(entries).toEqual([
       expect.objectContaining({ type: "agent", text: "Creating the workspace." }),
       expect.objectContaining({ type: "command", command: "mkdir -p ws && ls", status: "started" }),
-      expect.objectContaining({ type: "tool", name: "Write" }),
+      expect.objectContaining({ type: "tool", name: "Read" }),
+    ]);
+  });
+
+  test("tool results attach to the command or tool that asked for them", () => {
+    const user = (...content: unknown[]) => ev("native", { type: "user", message: { content } });
+    const entries = transcript([
+      assistant({ type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } }),
+      assistant({ type: "tool_use", id: "t2", name: "Bash", input: { command: "false" } }),
+      assistant({ type: "tool_use", id: "t3", name: "Grep", input: { pattern: "x" } }),
+      assistant({ type: "tool_use", id: "t4", name: "Read", input: { file_path: "gone" } }),
+      user({ type: "tool_result", tool_use_id: "t1", content: "a.py\nb.py" }),
+      user({ type: "tool_result", tool_use_id: "t2", is_error: true, content: [{ type: "text", text: "exit 1" }] }),
+      user({ type: "tool_result", tool_use_id: "t3", content: [{ type: "text", text: "a.py:1:x" }] }),
+      user({ type: "tool_result", tool_use_id: "t4", is_error: true, content: "no such file" }),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "command", command: "ls", output: "a.py\nb.py", status: "completed" }),
+      expect.objectContaining({ type: "command", command: "false", output: "exit 1", status: "failed" }),
+      expect.objectContaining({ type: "tool", name: "Grep", output: "a.py:1:x", status: "completed" }),
+      expect.objectContaining({ type: "tool", name: "Read", error: "no such file", status: "failed" }),
+    ]);
+  });
+
+  test("Write, Edit and MultiEdit show as file changes with a diff", () => {
+    const entries = transcript([
+      assistant({ type: "tool_use", name: "Write", input: { file_path: "/w/a.py", content: "x = 1\ny = 2" } }),
+      assistant({ type: "tool_use", name: "Edit", input: { file_path: "/w/b.py", old_string: "old", new_string: "new" } }),
+      assistant({
+        type: "tool_use",
+        name: "MultiEdit",
+        input: { file_path: "/w/c.py", edits: [{ old_string: "a", new_string: "b" }, { old_string: "c", new_string: "d" }] },
+      }),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "files", changes: [{ path: "/w/a.py", kind: "write", diff: "+x = 1\n+y = 2" }] }),
+      expect.objectContaining({ type: "files", changes: [{ path: "/w/b.py", kind: "edit", diff: "-old\n+new" }] }),
+      expect.objectContaining({ type: "files", changes: [{ path: "/w/c.py", kind: "edit", diff: "-a\n+b\n\n-c\n+d" }] }),
     ]);
   });
 

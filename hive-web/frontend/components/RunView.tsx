@@ -11,6 +11,7 @@ import {
   stateTone,
   transcript,
 } from "../lib/runEvents";
+import { Markdown } from "../lib/markdown";
 
 export type Approval = {
   id: string;
@@ -136,6 +137,58 @@ export function useRunEvents(run: Run | undefined, tail: number, live: boolean) 
   };
 }
 
+/// The one approval card: who wants what, the exact command, and the choice.
+/// Chat steps and delegated runs both render through it.
+export function ApprovalPrompt({
+  title,
+  reason,
+  command,
+  cwd,
+  status,
+  denyLabel,
+  busy,
+  error,
+  onApprove,
+  onDeny,
+}: {
+  title: string;
+  reason?: string;
+  command: string;
+  cwd?: string;
+  status?: React.ReactNode;
+  denyLabel: string;
+  busy: boolean;
+  error?: string;
+  onApprove: () => void;
+  onDeny: () => void;
+}) {
+  return (
+    <div className="approval">
+      <div className="approval-head">
+        <strong>{title}</strong>
+        {reason && <span className="muted">{reason}</span>}
+      </div>
+      <pre className="cmd">{command}</pre>
+      {cwd && <div className="muted mono small">in {cwd}</div>}
+      {status || (
+        <div className="row">
+          <button className="primary" disabled={busy} onClick={onApprove}>
+            Approve
+          </button>
+          <button className="danger" disabled={busy} onClick={onDeny}>
+            {denyLabel}
+          </button>
+        </div>
+      )}
+      {error && (
+        <p role="alert" className="error">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function ApprovalCard({
   run,
   approval,
@@ -166,48 +219,29 @@ function ApprovalCard({
     }
   }
   return (
-    <div className="approval">
-      <div className="approval-head">
-        <strong>
-          {run.assignment.agent} wants to {verb}
-        </strong>
-        {approval.reason && <span className="muted">{approval.reason}</span>}
-      </div>
-      <pre className="cmd">{command}</pre>
-      {cwd && <div className="muted mono small">in {cwd}</div>}
-      {run.state === "disconnected" ? (
-        <p className="muted">
-          The agent disconnected before this was answered, so approving now has no effect.
-        </p>
-      ) : approval.decision ? (
-        <p role="status" className="muted">
-          You chose <strong>{approval.decision === "stop" ? "deny" : "approve"}</strong>
-          . Waiting for the agent to pick it up…
-        </p>
-      ) : (
-        <div className="row">
-          <button
-            className="primary"
-            disabled={busy}
-            onClick={() => void decide("continue")}
-          >
-            Approve
-          </button>
-          <button
-            className="danger"
-            disabled={busy}
-            onClick={() => void decide("stop")}
-          >
-            Deny and stop
-          </button>
-        </div>
-      )}
-      {error && (
-        <p role="alert" className="error">
-          {error}
-        </p>
-      )}
-    </div>
+    <ApprovalPrompt
+      title={`${run.assignment.agent} wants to ${verb}`}
+      reason={approval.reason}
+      command={command}
+      cwd={cwd}
+      status={
+        run.state === "disconnected" ? (
+          <p className="muted">
+            The agent disconnected before this was answered, so approving now has no effect.
+          </p>
+        ) : approval.decision ? (
+          <p role="status" className="muted">
+            You chose <strong>{approval.decision === "stop" ? "deny" : "approve"}</strong>
+            . Waiting for the agent to pick it up…
+          </p>
+        ) : undefined
+      }
+      denyLabel="Deny and stop"
+      busy={busy}
+      error={error}
+      onApprove={() => void decide("continue")}
+      onDeny={() => void decide("stop")}
+    />
   );
 }
 
@@ -307,6 +341,11 @@ export function RunAttention({
   );
 }
 
+// Claude's Read and Write can return whole files; keep the transcript light.
+const LIMIT = 20000;
+const clip = (text: string) =>
+  text.length > LIMIT ? `${text.slice(0, LIMIT)}\n… truncated; Raw events has the rest` : text;
+
 function EntryView({ entry }: { entry: Entry }) {
   switch (entry.type) {
     case "state":
@@ -323,7 +362,7 @@ function EntryView({ entry }: { entry: Entry }) {
         </details>
       );
     case "agent":
-      return <div className="t-agent t-text">{entry.text}</div>;
+      return <Markdown className="t-agent" text={entry.text} />;
     case "reasoning":
       return (
         <details className="t-muted">
@@ -333,18 +372,20 @@ function EntryView({ entry }: { entry: Entry }) {
       );
     case "command":
       return (
-        <details className="t-cmd" open={!!entry.exitCode}>
+        <details className="t-cmd" open={!!entry.exitCode || entry.status === "failed"}>
           <summary>
             <span className="mono">$ {entry.command.split("\n")[0]}</span>
-            {entry.exitCode != null && (
+            {entry.exitCode != null ? (
               <span className={`exit ${entry.exitCode ? "bad" : ""}`}>
                 exit {entry.exitCode}
               </span>
+            ) : (
+              entry.status === "failed" && <span className="exit bad">failed</span>
             )}
           </summary>
           {entry.command.includes("\n") && <pre className="cmd">{entry.command}</pre>}
           {entry.cwd && <div className="muted mono small">in {entry.cwd}</div>}
-          {entry.output && <pre>{entry.output}</pre>}
+          {entry.output && <pre>{clip(entry.output)}</pre>}
         </details>
       );
     case "files":
@@ -361,7 +402,7 @@ function EntryView({ entry }: { entry: Entry }) {
               <div className="muted mono small">
                 {c.kind} {c.path}
               </div>
-              {c.diff && <pre>{c.diff}</pre>}
+              {c.diff && <pre>{clip(c.diff)}</pre>}
             </div>
           ))}
         </details>
@@ -377,7 +418,8 @@ function EntryView({ entry }: { entry: Entry }) {
               entry.status && <span className="exit">{entry.status}</span>
             )}
           </summary>
-          {entry.input && <pre>{entry.input}</pre>}
+          {entry.input && <pre>{clip(entry.input)}</pre>}
+          {entry.output && <pre>{clip(entry.output)}</pre>}
         </details>
       );
     case "approval":
@@ -397,7 +439,11 @@ function EntryView({ entry }: { entry: Entry }) {
       return <div className="t-error">{entry.text}</div>;
     case "result":
       return (
-        <div className={entry.error ? "t-error" : "t-result t-text"}>{entry.text}</div>
+        entry.error ? (
+          <div className="t-error">{entry.text}</div>
+        ) : (
+          <Markdown className="t-result" text={entry.text} />
+        )
       );
   }
 }
