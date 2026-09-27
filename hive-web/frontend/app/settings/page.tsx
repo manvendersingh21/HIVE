@@ -3,8 +3,10 @@
 import { FormEvent, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { Shell } from "../../components/Nav";
+import { ConnectionCheck, HiveKey, KeyInfo } from "../../components/SshSetup";
 
 type Provider = "local" | "zai" | "nvidia";
+type Autonomy = "yolo" | "ask";
 
 type ProviderOption = {
   id: Provider;
@@ -44,7 +46,14 @@ export default function SettingsPage() {
   const [name, setName] = useState("");
   const [host, setHost] = useState("");
   const [user, setUser] = useState("");
+  const [port, setPort] = useState("");
   const [tags, setTags] = useState("");
+  const [keyInfo, setKeyInfo] = useState<KeyInfo>();
+  const [autonomy, setAutonomy] = useState<Autonomy>();
+  const [autonomyError, setAutonomyError] = useState("");
+  const portNumber = port.trim() ? Number(port) : null;
+  const portValid =
+    portNumber === null || (Number.isInteger(portNumber) && portNumber >= 1 && portNumber <= 65535);
 
   async function load() {
     const current = await api<MasterAgentSettings>(
@@ -58,16 +67,40 @@ export default function SettingsPage() {
     setFleet(await api<FleetWorker[]>("/api/fleet"));
   }
 
+  async function saveAutonomy(mode: Autonomy) {
+    setAutonomyError("");
+    try {
+      const saved = await api<{ mode: Autonomy }>("/api/settings/autonomy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      setAutonomy(saved.mode);
+    } catch (e) {
+      setAutonomyError((e as Error).message);
+    }
+  }
+
   useEffect(() => {
     void load().catch((e) => setError((e as Error).message));
+    void api<{ mode: Autonomy }>("/api/settings/autonomy")
+      .then((current) => setAutonomy(current.mode))
+      .catch((e) => setAutonomyError((e as Error).message));
     void loadFleet().catch((e) => {
       setFleetError((e as Error).message);
       setFleet([]);
     });
+    void api<KeyInfo>("/api/fleet/ssh/key")
+      .then(setKeyInfo)
+      .catch((e) => setFleetError((e as Error).message));
   }, []);
 
   async function addWorker(event: FormEvent) {
     event.preventDefault();
+    if (!portValid) {
+      setFleetError("Port must be a number from 1 to 65535.");
+      return;
+    }
     setFleetBusy(true);
     setFleetError("");
     try {
@@ -77,6 +110,7 @@ export default function SettingsPage() {
           name: name.trim(),
           host: host.trim(),
           user: user.trim(),
+          port: portNumber,
           tags: tags
             .split(",")
             .map((t) => t.trim())
@@ -87,6 +121,7 @@ export default function SettingsPage() {
       setName("");
       setHost("");
       setUser("");
+      setPort("");
       setTags("");
     } catch (e) {
       setFleetError((e as Error).message);
@@ -211,6 +246,29 @@ export default function SettingsPage() {
           )}
         </section>
         <section className="card">
+          <h2>Agent permissions</h2>
+          <p className="muted">
+            Applies to agents Hive launches from now on: delegated runs and new
+            Claude or Codex terminal sessions. Running agents keep their mode.
+          </p>
+          {autonomyError && <p className="error">{autonomyError}</p>}
+          {!autonomy ? (
+            <p className="muted">Loading…</p>
+          ) : (
+            <>
+              <label htmlFor="agent-autonomy">Mode</label>
+              <select
+                id="agent-autonomy"
+                value={autonomy}
+                onChange={(event) => void saveAutonomy(event.target.value as Autonomy)}
+              >
+                <option value="yolo">Yolo: never ask, no sandbox</option>
+                <option value="ask">Ask: approve anything outside the workspace policy</option>
+              </select>
+            </>
+          )}
+        </section>
+        <section className="card">
           <h2>Fleet</h2>
           <p className="muted">
             SSH worker machines Hive can delegate to. Machines added here are
@@ -264,6 +322,8 @@ export default function SettingsPage() {
                   </article>
                 ))
               )}
+              <HiveKey keyInfo={keyInfo} onChange={setKeyInfo} />
+              <h3>Add a machine</h3>
               <form onSubmit={addWorker}>
                 <label htmlFor="worker-name">
                   Name
@@ -297,6 +357,18 @@ export default function SettingsPage() {
                     required
                   />
                 </label>
+                <label htmlFor="worker-port">
+                  SSH port (optional)
+                  <input
+                    id="worker-port"
+                    inputMode="numeric"
+                    value={port}
+                    onChange={(event) => setPort(event.target.value)}
+                    placeholder="22"
+                    disabled={fleetBusy}
+                    aria-invalid={!portValid}
+                  />
+                </label>
                 <label htmlFor="worker-tags">
                   Tags (comma-separated, optional)
                   <input
@@ -307,7 +379,11 @@ export default function SettingsPage() {
                     disabled={fleetBusy}
                   />
                 </label>
-                <button type="submit" disabled={fleetBusy}>
+                <ConnectionCheck
+                  target={{ host, user, port: portValid ? portNumber : null }}
+                  keyInfo={keyInfo}
+                />
+                <button type="submit" className="primary" disabled={fleetBusy}>
                   {fleetBusy ? "Adding…" : "Add machine"}
                 </button>
               </form>

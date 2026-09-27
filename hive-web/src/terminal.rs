@@ -189,6 +189,7 @@ mod tests {
             user: "alice".into(),
             port: Some(2222),
             tags: vec![],
+            local: false,
         };
         let command = attach_command("ws-share", Some(&worker));
         let args = command

@@ -173,9 +173,15 @@ impl Kind {
     }
 
     fn launch_command(self) -> Option<&'static str> {
+        use hive_core::delegation::Autonomy;
+        let yolo = hive_core::delegation::autonomy() == Autonomy::Yolo;
         match self {
             Kind::Shell => None,
+            Kind::Claude if yolo => Some("claude --dangerously-skip-permissions"),
             Kind::Claude => Some("claude"),
+            Kind::Codex if yolo => {
+                Some("codex --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox")
+            }
             Kind::Codex => Some("codex --skip-git-repo-check"),
         }
     }

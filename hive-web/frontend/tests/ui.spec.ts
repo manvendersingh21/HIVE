@@ -122,6 +122,11 @@ async function defaults(page: Page) {
           removable: false,
         },
       ],
+      "/api/fleet/ssh/key": {
+        public_key: "ssh-ed25519 AAAAC3NzaTEST hive@coordinator",
+        path: "/home/me/.ssh/hive_worker_ed25519",
+        config_included: true,
+      },
     };
     if (path === "/api/machines/prompt")
       return route.fulfill({ body: "worker-a can run codex" });
@@ -150,6 +155,23 @@ test("navigation works and marks the current page", async ({ page }) => {
       page.getByRole("link", { name: label, exact: true }),
     ).toHaveAttribute("aria-current", "page");
   }
+});
+
+test("agent permissions default to yolo and save a switch to ask", async ({ page }) => {
+  let saved: unknown;
+  await page.route("**/api/settings/autonomy", (route) => {
+    if (route.request().method() === "POST") {
+      saved = JSON.parse(route.request().postData() || "{}");
+      return route.fulfill({ json: saved });
+    }
+    return route.fulfill({ json: { mode: "yolo" } });
+  });
+  await page.goto("/settings/");
+  const mode = page.getByLabel("Mode");
+  await expect(mode).toHaveValue("yolo");
+  await mode.selectOption("ask");
+  await expect.poll(() => saved).toEqual({ mode: "ask" });
+  await expect(mode).toHaveValue("ask");
 });
 
 test("master agent provider settings loads and saves", async ({ page }) => {
@@ -249,7 +271,7 @@ test("fleet settings add and remove only editable workers", async ({ page }) => 
   await page.getByLabel("Tags (comma-separated, optional)").fill("qa, light, ");
   await page.getByRole("button", { name: "Add machine" }).click();
   await expect(page.locator("article").filter({ hasText: "qa-worker" })).toBeVisible();
-  expect(payload).toEqual({ name: "qa-worker", host: "ssh-qa", user: "tester", tags: ["qa", "light"] });
+  expect(payload).toEqual({ name: "qa-worker", host: "ssh-qa", user: "tester", port: null, tags: ["qa", "light"] });
   await expect(page.getByLabel("Name", { exact: true })).toHaveValue("");
   await page.getByRole("button", { name: "Remove", exact: true }).click();
   await expect(page.locator("article").filter({ hasText: "qa-worker" })).toHaveCount(0);
@@ -275,6 +297,132 @@ test("fleet settings preserve failed additions and report removal errors", async
   await expect(page.locator('p[role="alert"]')).toHaveText("Could not save fleet");
   await expect(page.locator("article").filter({ hasText: "qa-worker" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Remove", exact: true })).toBeEnabled();
+});
+
+async function fillMachine(page: Page, port = "") {
+  await page.getByLabel("Name", { exact: true }).fill("gpu");
+  await page.getByLabel("Host", { exact: true }).fill("gpu-node");
+  await page.getByLabel("SSH user", { exact: true }).fill("me");
+  await page.getByLabel("SSH port (optional)").fill(port);
+}
+const sshResult = (status: string, message: string, extra = {}) => ({
+  status, message, methods: [], password_possible: false, ...extra,
+});
+
+test("fleet shows Hive's key with a copy fallback and sends the port", async ({ page }) => {
+  let payload: any;
+  await page.route("**/api/fleet", (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    payload = route.request().postDataJSON();
+    return route.fulfill({ json: [] });
+  });
+  // Plain http on a tailnet address has no Clipboard API.
+  await page.addInitScript(() => Object.defineProperty(navigator, "clipboard", { value: undefined }));
+  await page.goto("/settings/");
+  await expect(page.getByLabel("Hive's public key")).toHaveValue("ssh-ed25519 AAAAC3NzaTEST hive@coordinator");
+  await page.locator(".ssh-key").getByRole("button", { name: "Copy" }).click();
+  await expect(page.locator(".ssh-key [role=status]")).toHaveText(/Copied|Selected/);
+  await fillMachine(page, "70000");
+  await page.getByRole("button", { name: "Add machine" }).click();
+  await expect(page.locator('p[role="alert"]')).toHaveText("Port must be a number from 1 to 65535.");
+  expect(payload).toBeUndefined();
+  await page.getByLabel("SSH port (optional)").fill("2222");
+  await page.getByRole("button", { name: "Add machine" }).click();
+  await expect.poll(() => payload?.port).toBe(2222);
+});
+
+test("a missing key can be created, and a config without the include is flagged", async ({ page }) => {
+  let key: any = { public_key: null, path: "/home/me/.ssh/hive_worker_ed25519", config_included: false };
+  await page.route("**/api/fleet/ssh/key", (route) => {
+    if (route.request().method() === "POST")
+      key = { ...key, public_key: "ssh-ed25519 AAAANEW hive@coordinator" };
+    return route.fulfill({ json: key });
+  });
+  await page.goto("/settings/");
+  await expect(page.locator(".ssh-key [role=alert]")).toContainText("Include ~/.ssh/config.d/*.conf");
+  await page.getByRole("button", { name: "Create Hive's key" }).click();
+  await expect(page.getByLabel("Hive's public key")).toHaveValue("ssh-ed25519 AAAANEW hive@coordinator");
+});
+
+test("a new machine's host key is shown, trusted, then its key is installed with a password", async ({ page }) => {
+  const calls: { path: string; body: any }[] = [];
+  const reply = (path: string, json: unknown) =>
+    page.route(`**/api/fleet/ssh/${path}`, (route) => {
+      calls.push({ path, body: route.request().postDataJSON() });
+      return route.fulfill({ json });
+    });
+  const fingerprint = { fingerprint: "SHA256:abc123", kind: "ED25519" };
+  await reply("test", sshResult("host-key-unknown", "Hive hasn't seen gpu-node's host key yet."));
+  await reply("host-key", { fingerprints: [fingerprint] });
+  await reply("trust", sshResult("not-authorized", "me@gpu-node is reachable, but Hive's key isn't authorized there yet.",
+    { methods: ["publickey", "password"], password_possible: true }));
+  await reply("install-key", sshResult("ok", "Connected to me@gpu-node."));
+  await page.goto("/settings/");
+  await fillMachine(page, "2222");
+  await page.getByRole("button", { name: "Test connection" }).click();
+  const banner = page.locator("[data-ssh-status]");
+  await expect(banner).toHaveAttribute("data-ssh-status", "host-key-unknown");
+  await page.getByRole("button", { name: "Show host key" }).click();
+  await expect(banner).toContainText("ED25519 SHA256:abc123");
+  await expect(banner).toContainText("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub");
+  await page.getByRole("button", { name: "Trust this key" }).click();
+  await expect(banner).toHaveAttribute("data-ssh-status", "not-authorized");
+  await expect(page.getByLabel("Command that authorizes Hive's key")).toHaveValue(
+    "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo 'ssh-ed25519 AAAAC3NzaTEST hive@coordinator' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
+  );
+  const password = page.getByLabel("Password for me@gpu-node");
+  await password.fill("hunter2");
+  // Enter installs the key; it must not submit the add-machine form around it.
+  let added = false;
+  await page.route("**/api/fleet", (route) => {
+    if (route.request().method() === "POST") added = true;
+    return route.fallback();
+  });
+  await password.press("Enter");
+  await expect(banner).toHaveAttribute("data-ssh-status", "ok");
+  await expect(banner).toContainText("Connected to me@gpu-node.");
+  await expect(password).toHaveCount(0);
+  expect(added).toBe(false);
+  const target = { host: "gpu-node", user: "me", port: 2222 };
+  expect(calls).toEqual([
+    { path: "test", body: target },
+    { path: "host-key", body: target },
+    { path: "trust", body: { ...target, fingerprints: [fingerprint] } },
+    { path: "install-key", body: { ...target, password: "hunter2" } },
+  ]);
+});
+
+test("a changed host key is a warning with no trust button, and editing clears the result", async ({ page }) => {
+  await page.route("**/api/fleet/ssh/test", (route) =>
+    route.fulfill({ json: sshResult("host-key-changed", "gpu-node's host key doesn't match. Remove the old key with `ssh-keygen -R gpu-node`.") }));
+  await page.goto("/settings/");
+  await fillMachine(page);
+  await page.getByRole("button", { name: "Test connection" }).click();
+  const banner = page.locator("[data-ssh-status]");
+  await expect(banner).toHaveClass(/bad/);
+  await expect(banner).toContainText("ssh-keygen -R gpu-node");
+  await expect(page.getByRole("button", { name: /Trust|Show host key/ })).toHaveCount(0);
+  await page.getByLabel("Host", { exact: true }).fill("other-node");
+  await expect(banner).toHaveCount(0);
+});
+
+test("machines that refuse passwords only get the command, and failures are shown", async ({ page }) => {
+  let fail = false;
+  await page.route("**/api/fleet/ssh/test", (route) =>
+    fail
+      ? route.fulfill({ status: 500, body: "ssh -G gpu-node: bad configuration" })
+      : route.fulfill({ json: sshResult("not-authorized", "Hive's key isn't authorized there yet.",
+          { methods: ["publickey", "keyboard-interactive:duo"], password_possible: false }) }));
+  await page.goto("/settings/");
+  await fillMachine(page);
+  await page.getByRole("button", { name: "Test connection" }).click();
+  await expect(page.locator("[data-ssh-status]")).toContainText("doesn't accept password sign-in");
+  await expect(page.getByLabel("Password for me@gpu-node")).toHaveCount(0);
+  await expect(page.getByLabel("Command that authorizes Hive's key")).toBeVisible();
+  fail = true;
+  await page.getByLabel("SSH port (optional)").fill("22");
+  await page.getByRole("button", { name: "Test connection" }).click();
+  await expect(page.locator(".ssh-check [role=alert]")).toHaveText("ssh -G gpu-node: bad configuration");
 });
 
 test("provider save failure preserves key and allows retry", async ({ page }) => {

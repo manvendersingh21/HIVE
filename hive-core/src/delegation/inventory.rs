@@ -5,9 +5,48 @@ use crate::{
 };
 use serde_json::{json, Value};
 
+/// A probe starts every agent CLI to read versions and auth, which takes close
+/// to a minute on a loaded worker.
+pub const PROBE_SECONDS: u64 = 150;
+
+/// Probe every device's agents, the coordinator included.
 pub async fn refresh(agent: &MasterAgent) -> anyhow::Result<()> {
-    let fleet = agent.workers.snapshot();
-    let probes = fleet.iter().map(|worker| async move {
+    probe_devices(agent, super::targets(agent), PROBE_SECONDS).await
+}
+
+/// Probe only devices without an inventory verified in the last `max_age`
+/// seconds. Planning uses this with a short budget: the background refresh
+/// keeps healthy devices current, and a slow probe here must not mark their
+/// fresh inventory stale.
+pub async fn refresh_stale(agent: &MasterAgent, max_age: i64, seconds: u64) -> anyhow::Result<()> {
+    let stale = stale_devices(agent, max_age, chrono::Utc::now().timestamp())?;
+    probe_devices(agent, stale, seconds).await
+}
+
+fn stale_devices(
+    agent: &MasterAgent,
+    max_age: i64,
+    now: i64,
+) -> anyhow::Result<Vec<hive_common::protocol::WorkerInfo>> {
+    let records = agent.memory.graph.entities_of_kind("device-agent")?;
+    Ok(super::targets(agent)
+        .into_iter()
+        .filter(|t| {
+            !records.iter().any(|r| {
+                r.attrs["device"] == t.name.as_str()
+                    && !r.attrs["probe_error"].is_string()
+                    && r.attrs["verified_at"].as_i64().is_some_and(|v| now - v <= max_age)
+            })
+        })
+        .collect())
+}
+
+async fn probe_devices(
+    agent: &MasterAgent,
+    devices: Vec<hive_common::protocol::WorkerInfo>,
+    seconds: u64,
+) -> anyhow::Result<()> {
+    let probes = devices.iter().map(|worker| async move {
         // Probe existing bundle when present (SDK/runtime status is device-specific).
         let source = format!(
             "__file__ = str(__import__('pathlib').Path.home()/'.hive/runners/{}/runner.py')\n{}",
@@ -16,14 +55,20 @@ pub async fn refresh(agent: &MasterAgent) -> anyhow::Result<()> {
         );
         let command = format!("python3 -c {} probe", transport::quote(&source));
         (
-            worker.info.name.clone(),
-            transport::ssh(&worker.info, &command, None).await,
+            worker.name.clone(),
+            transport::ssh_timeout(worker, &command, None, seconds).await,
         )
     });
     for (device, result) in futures::future::join_all(probes).await {
         match result {
             Ok(raw) => match serde_json::from_str::<Vec<Value>>(&raw) {
-                Ok(records) => project(&agent.memory.graph, &device, &records)?,
+                // One device that can't be recorded (for example, a worker the
+                // machine graph hasn't seen yet) must not drop the rest.
+                Ok(records) => {
+                    if let Err(e) = project(&agent.memory.graph, &device, &records) {
+                        tracing::warn!(%device,error=%e,"could not record agent inventory");
+                    }
+                }
                 Err(e) => {
                     mark_stale(&agent.memory.graph, &device, &e.to_string())?;
                     tracing::warn!(%device,error=%e,"invalid agent inventory");
@@ -95,6 +140,43 @@ pub fn describe(graph: &KnowledgeGraph) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn planning_reprobes_only_devices_without_a_fresh_clean_inventory() {
+        let agent = crate::agent::MasterAgent::new(
+            crate::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            crate::workers::WorkerPool::new(
+                ["fresh", "old", "failed", "never"]
+                    .iter()
+                    .map(|name| hive_common::protocol::WorkerInfo {
+                        name: (*name).into(),
+                        host: (*name).into(),
+                        user: "test".into(),
+                        port: None,
+                        tags: vec![],
+                        local: false,
+                    })
+                    .collect(),
+            ),
+            crate::skills::SkillRegistry::new(),
+            crate::memory::MemorySystem::new(),
+        )
+        .with_master_name("coordinator");
+        let graph = &agent.memory.graph;
+        for name in ["fresh", "old", "failed", "never", "coordinator"] {
+            crate::memory::machines::project_into_graph(
+                graph,
+                &crate::memory::machines::MachineFacts { name: name.into(), reachable: true, ..Default::default() },
+            )
+            .unwrap();
+        }
+        let now = 10_000;
+        for (device, age) in [("fresh", 30), ("old", 500), ("failed", 30), ("coordinator", 30)] {
+            project(graph, device, &[json!({"agent":"codex","executable":"/codex","verified_at":now-age})]).unwrap();
+        }
+        mark_stale(graph, "failed", "timed out").unwrap();
+        let names: Vec<_> = stale_devices(&agent, 120, now).unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["old", "failed", "never"]);
+    }
     #[test]
     fn all_devices_survive_offline_with_evidence_distinct_from_installation() {
         let graph = KnowledgeGraph::in_memory().unwrap();

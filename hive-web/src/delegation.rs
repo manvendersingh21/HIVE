@@ -94,6 +94,19 @@ pub async fn events(
         Err(e) => error(e),
     }
 }
+pub async fn autonomy() -> Json<Value> {
+    Json(json!({ "mode": delegation::autonomy() }))
+}
+pub async fn set_autonomy(Json(body): Json<Value>) -> Response {
+    let mode = match serde_json::from_value::<delegation::Autonomy>(body["mode"].clone()) {
+        Ok(mode) => mode,
+        Err(_) => return (StatusCode::BAD_REQUEST, "mode must be yolo or ask").into_response(),
+    };
+    match delegation::set_autonomy(mode) {
+        Ok(()) => Json(json!({ "mode": mode })).into_response(),
+        Err(e) => error(e),
+    }
+}
 #[derive(Deserialize)]
 pub struct Decision {
     pub id: String,
@@ -241,13 +254,11 @@ async fn recovery_control(
         .agent
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Delegation unavailable"))?;
-    let worker = agent
-        .workers
-        .find(&run.assignment.device)
+    let worker = delegation::target(agent, &run.assignment.device)
         .ok_or_else(|| anyhow::anyhow!("Device removed from configured fleet"))?;
     let payload = request.map(|request| json!({"fingerprint":request.fingerprint,"reason":request.reason,"evidence":request.evidence,"acknowledge_ids":request.acknowledge_ids}));
     let result = transport::control(
-        &worker.info,
+        &worker,
         runner,
         if request.is_some() {
             "reconcile"
@@ -373,14 +384,12 @@ async fn sync_run(
         return Ok(());
     }
     let agent = h.agent.as_ref().unwrap();
-    let worker = agent
-        .workers
-        .find(&run.assignment.device)
+    let worker = delegation::target(agent, &run.assignment.device)
         .ok_or_else(|| anyhow::anyhow!("Device removed from configured fleet"))?;
     if run.state == "superseded" {
         if run.runner_path.is_some() {
             let _ = transport::ssh(
-                &worker.info,
+                &worker,
                 &format!(
                     "tmux kill-session -t {} 2>/dev/null || true",
                     transport::quote(&format!("={}", run.tmux_name))
@@ -421,7 +430,7 @@ async fn sync_run(
                 return Ok(());
             }
         }
-        let runner = transport::deploy(&worker.info).await?;
+        let runner = transport::deploy(&worker).await?;
         // Isolated SDK install is a routine prerequisite, never a permission bypass.
         if run.assignment.agent == "claude" {
             let directory = std::path::Path::new(&runner)
@@ -429,7 +438,7 @@ async fn sync_run(
                 .unwrap()
                 .to_string_lossy();
             let command=format!("cd {} && if python3 -c 'import sys; assert sys.version_info >= (3,10)' 2>/dev/null; then test -f .sdk/bin/python || python3 -m venv .sdk; env PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL= .sdk/bin/python -m pip install --index-url https://pypi.org/simple --timeout 15 --retries 1 --disable-pip-version-check claude-agent-sdk==0.2.152; else test -d node_modules/@anthropic-ai/claude-agent-sdk || npm install --ignore-scripts --no-audit --no-fund --save-exact @anthropic-ai/claude-agent-sdk@0.3.268; fi",transport::quote(&directory));
-            if let Err(error) = transport::ssh_timeout(&worker.info, &command, None, 180).await {
+            if let Err(error) = transport::ssh_timeout(&worker, &command, None, 180).await {
                 store.state(
                     &run.id,
                     "needs-setup",
@@ -441,18 +450,16 @@ async fn sync_run(
                 return Ok(());
             }
         }
-        // The probe starts every agent CLI to read versions and auth, which
-        // takes close to a minute on a loaded worker.
         let raw = transport::ssh_timeout(
-            &worker.info,
+            &worker,
             &format!("python3 {} probe", transport::quote(&runner)),
             None,
-            150,
+            inventory::PROBE_SECONDS,
         )
         .await?;
         inventory::project(
             &agent.memory.graph,
-            &worker.info.name,
+            &worker.name,
             &serde_json::from_str::<Vec<Value>>(&raw)?,
         )?;
         if let Some(reason) = delegation::setup_reason(agent, &run.assignment)? {
@@ -477,7 +484,7 @@ async fn sync_run(
             .collect::<Vec<_>>();
         let assignment = delegation::remote_assignment(run, &peers, executable);
         transport::control(
-            &worker.info,
+            &worker,
             &runner,
             "launch",
             &run.id,
@@ -491,14 +498,14 @@ async fn sync_run(
         return Ok(());
     };
     let raw =
-        transport::control(&worker.info, runner, "snapshot", &run.id, run.cursor, None).await?;
+        transport::control(&worker, runner, "snapshot", &run.id, run.cursor, None).await?;
     let mut snapshot: Value = serde_json::from_str(&raw)?;
     enrich_approvals(&mut snapshot, &store.recent_events(&run.id, 1000)?);
     let peers=json!(runs.iter().filter(|r|r.task_id==run.task_id && r.id!=run.id && r.state!="superseded").map(|r|json!({"id":r.id,"key":r.assignment.key,"device":r.assignment.device,"agent":r.assignment.agent})).collect::<Vec<_>>());
     if snapshot["metadata"]["assignment"].is_object()
         && snapshot["metadata"]["assignment"]["peers"] != peers
     {
-        transport::update_peers(&worker.info, &run.id, &peers).await?;
+        transport::update_peers(&worker, &run.id, &peers).await?;
     }
 
     // Stage outgoing peer messages before advancing the source event cursor.
@@ -541,7 +548,7 @@ async fn sync_run(
             transport::RUNNER
         );
         let raw = transport::ssh(
-            &worker.info,
+            &worker,
             &format!("python3 -c {} assess", transport::quote(&source)),
             Some(&action),
         )
@@ -557,11 +564,11 @@ async fn sync_run(
         }
     }
     for decision in store.pending_decisions(&run.id)? {
-        transport::control(&worker.info, runner, "decide", &run.id, 0, Some(&decision)).await?;
+        transport::control(&worker, runner, "decide", &run.id, 0, Some(&decision)).await?;
         store.decision_delivered(&run.id, decision["id"].as_str().unwrap())?;
     }
     for message in store.pending_messages(&run.id)? {
-        transport::control(&worker.info, runner, "enqueue", &run.id, 0, Some(&message)).await?;
+        transport::control(&worker, runner, "enqueue", &run.id, 0, Some(&message)).await?;
         store.message_delivered(message["id"].as_str().unwrap())?;
     }
     // Only a completed native invocation proves a model works; the runtime's

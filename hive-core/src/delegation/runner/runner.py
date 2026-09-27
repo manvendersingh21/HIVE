@@ -353,9 +353,14 @@ def policy(tool, args, workspace):
     return 'Tool or requested permissions need explicit review'
 
 
+def yolo(journal):
+    # Journals written before autonomy existed keep the reviewed policy.
+    return (journal.get('assignment') or {}).get('autonomy') == 'yolo'
+
+
 async def permission(journal, tool, args, workspace):
     reason = policy(tool, args, workspace)
-    if reason is None:
+    if reason is None or yolo(journal):
         return True
     ident = journal.pending(dict(tool=tool, arguments=args, workspace=workspace), reason)
     while True:
@@ -571,7 +576,7 @@ class Codex(JsonProcess):
             # tmux executes multiple command arguments directly; no shell text
             # from the worker is evaluated. Checkpoint precedes the side effect.
             process = subprocess.run([executable('tmux'), 'new-session', '-d', '-P', '-F', '#{pane_id}\t#{pane_pid}',
-                '-s', name, '-c', assignment['workspace'], *argv], capture_output=True, text=True, timeout=15, check=True)
+                '-s', name, '-c', assignment['workspace'], *without_hive_env(argv)], capture_output=True, text=True, timeout=15, check=True)
             pane = process.stdout.strip().split('\t')
             if len(pane) != 2 or not pane[1].isdigit():
                 raise ValueError('Service launch receipt is uncertain; inspect the owned tmux session')
@@ -593,6 +598,8 @@ class Codex(JsonProcess):
         if requested and requested not in available:
             raise RuntimeError('Unavailable Codex model: '+requested)
         params = dict(cwd=assignment['workspace'], approvalPolicy='untrusted', sandbox='workspace-write')
+        if assignment.get('autonomy') == 'yolo':
+            params.update(approvalPolicy='never', sandbox='danger-full-access')
         params['config'] = {'mcp_servers.hive': {'command': sys.executable, 'args': [str(Path(__file__).resolve()), 'mcp', '--run-id', assignment['id']]}}
         if requested:
             params['model'] = requested
@@ -744,8 +751,9 @@ class OpenCode:
         password = uuid.uuid4().hex + uuid.uuid4().hex
         self.url = 'http://127.0.0.1:'+str(port)
         self.auth = 'Basic '+base64.b64encode(('opencode:'+password).encode()).decode()
+        mode = 'allow' if assignment.get('autonomy') == 'yolo' else 'ask'
         env = dict(os.environ, OPENCODE_SERVER_PASSWORD=password,
-                   OPENCODE_CONFIG_CONTENT=encode({'permission': {'*': 'ask'}, 'agent': {'build': {'permission': {'*': 'ask'}}}}))
+                   OPENCODE_CONFIG_CONTENT=encode({'permission': {'*': mode}, 'agent': {'build': {'permission': {'*': mode}}}}))
         self.proc = await asyncio.create_subprocess_exec(executable('opencode'), 'serve', '--pure', '--hostname', '127.0.0.1', '--port', str(port),
                     cwd=assignment['workspace'], env=env, stdout=asyncio.subprocess.DEVNULL, stderr=sys.stderr)
         for attempt in range(40):
@@ -774,7 +782,7 @@ class OpenCode:
         self.model = dict(zip(('providerID', 'modelID'), model.split('/', 1)))
         self.native = journal.get('native_conversation_id')
         if not self.native:
-            session = await self.http('POST', '/session', {'title': assignment['objective'][:100], 'permission': [{'permission': '*', 'pattern': '*', 'action': 'ask'}]})
+            session = await self.http('POST', '/session', {'title': assignment['objective'][:100], 'permission': [{'permission': '*', 'pattern': '*', 'action': mode}]})
             self.native = session['id']
             journal.set('native_conversation_id', self.native)
         journal.set('actual_model', model)
@@ -1085,8 +1093,24 @@ def mcp_peer(journal):
         print(encode({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
 
 
+def hive_env_names(environ):
+    return sorted(name for name in environ if name.startswith('HIVE_'))
+
+
+def without_hive_env(argv):
+    # A tmux server started by Hive's web service keeps its credentials in the
+    # global environment, and every new pane inherits them. Drop them.
+    code, output = capture([executable('tmux'), 'show-environment', '-g'])
+    names = hive_env_names(dict(line.split('=', 1) for line in output.splitlines() if '=' in line)) if code == 0 else []
+    return ['env', *[arg for name in names for arg in ('-u', name)], *argv] if names else list(argv)
+
+
 def main():
     os.umask(0o077)
+    # Nothing here reads Hive's own variables; agents started below must not
+    # see them either.
+    for name in hive_env_names(os.environ):
+        del os.environ[name]
     parser = argparse.ArgumentParser()
     parser.add_argument('operation', choices=['probe', 'assess', 'launch', 'run', 'snapshot', 'enqueue', 'decide', 'peer', 'hook', 'mcp', 'reconcile-inspect', 'reconcile'])
     parser.add_argument('--run-id')
@@ -1117,7 +1141,8 @@ def main():
         assignment['workspace'] = str(workspace.resolve())
         existing = journal.get('assignment')
         if existing:
-            if existing != assignment:
+            # A retried launch keeps the autonomy it was first launched with.
+            if {**existing, 'autonomy': None} != {**assignment, 'autonomy': None}:
                 raise ValueError('Run ID reused with a different assignment')
             print(encode(dict(existing=True)))
             return
@@ -1165,7 +1190,7 @@ def main():
         assignment = journal.get('assignment')
         action = dict(tool=call.get('name'), arguments=call.get('args', {}), workspace=assignment['workspace'])
         reason = policy(action['tool'], action['arguments'], action['workspace'])
-        if not reason:
+        if not reason or assignment.get('autonomy') == 'yolo':
             print(encode(dict(decision='allow')))
             return
         # AGY cannot wait for stream permission messages. Deny before execution;

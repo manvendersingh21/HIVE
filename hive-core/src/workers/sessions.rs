@@ -122,6 +122,7 @@ mod tests {
             user: "azureuser".into(),
             port: None,
             tags: vec![],
+            local: false,
         }
     }
 

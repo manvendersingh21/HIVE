@@ -950,6 +950,20 @@ pub async fn add_fleet_worker(
         )
             .into_response());
     }
+    let valid_name = name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && !name.starts_with('-');
+    if !valid_name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Name may contain only letters, digits and . - _",
+        )
+            .into_response());
+    }
+    crate::ssh_setup::validate_host(&host)
+        .and(crate::ssh_setup::validate_user(&user))
+        .and(crate::ssh_setup::validate_port(req.port))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
 
     let info = hive_common::WorkerInfo {
         name,
@@ -957,6 +971,7 @@ pub async fn add_fleet_worker(
         user,
         port: req.port,
         tags: req.tags,
+        local: false,
     };
 
     agent
@@ -967,6 +982,7 @@ pub async fn add_fleet_worker(
     if let Err(e) = save_fleet_ui_addition(&info) {
         warn!(error = %e, worker = %info.name, "failed to persist added worker; it will not survive a restart");
     }
+    sync_ssh_config().await;
 
     // Probe the new worker (and re-probe the rest — the pool has no
     // single-worker refresh) so the response reflects real reachability
@@ -996,9 +1012,22 @@ pub async fn remove_fleet_worker(
     if let Err(e) = save_fleet_ui_removal(&name) {
         warn!(error = %e, worker = %name, "failed to persist worker removal; it will reappear on restart");
     }
+    sync_ssh_config().await;
 
     info!(worker = %name, "worker removed from fleet from settings UI");
     Ok(Json(fleet_view(agent).await))
+}
+
+/// Give machines added here Hive's SSH key where the user's own ssh config
+/// doesn't already cover them.
+async fn sync_ssh_config() {
+    let Some(paths) = crate::ssh_setup::SshPaths::from_env() else {
+        return;
+    };
+    let hosts: Vec<String> = load_fleet_ui_state().into_iter().map(|w| w.host).collect();
+    if let Err(e) = crate::ssh_setup::sync_managed_config(&paths, &hosts).await {
+        warn!(error = %e, "could not update Hive's managed ssh config");
+    }
 }
 
 fn fleet_ui_state_path() -> Option<std::path::PathBuf> {
