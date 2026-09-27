@@ -301,7 +301,7 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         // `Router::layer` wraps only what has been added when it is called, so
         // a `fallback_service` attached afterwards sits outside the gate — which
         // is where it was, serving every page shell (`/index.html`,
-        // `/incidents.html`, …) to anyone who could reach the port. No incident
+        // `/incidents/index.html`, …) to anyone who could reach the port. No incident
         // data leaked, since each page fetches its contents through a gated
         // `/api/` route, but the markup was public and the review page made that
         // worth fixing rather than noting. `require_auth` keeps `.css`/`.js` and
@@ -367,11 +367,12 @@ mod router_tests {
             "/incidents",
             "/terminal",
             "/session",
+            "/machines",
+            "/settings",
             "/index.html",
-            "/chat.html",
-            "/incidents.html",
-            "/machines.html",
-            "/terminal.html",
+            "/incidents/index.html",
+            "/machines/index.html",
+            "/terminal/index.html",
         ] {
             let response = app
                 .clone()
@@ -421,7 +422,7 @@ mod router_tests {
             .split(';')
             .next()
             .unwrap();
-        for path in ["/index.html", "/incidents.html", "/session/index.html"] {
+        for path in ["/index.html", "/incidents/index.html", "/session/index.html"] {
             let response = app
                 .clone()
                 .oneshot(

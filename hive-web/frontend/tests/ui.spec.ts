@@ -611,6 +611,49 @@ for (const [button, decision, note] of [
     ).toHaveAttribute("href", "/terminal/?name=ui-test&host=worker-a");
   });
 }
+// Incidents exist *because* a session printed something dangerous, and
+// `reason` quotes the matched line verbatim. Every field is untrusted process
+// output and must render as text, never as markup.
+test("incident fields from untrusted output render as inert text", async ({ page }) => {
+  const payload = '<img src=x onerror="window.__pwned=1"><script>window.__pwned=1</script>';
+  const hostile = {
+    ...incident,
+    worker: 'w<b id="injected">x</b>',
+    tmux_session: '"><svg onload="window.__pwned=1">',
+    analysis: { ...incident.analysis, reason: "matched: " + payload },
+    flagged_output: payload,
+  };
+  let dialogs = 0;
+  page.on("dialog", (dialog) => {
+    dialogs++;
+    void dialog.dismiss();
+  });
+  await page.route("**/api/incidents", (route) => route.fulfill({ json: [hostile] }));
+  await page.goto("/incidents/");
+  await expect(page.getByText(hostile.flagged_output, { exact: true })).toBeVisible();
+  await expect(page.getByText(hostile.analysis.reason, { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: /^Open w<b id="injected">x<\/b> \/ / })).toBeVisible();
+  await expect(page.locator("main img, main script, main svg, #injected")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();
+  expect(dialogs).toBe(0);
+});
+
+// Rendering through React's text nodes is what makes the test above hold;
+// a raw-HTML sink anywhere in the app would bypass it for whatever it renders.
+test("app source has no raw HTML sinks", async () => {
+  const { readdir } = await import("node:fs/promises");
+  const sinks = /dangerouslySetInnerHTML|\.innerHTML|\.outerHTML|insertAdjacentHTML|document\.write/;
+  const offenders: string[] = [];
+  for (const dir of ["app", "components", "lib"]) {
+    for (const entry of await readdir(resolve(__dirname, "..", dir), { recursive: true })) {
+      if (![".ts", ".tsx"].includes(extname(entry))) continue;
+      const file = resolve(__dirname, "..", dir, entry);
+      if (sinks.test(await readFile(file, "utf8"))) offenders.push(`${dir}/${entry}`);
+    }
+  }
+  expect(offenders).toEqual([]);
+});
+
 test("canceling incident note sends no decision; server failures display", async ({
   page,
 }) => {
