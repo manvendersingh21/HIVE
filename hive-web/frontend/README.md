@@ -7,8 +7,11 @@ API and WebSocket endpoints.
 ```bash
 npm ci
 npm run build
-cp -R out/. ../static/
+rsync -a --delete out/ ../static/
 ```
+
+`../static/` is build output and is not committed. `scripts/run-hive-web.sh`
+rebuilds it when this source changes, so restarting the service is enough.
 
 The pages are implemented in `app/`: agent chat, sessions, machines,
 incidents, login, and the xterm-backed terminal.

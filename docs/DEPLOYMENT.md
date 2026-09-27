@@ -37,14 +37,17 @@ export HIVE_MASTER_NAME="your-master-name"
 export RUST_LOG="hive_web=info,hive_core=info"
 ```
 
-The browser frontend is a TypeScript Next.js app exported as static files. When
-the UI changes, rebuild it before rebuilding the Rust service:
+The browser frontend is a TypeScript Next.js app exported as static files. The
+export is not committed: `hive-web/static/` is build output. The launch script
+below (`scripts/run-hive-web.sh`) rebuilds it at startup whenever the frontend
+source is newer than the last build, so it needs Node.js and npm on the host.
+To build it by hand instead:
 
 ```bash
 cd hive-web/frontend
 npm ci
 npm run build
-cp -R out/. ../static/
+rsync -a --delete out/ ../static/
 cd ../..
 cargo build --release -p hive-web
 ```
@@ -98,7 +101,9 @@ RUST_LOG=hive_web=info,hive_core=info
 
 ### Launch Script
 
-For systems using alternative init systems, create a launch script that sources the environment properly:
+`scripts/run-hive-web.sh` is the reference launch script: it sources the
+environment, rebuilds the frontend export when needed, and starts the service.
+Its essentials, for systems that need their own:
 
 ```bash
 #!/bin/bash

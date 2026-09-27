@@ -360,7 +360,14 @@ mod router_tests {
             workers: workers::WorkerIngest::from_env(),
             incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()),
         };
-        let app = app_router(state, concat!(env!("CARGO_MANIFEST_DIR"), "/static"));
+        // The frontend export isn't in git; stand in for the pages it ships.
+        let dir = std::env::temp_dir().join(format!("hive-web-gate-{}", uuid::Uuid::new_v4()));
+        for file in ["index.html", "login/index.html", "incidents/index.html", "session/index.html"] {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("<p>{file}</p>")).unwrap();
+        }
+        let app = app_router(state, dir.to_str().unwrap());
         for path in [
             "/",
             "/sessions",
@@ -435,6 +442,7 @@ mod router_tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "authenticated {path}");
         }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
