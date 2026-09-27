@@ -37,8 +37,7 @@ pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
         let history=h.history.as_ref().unwrap();
         let context=history.context(&turn)?;
         let plan=tokio::time::timeout(std::time::Duration::from_secs(240),delegation::plan(agent,&turn.user_input,&context.join("\n"))).await??;
-        let runs=store(&h)?.create(&turn.id,&turn.conversation_id,&plan)?;
-        let reply=json!({"conversation_id":turn.conversation_id,"delegation":{"task_id":turn.id,"summary":plan.summary,"runs":runs}});
+        let reply=start_plan(agent,&store(&h)?,&turn.id,&turn.conversation_id,&plan).await?;
         // A detached run owns its own state. Finishing the receipt keeps this
         // conversation's composer available while the real agents work.
         history.finish(&turn.id,"completed",&plan.summary,Some(&reply))?;
@@ -53,6 +52,72 @@ pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
             error(e)
         }
     }
+}
+
+/// How long Hive gives one container to be created, image build included.
+const CONTAINER_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+/// How long to wait for a new container's agents to be probed.
+const CONTAINER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+
+/// Create the plan's containers, then its runs. A container that can't be
+/// created stops the whole plan before any agent starts; nothing is retried.
+async fn start_plan(
+    agent: &hive_core::agent::MasterAgent,
+    store: &RunStore,
+    task_id: &str,
+    conversation_id: &str,
+    plan: &delegation::DelegationPlan,
+) -> anyhow::Result<Value> {
+    let created = create_containers(agent, plan).await?;
+    let runs = store.create(task_id, conversation_id, plan)?;
+    Ok(json!({"conversation_id":conversation_id,"delegation":{
+        "task_id":task_id,"summary":plan.summary,"runs":runs,"containers_created":created}}))
+}
+
+async fn create_containers(
+    agent: &hive_core::agent::MasterAgent,
+    plan: &delegation::DelegationPlan,
+) -> anyhow::Result<Vec<String>> {
+    let mut created = Vec::new();
+    for planned in &plan.containers {
+        let result = async {
+            let machine = delegation::machine(agent, &planned.host)
+                .ok_or_else(|| anyhow::anyhow!("{} is not a configured machine", planned.host))?;
+            let taken: Vec<String> =
+                delegation::targets(agent).into_iter().map(|t| t.name).collect();
+            tokio::time::timeout(
+                CONTAINER_CREATE_TIMEOUT,
+                delegation::containers::create(&machine, &planned.name, &taken),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out"))?
+        }
+        .await;
+        if let Err(e) = result {
+            anyhow::bail!(
+                "Could not create container {} on {}: {e}. No agents were started.",
+                planned.name,
+                planned.host
+            );
+        }
+        tracing::info!(container = %planned.name, host = %planned.host, "planner created a container");
+        created.push(planned.name.clone());
+    }
+    if !created.is_empty() {
+        // Setup checks read the inventory, so learn the new agents first.
+        let names: Vec<&str> = created.iter().map(String::as_str).collect();
+        match tokio::time::timeout(
+            CONTAINER_PROBE_TIMEOUT,
+            delegation::inventory::refresh_devices(agent, &names),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "probing new containers failed"),
+            Err(_) => tracing::warn!("probing new containers timed out"),
+        }
+    }
+    Ok(created)
 }
 
 #[derive(Default, Deserialize)]
@@ -194,6 +259,7 @@ pub async fn replace(
         let plan = delegation::DelegationPlan {
             summary: "Move assignment while retaining peer work".into(),
             assignments: vec![assignment.clone()],
+            containers: vec![],
         };
         delegation::validate(&plan, h.agent.as_ref().unwrap())?;
         store.replace(&id, &assignment)
@@ -705,6 +771,25 @@ mod tests {
         assert_eq!(ids(q(Some("working"), None)).await, 0);
         assert_eq!(ids(q(None, Some(&id))).await, 1);
         assert_eq!(ids(q(None, Some("unknown-run"))).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_container_that_cant_be_created_starts_no_agents() {
+        let h = handle();
+        let agent = h.agent.as_ref().unwrap();
+        let store = store(&h).unwrap();
+        let mut plan: delegation::DelegationPlan = serde_json::from_value(json!({"summary":"work","assignments":[
+            {"key":"a","device":"box","agent":"codex","model":null,"workspace":"~/hive-workspaces/t","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        plan.containers = vec![delegation::NewContainer { name: "box".into(), host: "master".into() }];
+        let err = start_plan(agent, &store, "task", "chat", &plan).await.unwrap_err().to_string();
+        assert!(err.starts_with("Could not create container box on "), "{err}");
+        assert!(err.ends_with("No agents were started."), "{err}");
+        assert!(store.list().unwrap().is_empty());
+        // A plan without containers creates its runs as before.
+        plan.containers.clear();
+        let reply = start_plan(agent, &store, "task", "chat", &plan).await.unwrap();
+        assert_eq!(reply["delegation"]["containers_created"], json!([]));
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 
     #[tokio::test]
