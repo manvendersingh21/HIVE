@@ -94,6 +94,19 @@ pub fn remove(name: &str) -> anyhow::Result<Container> {
     Ok(removed)
 }
 
+/// Create a Hive-managed container named `name` on `machine` (a fleet machine
+/// or the coordinator, never a container) from Hive's agent base image, with
+/// the machine's agent logins mounted in, and register it with `managed: true`.
+/// `taken` is every existing device name. Only Hive's own planner calls this.
+pub async fn create(
+    machine: &hive_common::protocol::WorkerInfo,
+    name: &str,
+    taken: &[String],
+) -> anyhow::Result<Container> {
+    let _ = (machine, name, taken);
+    anyhow::bail!("Creating containers is not implemented yet")
+}
+
 /// Run `command` inside the container, as a login shell so the image's PATH
 /// applies. `-i` keeps stdin: the runner reads its JSON input from it.
 pub fn exec(container: &str, command: &str, tty: bool) -> String {
