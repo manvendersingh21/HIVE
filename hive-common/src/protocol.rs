@@ -399,6 +399,11 @@ pub struct WorkerInfo {
     #[serde(skip)]
     #[schemars(skip)]
     pub local: bool,
+    /// A Docker container on the machine above: commands run through
+    /// `docker exec` there. Set only by Hive's container registry.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub container: Option<String>,
 }
 
 impl WorkerInfo {
@@ -691,6 +696,7 @@ mod tests {
             port: None,
             tags: vec!["gpu".to_string()],
             local: false,
+            container: None,
         };
         assert_eq!(worker.ssh_target(), "admin@192.168.1.101");
     }

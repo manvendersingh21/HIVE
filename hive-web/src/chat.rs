@@ -77,7 +77,7 @@ impl AgentHandle {
         })
     }
 
-    fn require(&self) -> Result<&Arc<MasterAgent>, Response> {
+    pub(crate) fn require(&self) -> Result<&Arc<MasterAgent>, Response> {
         self.agent.as_ref().ok_or_else(|| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -972,6 +972,7 @@ pub async fn add_fleet_worker(
         port: req.port,
         tags: req.tags,
         local: false,
+        container: None,
     };
 
     agent

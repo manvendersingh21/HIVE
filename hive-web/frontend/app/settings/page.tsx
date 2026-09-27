@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { Shell } from "../../components/Nav";
 import { ConnectionCheck, HiveKey, KeyInfo } from "../../components/SshSetup";
+import { Containers } from "../../components/Containers";
 
 type Provider = "local" | "zai" | "nvidia";
 type Autonomy = "yolo" | "ask";
@@ -390,6 +391,7 @@ export default function SettingsPage() {
             </>
           )}
         </section>
+        <Containers />
       </main>
     </Shell>
   );

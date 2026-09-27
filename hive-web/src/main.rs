@@ -9,6 +9,7 @@
 
 mod auth;
 mod chat;
+mod containers;
 mod delegation;
 mod incidents;
 mod sessions;
@@ -249,6 +250,10 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
             "/api/settings/master-agent",
             get(chat::master_agent_settings).post(chat::set_master_agent),
         )
+        .route("/api/containers", get(containers::list).post(containers::add))
+        .route("/api/containers/hosts", get(containers::hosts))
+        .route("/api/containers/available", get(containers::available))
+        .route("/api/containers/{name}", axum::routing::delete(containers::remove))
         .route(
             "/api/settings/autonomy",
             get(delegation::autonomy).post(delegation::set_autonomy),
@@ -335,6 +340,7 @@ mod router_tests {
                 port: None,
                 tags: vec![],
                 local: false,
+                container: None,
             }]),
             hive_core::skills::SkillRegistry::new(),
             hive_core::memory::MemorySystem::new(),
@@ -544,7 +550,8 @@ fn session_worker(
     }
     match h.agent.as_ref().and_then(|a| hive_core::delegation::target(a, host)) {
         // An agent run on the coordinator names its device, not "local".
-        Some(t) if t.local => Ok(None),
+        // A container on the coordinator still goes through `docker exec`.
+        Some(t) if t.local && t.container.is_none() => Ok(None),
         Some(t) => Ok(Some(t)),
         None => Err((StatusCode::NOT_FOUND, "unknown worker").into_response()),
     }
@@ -554,11 +561,10 @@ async fn session_hosts(State(h): State<chat::AgentHandle>) -> Json<serde_json::V
     let mut hosts = vec![serde_json::json!({"host": "local", "name": h.master_name})];
     if let Some(agent) = h.agent {
         hosts.extend(
-            agent
-                .workers
-                .snapshot()
+            hive_core::delegation::targets(&agent)
                 .iter()
-                .map(|w| serde_json::json!({"host": w.info.name, "name": w.info.name})),
+                .filter(|t| !t.local || t.container.is_some())
+                .map(|t| serde_json::json!({"host": t.name, "name": t.name})),
         );
     }
     Json(serde_json::json!(hosts))
@@ -570,9 +576,14 @@ async fn list_sessions(State(h): State<chat::AgentHandle>) -> Response {
         async {
             match &h.agent {
                 Some(agent) => {
-                    let fleet = agent.workers.snapshot();
-                    futures::future::join_all(fleet.iter().map(|w| async {
-                        (w.info.name.clone(), sessions::list_on(&w.info).await)
+                    // The SSH fleet plus registered containers; the coordinator
+                    // itself is the local listing above.
+                    let devices: Vec<_> = hive_core::delegation::targets(agent)
+                        .into_iter()
+                        .filter(|t| !t.local || t.container.is_some())
+                        .collect();
+                    futures::future::join_all(devices.iter().map(|w| async {
+                        (w.name.clone(), sessions::list_on(w).await)
                     }))
                     .await
                 }
@@ -599,7 +610,7 @@ async fn list_sessions(State(h): State<chat::AgentHandle>) -> Response {
                 let host = match h.agent.as_deref().and_then(|a| {
                     hive_core::delegation::target(a, &run.assignment.device)
                 }) {
-                    Some(t) if t.local => sessions::local_host(),
+                    Some(t) if t.local && t.container.is_none() => sessions::local_host(),
                     _ => run.assignment.device.clone(),
                 };
                 if let Some(session) = list

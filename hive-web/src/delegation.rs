@@ -707,6 +707,24 @@ mod tests {
         assert_eq!(ids(q(None, Some("unknown-run"))).await, 0);
     }
 
+    #[tokio::test]
+    async fn an_unreachable_container_is_unknown_not_gone() {
+        // No such container (or no Docker at all): docker exec fails, which
+        // says nothing about the agent's session inside it.
+        let h = handle();
+        let run = store(&h).unwrap().get(&run_with_events(&h, 0)).unwrap();
+        let worker = hive_common::protocol::WorkerInfo {
+            name: "dev-box".into(),
+            host: "localhost".into(),
+            user: "u".into(),
+            port: None,
+            tags: vec![],
+            local: true,
+            container: Some(format!("hive-test-missing-{}", uuid::Uuid::new_v4().simple())),
+        };
+        assert_eq!(session_alive(&worker, &run).await, None);
+    }
+
     #[test]
     fn runs_whose_session_ended_are_never_synced_again() {
         let h = handle();

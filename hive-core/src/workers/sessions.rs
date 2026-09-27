@@ -123,6 +123,7 @@ mod tests {
             port: None,
             tags: vec![],
             local: false,
+            container: None,
         }
     }
 

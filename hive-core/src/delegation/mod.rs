@@ -1,5 +1,6 @@
 //! Durable fleet delegation. Remote journals own native conversations; the
 //! coordinator synchronizes evidence and never retries uncertain launches.
+pub mod containers;
 pub mod inventory;
 pub mod review;
 pub mod store;
@@ -70,8 +71,23 @@ fn repair_workspaces(plan: &mut DelegationPlan) {
 }
 
 /// Where delegated work for `device` runs. A configured SSH worker wins; the
-/// coordinator's own name runs agents here without SSH.
+/// coordinator's own name runs agents here without SSH; a registered
+/// container runs them inside Docker on its machine.
 pub fn target(agent: &MasterAgent, device: &str) -> Option<WorkerInfo> {
+    resolve(agent, device, &containers::load())
+}
+
+fn resolve(agent: &MasterAgent, device: &str, registered: &[containers::Container]) -> Option<WorkerInfo> {
+    machine(agent, device).or_else(|| {
+        registered
+            .iter()
+            .find(|c| c.name == device)
+            .and_then(|c| in_container(agent, c))
+    })
+}
+
+/// A fleet machine or the coordinator, never a container.
+pub fn machine(agent: &MasterAgent, device: &str) -> Option<WorkerInfo> {
     if let Some(worker) = agent.workers.find(device) {
         return Some(worker.info);
     }
@@ -82,13 +98,25 @@ pub fn target(agent: &MasterAgent, device: &str) -> Option<WorkerInfo> {
         port: None,
         tags: vec![],
         local: true,
+        container: None,
     })
 }
 
-/// Every device delegation can reach: the SSH fleet plus the coordinator.
+/// The container's machine, addressed as the container. `local` comes from
+/// the machine, never from the registry file.
+fn in_container(agent: &MasterAgent, c: &containers::Container) -> Option<WorkerInfo> {
+    let mut info = machine(agent, &c.host)?;
+    info.name = c.name.clone();
+    info.container = Some(c.container.clone());
+    Some(info)
+}
+
+/// Every device delegation can reach: the SSH fleet, the coordinator and the
+/// registered containers whose machine is still configured.
 pub fn targets(agent: &MasterAgent) -> Vec<WorkerInfo> {
     let mut all: Vec<WorkerInfo> = agent.workers.snapshot().into_iter().map(|w| w.info).collect();
-    all.extend(target(agent, agent.master_name()).filter(|t| t.local));
+    all.extend(machine(agent, agent.master_name()).filter(|t| t.local));
+    all.extend(containers::load().iter().filter_map(|c| in_container(agent, c)));
     all
 }
 
@@ -202,10 +230,11 @@ pub fn names_coordinator(request: &str, master: &str) -> bool {
 }
 
 /// Agents on the coordinator sit next to Hive's own config and database, so
-/// work goes there only when the user asks for that machine by name.
+/// work goes there only when the user asks for that machine by name. A
+/// container on the coordinator is walled off from both and needs no ask.
 fn validate_coordinator(request: &str, plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
     for a in &plan.assignments {
-        if target(agent, &a.device).is_some_and(|t| t.local) {
+        if target(agent, &a.device).is_some_and(|t| t.local && t.container.is_none()) {
             anyhow::ensure!(
                 names_coordinator(request, agent.master_name()),
                 "{} is the Hive coordinator; place work there only when the user names it",
@@ -465,6 +494,7 @@ mod tests {
                 port: None,
                 tags: vec!["light".into()],
                 local: false,
+                container: None,
             }]),
             crate::skills::SkillRegistry::new(),
             crate::memory::MemorySystem::new(),
@@ -514,6 +544,28 @@ mod tests {
         .unwrap();
         agent
     }
+    #[test]
+    fn containers_resolve_through_their_machine_and_never_shadow_one() {
+        let agent = agent();
+        let c = |name: &str, host: &str| containers::Container {
+            name: name.into(),
+            host: host.into(),
+            container: format!("{name}-docker"),
+            managed: false,
+            image: None,
+        };
+        let registered = [c("box", "air"), c("here", agent.master_name()), c("air", "air"), c("lost", "gone")];
+        let on_worker = resolve(&agent, "box", &registered).unwrap();
+        assert_eq!((on_worker.host.as_str(), on_worker.local), ("ssh-alias", false));
+        assert_eq!(on_worker.container.as_deref(), Some("box-docker"));
+        let here = resolve(&agent, "here", &registered).unwrap();
+        assert!(here.local && here.container.as_deref() == Some("here-docker"));
+        // The fleet machine wins over a same-named container.
+        assert_eq!(resolve(&agent, "air", &registered).unwrap().container, None);
+        // A container whose machine left the fleet resolves to nothing.
+        assert!(resolve(&agent, "lost", &registered).is_none());
+    }
+
     #[test]
     fn the_coordinator_runs_agents_locally_unless_a_worker_has_its_name() {
         let agent = coordinator("mac-mini");

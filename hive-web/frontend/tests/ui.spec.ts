@@ -94,6 +94,8 @@ async function defaults(page: Page) {
         { host: "worker-a", name: "worker-a" },
       ],
       "/api/incidents": [incident],
+      "/api/containers": [],
+      "/api/containers/hosts": ["local"],
       "/api/machines": {
         entities: [
           {
@@ -2194,5 +2196,91 @@ test.describe("polling", () => {
     before = fetches;
     await advance(10);
     expect(fetches - before).toBeGreaterThanOrEqual(4);
+  });
+});
+
+test.describe("containers", () => {
+  const registered = {
+    name: "dev-box",
+    host: "local",
+    container: "box",
+    managed: false,
+    reachable: true,
+    missing: ["tmux"],
+    agents: ["codex"],
+  };
+
+  test("lists, adds and removes containers without touching Docker", async ({ page }) => {
+    let items: unknown[] = [registered];
+    let added: unknown;
+    let removed = "";
+    await page.route("**/api/containers", (route) => {
+      if (route.request().method() === "POST") {
+        added = route.request().postDataJSON();
+        items = [...items, { ...registered, name: "web", container: "web-1", missing: [] }];
+        return route.fulfill({ status: 201, json: { name: "web" } });
+      }
+      return route.fulfill({ json: items });
+    });
+    await page.route("**/api/containers/hosts", (route) => route.fulfill({ json: ["local", "worker-a"] }));
+    await page.route("**/api/containers/available?*", (route) =>
+      route.fulfill({
+        json: [
+          { container: "web-1", image: "python:3.12", status: "Up 2 hours", running: true },
+          { container: "old", image: "alpine", status: "Exited (0)", running: false },
+        ],
+      }),
+    );
+    await page.route("**/api/containers/dev-box", (route) => {
+      removed = route.request().method();
+      items = items.slice(1);
+      return route.fulfill({ status: 204 });
+    });
+    await page.goto("/settings/");
+    const box = page.locator('[data-container="dev-box"]');
+    await expect(box).toContainText("box on local");
+    await expect(box).toContainText("Agents: codex · Missing: tmux");
+
+    await page.getByLabel("Docker machine").selectOption("worker-a");
+    await page.getByRole("button", { name: "List containers" }).click();
+    // Stopped containers can't run agents, so they can't be picked.
+    await expect(page.getByRole("radio", { name: /old/ })).toBeDisabled();
+    await page.getByRole("radio", { name: /web-1/ }).check();
+    await expect(page.getByLabel("Name in Hive")).toHaveValue("web-1");
+    await page.getByLabel("Name in Hive").fill("web");
+    await page.getByRole("button", { name: "Add container" }).click();
+    await expect(page.getByRole("status")).toContainText("Added web");
+    expect(added).toEqual({ name: "web", host: "worker-a", container: "web-1" });
+    await expect(page.locator('[data-container="web"]')).toBeVisible();
+
+    await box.getByRole("button", { name: "Remove" }).click();
+    await expect(page.getByRole("status")).toContainText("The container itself is still there");
+    expect(removed).toBe("DELETE");
+    await expect(box).toHaveCount(0);
+  });
+
+  test("a machine whose Docker refuses says why", async ({ page }) => {
+    await page.route("**/api/containers", (route) => route.fulfill({ json: [] }));
+    await page.route("**/api/containers/hosts", (route) => route.fulfill({ json: ["cis-a6000"] }));
+    await page.route("**/api/containers/available?*", (route) =>
+      route.fulfill({ status: 502, body: "permission denied while trying to connect to the Docker daemon socket" }),
+    );
+    await page.goto("/settings/");
+    await expect(page.getByText("No containers added.")).toBeVisible();
+    await page.getByRole("button", { name: "List containers" }).click();
+    await expect(page.locator('p[role="alert"]')).toHaveText(
+      "Docker on cis-a6000: permission denied while trying to connect to the Docker daemon socket",
+    );
+  });
+
+  test("an unreachable container shows its error and can't open a shell", async ({ page }) => {
+    await page.route("**/api/containers", (route) =>
+      route.fulfill({ json: [{ ...registered, reachable: false, error: "No such container: box" }] }),
+    );
+    await page.route("**/api/containers/hosts", (route) => route.fulfill({ json: ["local"] }));
+    await page.goto("/settings/");
+    const box = page.locator('[data-container="dev-box"]');
+    await expect(box).toContainText("No such container: box");
+    await expect(box.getByRole("button", { name: "Open shell" })).toBeDisabled();
   });
 });

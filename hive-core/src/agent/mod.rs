@@ -871,10 +871,19 @@ impl MasterAgent {
             async move { machines::probe_remote(&name, &target, tags).await }
         });
 
-        let results = futures::future::join_all(probes).await;
+        // Containers sit on a machine above, so they're probed the same round.
+        let containers: Vec<hive_common::protocol::WorkerInfo> = crate::delegation::targets(self)
+            .into_iter()
+            .filter(|t| t.container.is_some())
+            .collect();
+        let (results, container_facts) = futures::future::join(
+            futures::future::join_all(probes),
+            futures::future::join_all(containers.iter().map(machines::probe_container)),
+        )
+        .await;
         let mut count = 1;
-        for facts in results {
-            machines::project_into_graph(&self.memory.graph, &facts)?;
+        for facts in results.iter().chain(&container_facts) {
+            machines::project_into_graph(&self.memory.graph, facts)?;
             count += 1;
         }
 
@@ -885,6 +894,7 @@ impl MasterAgent {
         // the planner to keep proposing it.
         let known: Vec<String> = std::iter::once(self.master_name.clone())
             .chain(fleet.iter().map(|w| w.info.name.clone()))
+            .chain(containers.iter().map(|c| c.name.clone()))
             .collect();
         let pruned = machines::prune_unknown(&self.memory.graph, &known)?;
         if !pruned.is_empty() {
@@ -955,6 +965,7 @@ mod placement_tests {
                     port: None,
                     tags: vec![],
                     local: false,
+                    container: None,
                 })
                 .collect(),
         );
