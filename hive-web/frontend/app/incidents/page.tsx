@@ -1,8 +1,9 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useRef, useState } from "react";
 import Link from "next/link";
 import { api, terminalUrl } from "../../lib/api";
 import { Shell } from "../../components/Nav";
+import { usePoll } from "../../lib/poll";
 type Incident = {
   id: string;
   worker: string;
@@ -23,25 +24,25 @@ export default function IncidentsPage() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
-  useEffect(() => {
-    let cancelled = false;
-    async function load() {
+  const [loadError, setLoadError] = useState("");
+  // Drop a reply that arrives after "Show history" was toggled.
+  const showing = useRef(all);
+  showing.current = all;
+  usePoll(
+    async () => {
+      const wanted = all;
       try {
-        const data = await api<Incident[]>(
-          `/api/incidents${all ? "?all=1" : ""}`,
-        );
-        if (!cancelled) setItems(data);
+        const data = await api<Incident[]>(`/api/incidents${wanted ? "?all=1" : ""}`);
+        if (showing.current !== wanted) return;
+        setItems(data);
+        setLoadError("");
       } catch (e) {
-        if (!cancelled) setError((e as Error).message);
+        setLoadError((e as Error).message);
       }
-    }
-    void load();
-    const timer = setInterval(() => void load(), 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [all]);
+    },
+    5000,
+    [all],
+  );
   async function decide(item: Incident, kind: string) {
     let decision: string | Record<string, string> = kind;
     if (kind === "resume_with_note" || kind === "modify_and_resume") {
@@ -93,9 +94,9 @@ export default function IncidentsPage() {
             Show history
           </label>
         </div>
-        {error && (
+        {(error || loadError) && (
           <p role="alert" className="error">
-            {error}
+            {error || loadError}
           </p>
         )}
         {notice && <p role="status">{notice}</p>}

@@ -1,9 +1,10 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { api } from "../../lib/api";
 import { TERMINAL_STATES } from "../../lib/runEvents";
 import { Shell } from "../../components/Nav";
+import { usePoll } from "../../lib/poll";
 import {
   Run,
   RunAttention,
@@ -25,19 +26,20 @@ export default function SessionPage() {
   useEffect(() => {
     setId(new URLSearchParams(window.location.search).get("run") || "");
   }, []);
+  const current = useRef(id);
+  current.current = id;
+  // Only this run's task: its siblings, not every run Hive has ever made.
   const load = useCallback(async () => {
+    if (!id) return;
     try {
-      setRuns(await api<Run[]>("/api/runs"));
+      const data = await api<Run[]>(`/api/runs?task_of=${encodeURIComponent(id)}`);
+      if (current.current === id) setRuns(data);
       setError("");
     } catch (e) {
       setError((e as Error).message);
     }
-  }, []);
-  useEffect(() => {
-    void load();
-    const timer = setInterval(() => void load(), 3000);
-    return () => clearInterval(timer);
-  }, [load]);
+  }, [id]);
+  usePoll(load, 3000, [load]);
   const run = runs?.find((r) => r.id === id);
   const siblings = run ? runs!.filter((r) => r.task_id === run.task_id) : [];
   const { events, error: eventsError, earlier, loadingEarlier } = useRunEvents(

@@ -847,7 +847,7 @@ test("chat run cards show both agents, approvals, setup retry and link to the se
 });
 test("session page renders a readable transcript and streams new events", async ({ page }) => {
   const requests: string[] = [];
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/events*", (route) => {
     const query = new URL(route.request().url()).searchParams;
     requests.push(query.toString());
@@ -882,7 +882,7 @@ test("session opened at its tail can page back to earlier activity", async ({ pa
     kind: "native",
     payload: { method: "item/completed", params: { item: { type: "agentMessage", text } } },
   });
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [{ ...run, state: "completed" }] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [{ ...run, state: "completed" }] }));
   await page.route("**/api/runs/run-1/events*", (route) => {
     const query = new URL(route.request().url()).searchParams;
     if (query.get("tail")) return route.fulfill({ json: [message(700, "Newest update")] });
@@ -905,7 +905,7 @@ test("failed session explains why and queued session names what it waits for", a
     state: "queued",
     assignment: { ...run.assignment, key: "consumer", device: "worker-b", dependencies: ["codex-a"] },
   };
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [failed, queued] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [failed, queued] }));
   await page.route("**/api/runs/*/events*", (route) =>
     route.fulfill({
       json: route.request().url().includes("run-1")
@@ -1030,6 +1030,8 @@ test("Hive replies render Markdown as elements, never as HTML", async ({ page })
 });
 
 test("the chat follows new replies unless the reader has scrolled up", async ({ page }) => {
+  // An idle chat refreshes every 15s; skip the wait.
+  await page.clock.install();
   await page.setViewportSize({ width: 1000, height: 500 });
   const messages = Array.from({ length: 30 }, (_, i) => ({
     role: i % 2 ? "assistant" : "user",
@@ -1041,10 +1043,12 @@ test("the chat follows new replies unless the reader has scrolled up", async ({ 
   const feed = page.locator(".chat-feed");
   await expect(page.getByText("message 29")).toBeInViewport();
   messages.push({ role: "assistant", content: "message 30", status: "completed" });
+  await page.clock.runFor(16000);
   await expect(page.getByText("message 30")).toBeInViewport();
   await feed.evaluate((el) => el.scrollTo({ top: 0 }));
   await expect(page.getByText("message 0", { exact: true })).toBeInViewport();
   messages.push({ role: "assistant", content: "message 31", status: "completed" });
+  await page.clock.runFor(16000);
   await expect(page.getByText("message 31")).toBeAttached();
   await expect(page.getByText("message 0", { exact: true })).toBeInViewport();
 });
@@ -1363,7 +1367,7 @@ test("agent message preserves a new draft typed while sending", async ({ page })
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let received: any;
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/messages", async (route) => {
     received = route.request().postDataJSON();
     await gate;
@@ -1381,7 +1385,7 @@ test("agent message preserves a new draft typed while sending", async ({ page })
 });
 
 test("fleet message failure retains draft", async ({ page }) => {
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/messages", (route) =>
     route.fulfill({ status: 503, body: "Agent unreachable" }),
   );
@@ -1823,7 +1827,7 @@ test.describe("delegated sessions", () => {
     await page.goto("/machines/");
     await expect(page.getByRole("heading", { name: "Machines" })).toBeVisible();
     await expect(page.locator(".nav-count")).toHaveCount(0);
-    await page.route(/\/api\/runs$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
+    await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
     await page.goto("/incidents/");
     await expect(page.locator(".nav-count")).toHaveCount(0);
     await expect(page.locator('p[role="alert"]')).toHaveCount(0);
@@ -1897,7 +1901,7 @@ test.describe("delegated sessions", () => {
   });
 
   test("session page reports a runs API failure", async ({ page }) => {
-    await page.route(/\/api\/runs$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
+    await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
     await page.goto("/session/?run=run-1");
     await expect(page.locator('main [role="alert"]')).toHaveText("Delegation unavailable");
   });
@@ -2088,5 +2092,107 @@ test.describe("delegated sessions", () => {
     await page.reload();
     await expect(page.getByText("No agent sessions yet.", { exact: false })).toBeVisible();
     await expect(page.getByText("No terminal sessions. Start one above.")).toBeVisible();
+  });
+});
+
+test.describe("polling", () => {
+  // Pretend the tab is hidden or shown, the way a browser does on tab switch.
+  async function setHidden(page: Page, hidden: boolean) {
+    await page.evaluate((value) => {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => value });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }, hidden);
+  }
+
+  for (const [path, api, empty] of [
+    ["/sessions/", "**/api/sessions", "No terminal sessions. Start one above."],
+    ["/incidents/", "**/api/incidents", "No incidents recorded."],
+  ]) {
+    test(`a failed refresh on ${path} clears once refreshing works again`, async ({ page }) => {
+      await page.clock.install();
+      let failing = true;
+      await page.route(api, (route) =>
+        failing ? route.fulfill({ status: 502, body: "worker unreachable" }) : route.fulfill({ json: [] }),
+      );
+      await page.goto(path);
+      await expect(page.locator('p[role="alert"]')).toHaveText("worker unreachable");
+      failing = false;
+      await page.clock.runFor(10000);
+      await expect(page.locator('p[role="alert"]')).toHaveCount(0);
+      await expect(page.getByText(empty)).toBeVisible();
+    });
+  }
+
+  test("an action's error is not cleared by the next refresh", async ({ page }) => {
+    await page.clock.install();
+    await page.route("**/api/sessions/*", (route) => route.fulfill({ status: 502, body: "SSH unavailable" }));
+    await page.goto("/sessions/");
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Kill" }).click();
+    await expect(page.locator('p[role="alert"]')).toHaveText("SSH unavailable");
+    await page.clock.runFor(20000);
+    await expect(page.locator('p[role="alert"]')).toHaveText("SSH unavailable");
+  });
+
+  test("a hidden tab stops polling and refreshes when shown again", async ({ page }) => {
+    await page.clock.install();
+    const requests: string[] = [];
+    await page.route(/\/api\/runs(\?.*)?$/, (route) => {
+      requests.push(new URL(route.request().url()).search);
+      return route.fulfill({ json: [{ ...run, state: "awaiting-approval" }] });
+    });
+    await page.goto("/machines/");
+    await expect(page.locator(".nav-count")).toHaveText("1");
+    // The badge asks only for the runs it counts.
+    expect(requests[0]).toBe("?state=awaiting-approval,needs-setup");
+    await setHidden(page, true);
+    await page.clock.runFor(15000);
+    const whileVisible = requests.length;
+    await page.clock.runFor(60000);
+    expect(requests.length).toBe(whileVisible);
+    await setHidden(page, false);
+    await expect.poll(() => requests.length).toBe(whileVisible + 1);
+  });
+
+  test("a session page asks only for its own task's runs", async ({ page }) => {
+    const queries: string[] = [];
+    await page.route(/\/api\/runs(\?.*)?$/, (route) => {
+      queries.push(new URL(route.request().url()).search);
+      return route.fulfill({ json: [{ ...run, state: "completed" }] });
+    });
+    await page.route("**/api/runs/run-1/events*", (route) => route.fulfill({ json: [] }));
+    await page.goto("/session/?run=run-1");
+    await expect(page.getByText("No agent activity yet.")).toBeVisible();
+    expect(queries).toContain("?task_of=run-1");
+    expect(queries.filter((q) => q === "")).toEqual([]);
+  });
+
+  test("an idle chat slows down and a working one keeps up", async ({ page }) => {
+    await page.clock.install();
+    let status = "completed";
+    let fetches = 0;
+    await page.route("**/api/chats/chat-1", (route) => {
+      fetches++;
+      return route.fulfill({ json: { messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "ok", status }] } });
+    });
+    // Fetches resolve in real time, so step the fake clock and let each land.
+    async function advance(seconds: number) {
+      for (let i = 0; i < seconds; i++) {
+        await page.clock.runFor(1000);
+        await page.waitForTimeout(50);
+      }
+    }
+    await page.goto("/?chat=chat-1");
+    await expect(page.getByText("ok", { exact: true })).toBeVisible();
+    await advance(1);
+    let before = fetches;
+    await advance(10);
+    expect(fetches - before).toBe(0);
+    status = "executing";
+    await advance(6);
+    await expect(page.getByText("Running…")).toBeVisible();
+    before = fetches;
+    await advance(10);
+    expect(fetches - before).toBeGreaterThanOrEqual(4);
   });
 });

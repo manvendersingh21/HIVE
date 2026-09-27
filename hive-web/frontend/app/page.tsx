@@ -5,6 +5,8 @@ import { api, requestId, terminalUrl } from "../lib/api";
 import { Shell } from "../components/Nav";
 import { ApprovalPrompt, Run, RunSummary } from "../components/RunView";
 import { Markdown } from "../lib/markdown";
+import { stateTone } from "../lib/runEvents";
+import { usePoll } from "../lib/poll";
 type Chat = { id: string; title?: string; updated_at?: string };
 type Reply = {
   run?: {
@@ -54,6 +56,8 @@ export default function AgentPage() {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  // Refresh failures clear on the next good refresh; `error` reports actions.
+  const [loadError, setLoadError] = useState("");
   const [capable, setCapable] = useState(true);
   // A chat runs one turn at a time. A message sent meanwhile waits here and
   // goes out when the turn finishes.
@@ -113,6 +117,7 @@ export default function AgentPage() {
     setMessages([]);
     setRuns([]);
     setError("");
+    setLoadError("");
     setLoading(true);
     try {
       await refresh(id);
@@ -138,26 +143,25 @@ export default function AgentPage() {
     const timer = setTimeout(() => void loadChats(query, 0), 250);
     return () => clearTimeout(timer);
   }, [query, capable]);
-  useEffect(() => {
-    if (!active) return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout>;
-    async function poll() {
+  // Follow closely while Hive or one of its agents is working; an idle chat
+  // only needs to notice changes made elsewhere.
+  const working =
+    running(messages) || runs.some((r) => ["running", "queued"].includes(stateTone(r.state)));
+  usePoll(
+    async () => {
+      const id = active;
+      if (!id) return;
       try {
-        await refresh(active!);
-        await refreshRuns(active!);
+        await refresh(id);
+        await refreshRuns(id);
+        if (activeRef.current === id) setLoadError("");
       } catch (e) {
-        if (!cancelled && activeRef.current === active)
-          setError((e as Error).message);
+        if (activeRef.current === id) setLoadError((e as Error).message);
       }
-      if (!cancelled) timer = setTimeout(() => void poll(), 2000);
-    }
-    timer = setTimeout(() => void poll(), 2000);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [active]);
+    },
+    working ? 2000 : 15000,
+    [active],
+  );
   async function send() {
     const draft = input;
     const text = draft.trim();
@@ -259,6 +263,7 @@ export default function AgentPage() {
                 setInput("");
                 unqueue();
                 setError("");
+                setLoadError("");
                 setLoading(false);
               }}
             >
@@ -396,9 +401,9 @@ export default function AgentPage() {
                 </button>
               </article>
             )}
-            {error && (
+            {(error || loadError) && (
               <p role="alert" className="error">
-                {error}
+                {error || loadError}
               </p>
             )}
           </div>

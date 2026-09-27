@@ -62,19 +62,31 @@ pub struct RunQuery {
     pub after: i64,
     /// Latest N events in order, for opening a long session at its end.
     pub tail: Option<usize>,
+    /// Comma-separated states to keep, for callers that only count some.
+    pub state: Option<String>,
+    /// A run ID: return only the runs of that run's task, for a session page.
+    pub task_of: Option<String>,
 }
 pub async fn list(State(h): State<AgentHandle>, Query(q): Query<RunQuery>) -> Response {
     match store(&h).and_then(|s| s.list()) {
-        Ok(runs) => Json(
-            runs.into_iter()
-                .filter(|r| {
-                    q.conversation_id
-                        .as_ref()
-                        .is_none_or(|id| id == &r.conversation_id)
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(runs) => {
+            let task = q.task_of.as_ref().map(|id| {
+                runs.iter().find(|r| &r.id == id).map(|r| r.task_id.clone())
+            });
+            let states = q.state.as_deref().map(|s| s.split(',').collect::<Vec<_>>());
+            Json(
+                runs.iter()
+                    .filter(|r| {
+                        q.conversation_id
+                            .as_ref()
+                            .is_none_or(|id| id == &r.conversation_id)
+                            && states.as_ref().is_none_or(|s| s.contains(&r.state.as_str()))
+                            && task.as_ref().is_none_or(|t| t.as_ref() == Some(&r.task_id))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
         Err(e) => error(e),
     }
 }
@@ -368,10 +380,35 @@ fn apply_runtime_evidence(attrs: &mut Value, metadata: &Value) -> bool {
 /// A completed run only changes again once Hive has something to deliver to
 /// it: a coordinator follow-up, a user message or a decision. Polling it anyway
 /// costs an SSH round trip and a remote runner process every loop.
+///
+/// A run whose agent session has ended can't change at all: its journal still
+/// reports the last state, so syncing it would only revive that stale state.
 fn idle(store: &RunStore, run: &Run) -> anyhow::Result<bool> {
+    if run.state == "disconnected" && run.metadata["reason"] == SESSION_ENDED {
+        return Ok(true);
+    }
     Ok(run.state == "completed"
         && store.pending_decisions(&run.id)?.is_empty()
         && store.pending_messages(&run.id)?.is_empty())
+}
+
+const SESSION_ENDED: &str = "The agent's session has ended, so this run can't continue.";
+
+/// States in which a launched run's tmux session must still exist.
+const LIVE_STATES: [&str; 4] = ["working", "awaiting-approval", "waiting-for-peer", "reviewing"];
+
+/// Whether the run's tmux session exists. `None` when the device couldn't be
+/// asked: an unreachable machine says nothing about the session.
+async fn session_alive(worker: &hive_common::protocol::WorkerInfo, run: &Run) -> Option<bool> {
+    let command = format!(
+        "tmux has-session -t {} 2>/dev/null && echo alive || echo gone",
+        transport::quote(&format!("={}", run.tmux_name))
+    );
+    match transport::ssh(worker, &command, None).await.ok()?.trim() {
+        "alive" => Some(true),
+        "gone" => Some(false),
+        _ => None,
+    }
 }
 
 async fn sync_run(
@@ -398,6 +435,15 @@ async fn sync_run(
             )
             .await;
         }
+        return Ok(());
+    }
+    // Checked before the snapshot, which would rewrite the state from the
+    // journal of a runner that no longer exists.
+    if run.runner_path.is_some()
+        && LIVE_STATES.contains(&run.state.as_str())
+        && session_alive(&worker, run).await == Some(false)
+    {
+        store.state(&run.id, "disconnected", SESSION_ENDED)?;
         return Ok(());
     }
     if run.state == "queued" {
@@ -636,6 +682,43 @@ mod tests {
             history: None,
             master_name: "master".into(),
         }
+    }
+    #[tokio::test]
+    async fn run_list_filters_by_state_and_task() {
+        let h = handle();
+        let id = run_with_events(&h, 0);
+        store(&h).unwrap().state(&id, "awaiting-approval", "").unwrap();
+        let ids = |q: RunQuery| {
+            let h = h.clone();
+            async move {
+                let response = list(State(h), Query(q)).await;
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<Vec<Value>>(&body).unwrap().len()
+            }
+        };
+        let q = |state: Option<&str>, task_of: Option<&str>| RunQuery {
+            state: state.map(Into::into),
+            task_of: task_of.map(Into::into),
+            ..Default::default()
+        };
+        assert_eq!(ids(q(Some("needs-setup,awaiting-approval"), None)).await, 1);
+        assert_eq!(ids(q(Some("working"), None)).await, 0);
+        assert_eq!(ids(q(None, Some(&id))).await, 1);
+        assert_eq!(ids(q(None, Some("unknown-run"))).await, 0);
+    }
+
+    #[test]
+    fn runs_whose_session_ended_are_never_synced_again() {
+        let h = handle();
+        let store = store(&h).unwrap();
+        let id = run_with_events(&h, 0);
+        store.state(&id, "awaiting-approval", "").unwrap();
+        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        // A runner-reported disconnect can still be reconciled, so keep syncing.
+        store.state(&id, "disconnected", "Prior runner exited").unwrap();
+        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        store.state(&id, "disconnected", SESSION_ENDED).unwrap();
+        assert!(idle(&store, &store.get(&id).unwrap()).unwrap());
     }
     fn run_with_events(h: &AgentHandle, count: i64) -> String {
         let store = store(h).unwrap();

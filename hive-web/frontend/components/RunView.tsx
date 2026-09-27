@@ -12,6 +12,7 @@ import {
   transcript,
 } from "../lib/runEvents";
 import { Markdown } from "../lib/markdown";
+import { visible } from "../lib/poll";
 
 export type Approval = {
   id: string;
@@ -85,6 +86,8 @@ export function useRunEvents(run: Run | undefined, tail: number, live: boolean) 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
+      await visible();
+      if (cancelled) return;
       try {
         const after = last.current;
         const url = `/api/runs/${encodeURIComponent(id!)}/events?${
