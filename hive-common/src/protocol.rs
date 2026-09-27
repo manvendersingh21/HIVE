@@ -394,6 +394,11 @@ pub struct WorkerInfo {
     /// Tags for categorization (e.g., ["gpu", "beefy"]).
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The Hive coordinator itself, reached without SSH. Never read from
+    /// config or requests, so a configured worker can't opt out of SSH.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub local: bool,
 }
 
 impl WorkerInfo {
@@ -685,6 +690,7 @@ mod tests {
             user: "admin".to_string(),
             port: None,
             tags: vec!["gpu".to_string()],
+            local: false,
         };
         assert_eq!(worker.ssh_target(), "admin@192.168.1.101");
     }

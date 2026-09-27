@@ -31,25 +31,12 @@ pub async fn ssh_timeout(
     input: Option<&Value>,
     seconds: u64,
 ) -> anyhow::Result<String> {
-    let mut cmd = Command::new("ssh");
-    cmd.args([
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "ServerAliveInterval=5",
-        "-o",
-        "ServerAliveCountMax=2",
-    ]);
-    if let Some(port) = worker.port {
-        cmd.args(["-p", &port.to_string()]);
-    }
-    cmd.arg(worker.ssh_target())
-        .arg(format!("{}; {command}", crate::workers::ssh::REMOTE_PATH))
-        .stdin(Stdio::piped())
+    let mut cmd = if worker.local {
+        local_shell(command)
+    } else {
+        remote_shell(worker, command)
+    };
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -76,6 +63,47 @@ pub async fn ssh_timeout(
             .collect::<String>()
     );
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn remote_shell(worker: &WorkerInfo, command: &str) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=2",
+    ]);
+    if let Some(port) = worker.port {
+        cmd.args(["-p", &port.to_string()]);
+    }
+    cmd.arg(worker.ssh_target()).arg(format!(
+        "{}; {command}",
+        crate::workers::ssh::REMOTE_PATH
+    ));
+    cmd
+}
+
+/// The environment an SSH login would give, and nothing else: hive-web's own
+/// variables (credentials, config paths) never reach agents on the coordinator.
+const LOCAL_ENV: [&str; 6] = ["HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR"];
+
+fn local_shell(command: &str) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.env_clear()
+        .envs(LOCAL_ENV.iter().filter_map(|k| Some((*k, std::env::var_os(k)?))))
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .arg("-c")
+        .arg(format!("{}; {command}", crate::workers::ssh::REMOTE_PATH));
+    if let Some(home) = std::env::var_os("HOME") {
+        cmd.current_dir(home);
+    }
+    cmd
 }
 
 pub async fn deploy(worker: &WorkerInfo) -> anyhow::Result<String> {
@@ -156,4 +184,42 @@ with c:
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coordinator() -> WorkerInfo {
+        WorkerInfo {
+            name: "mac-mini".into(),
+            host: "localhost".into(),
+            user: "test".into(),
+            port: None,
+            tags: vec![],
+            local: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_commands_run_locally_with_only_a_login_environment() {
+        // Stands in for hive-web's credentials in its own environment.
+        std::env::set_var("HIVE_TRANSPORT_TEST_SECRET", "leaked");
+        let out = ssh(
+            &coordinator(),
+            r#"printf '%s|%s|' "${HIVE_TRANSPORT_TEST_SECRET-unset}" "$(pwd -P)"; cat; case ":$PATH:" in *:/opt/homebrew/bin:*) printf '|path';; esac"#,
+            Some(&json!({"a": 1})),
+        )
+        .await
+        .unwrap();
+        let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+        assert_eq!(out, format!("unset|{}|{{\"a\":1}}|path", home.display()));
+    }
+
+    #[tokio::test]
+    async fn coordinator_failures_and_timeouts_report_like_ssh() {
+        let err = ssh(&coordinator(), "echo nope >&2; exit 3", None).await.unwrap_err();
+        assert_eq!(err.to_string(), "mac-mini: nope\n");
+        assert!(ssh_timeout(&coordinator(), "sleep 5", None, 1).await.is_err());
+    }
 }

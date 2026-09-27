@@ -22,6 +22,16 @@ class RunnerTests(unittest.TestCase):
         self.j.db.close()
         self.temp.cleanup()
 
+    def test_service_panes_drop_hive_variables_from_the_tmux_environment(self):
+        tmux_env = 'HIVE_WEB_PASSWORD=secret\nPATH=/bin\nHIVE_WORKER_TOKEN=t\n-HIVE_REMOVED'
+        with patch.object(runner, 'capture', return_value=(0, tmux_env)):
+            self.assertEqual(runner.without_hive_env(['python3', 'serve.py']),
+                             ['env', '-u', 'HIVE_WEB_PASSWORD', '-u', 'HIVE_WORKER_TOKEN', 'python3', 'serve.py'])
+        with patch.object(runner, 'capture', return_value=(0, 'PATH=/bin')):
+            self.assertEqual(runner.without_hive_env(['serve']), ['serve'])
+        with patch.object(runner, 'capture', return_value=(1, '')):
+            self.assertEqual(runner.without_hive_env(['serve']), ['serve'])
+
     def test_dangerous_actions_are_denied_before_side_effects(self):
         async def exercise():
             marker = self.root/'outside'
@@ -35,6 +45,12 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(await pending)
             self.assertFalse(marker.exists())
         asyncio.run(exercise())
+
+    def test_yolo_assignments_run_flagged_actions_without_an_approval(self):
+        action = dict(command='rm -rf build', cwd=str(self.workspace))
+        self.j.set('assignment', dict(autonomy='yolo'))
+        self.assertTrue(asyncio.run(runner.permission(self.j, 'Bash', action, str(self.workspace))))
+        self.assertEqual(self.j.snapshot()['approvals'], [])
 
     def test_single_use_and_changed_action_and_reconnect(self):
         first = self.j.pending({'command': 'rm artifact'}, 'destructive')

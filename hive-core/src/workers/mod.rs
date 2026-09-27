@@ -512,6 +512,7 @@ mod tests {
             user: "someone".into(),
             port: None,
             tags: vec!["gpu".into()],
+            local: false,
         })
         .unwrap();
 
@@ -527,6 +528,7 @@ mod tests {
                 user: "someone".into(),
                 port: None,
                 tags: vec![],
+                local: false,
             })
             .unwrap_err();
         assert!(err.to_string().contains("already configured"), "{err}");
@@ -542,6 +544,7 @@ mod tests {
             user: "u".into(),
             port: None,
             tags: vec![],
+            local: false,
         })
         .unwrap();
         assert_eq!(pool.worker_count(), 2);
@@ -570,6 +573,7 @@ mod tests {
             user: String::new(),
             port: None,
             tags: vec![],
+            local: false,
         }])
     }
 
@@ -619,6 +623,7 @@ mod tests {
             user: "azureuser".to_string(),
             port: None,
             tags: vec![],
+            local: false,
         };
         let pool = WorkerPool::new(vec![worker_info]);
         let nodes = pool.snapshot();

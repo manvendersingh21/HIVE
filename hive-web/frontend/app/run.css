@@ -92,3 +92,12 @@ pre.cmd { background: #0a0c10; border: 1px solid var(--line); margin: 6px 0; fon
 .message.assistant .approval { margin-top: 12px; }
 .message.queued > div { opacity: 0.75; border-style: dashed; }
 .message.queued button { margin-top: 6px; }
+
+/* SSH setup in Settings → Fleet. */
+.ssh-key { margin-top: 14px; }
+.copy-field textarea { width: 100%; resize: vertical; margin: 6px 0; }
+.ssh-check { margin: 12px 0; }
+.ssh-check .banner .row, .ssh-step { margin-top: 10px; }
+.ssh-step ul { padding-left: 18px; overflow-wrap: anywhere; }
+.banner.good { border-color: #1f4a31; background: #10201a; color: #bff0d2; }
+.ssh-step .full { width: 100%; margin: 0; }

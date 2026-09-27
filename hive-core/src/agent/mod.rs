@@ -954,6 +954,7 @@ mod placement_tests {
                     user: "test".into(),
                     port: None,
                     tags: vec![],
+                    local: false,
                 })
                 .collect(),
         );

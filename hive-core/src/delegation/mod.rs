@@ -6,6 +6,7 @@ pub mod store;
 pub mod transport;
 
 use crate::{agent::MasterAgent, memory::graph::entity_id};
+use hive_common::protocol::WorkerInfo;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -68,6 +69,29 @@ fn repair_workspaces(plan: &mut DelegationPlan) {
     }
 }
 
+/// Where delegated work for `device` runs. A configured SSH worker wins; the
+/// coordinator's own name runs agents here without SSH.
+pub fn target(agent: &MasterAgent, device: &str) -> Option<WorkerInfo> {
+    if let Some(worker) = agent.workers.find(device) {
+        return Some(worker.info);
+    }
+    (device == agent.master_name()).then(|| WorkerInfo {
+        name: device.to_string(),
+        host: "localhost".into(),
+        user: std::env::var("USER").unwrap_or_default(),
+        port: None,
+        tags: vec![],
+        local: true,
+    })
+}
+
+/// Every device delegation can reach: the SSH fleet plus the coordinator.
+pub fn targets(agent: &MasterAgent) -> Vec<WorkerInfo> {
+    let mut all: Vec<WorkerInfo> = agent.workers.snapshot().into_iter().map(|w| w.info).collect();
+    all.extend(target(agent, agent.master_name()).filter(|t| t.local));
+    all
+}
+
 pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
     anyhow::ensure!(
         plan.assignments.len() <= 16,
@@ -79,15 +103,7 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             !a.key.is_empty() && keys.insert(a.key.clone()),
             "Assignment keys must be unique"
         );
-        if agent.workers.find(&a.device).is_none() {
-            // Delegation reaches devices only over SSH, so the coordinator's
-            // own hostname — which the planner sees in the fleet — is not a
-            // target unless it is also configured as a worker.
-            anyhow::ensure!(
-                a.device != agent.master_name(),
-                "{} is the Hive coordinator and can't run delegated agents. Add it as an SSH worker in Settings → Machines (for example host localhost, under a different name) to use it.",
-                a.device
-            );
+        if target(agent, &a.device).is_none() {
             anyhow::bail!("Unknown device: {}", a.device);
         }
         anyhow::ensure!(
@@ -167,22 +183,55 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
 /// constraints, even when a generated plan proposes an otherwise valid
 /// different placement. "exactly N assignments" also bounds the plan, and with
 /// named placements every assignment must be one of them.
+/// Whether `request` names the coordinator: its full name or any run of two
+/// or more of its name's parts, so "mac mini" or "macmini" name
+/// "manus-mac-mini".
+pub fn names_coordinator(request: &str, master: &str) -> bool {
+    let parts: Vec<String> = master
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|p| !p.is_empty())
+        .map(regex::escape)
+        .collect();
+    let min = parts.len().min(2).max(1);
+    (min..=parts.len()).any(|len| {
+        parts.windows(len).any(|w| {
+            regex::Regex::new(&format!(r"(?i)\b{}\b", w.join(r"[\s._-]*")))
+                .is_ok_and(|r| r.is_match(request))
+        })
+    })
+}
+
+/// Agents on the coordinator sit next to Hive's own config and database, so
+/// work goes there only when the user asks for that machine by name.
+fn validate_coordinator(request: &str, plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
+    for a in &plan.assignments {
+        if target(agent, &a.device).is_some_and(|t| t.local) {
+            anyhow::ensure!(
+                names_coordinator(request, agent.master_name()),
+                "{} is the Hive coordinator; place work there only when the user names it",
+                a.device
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_explicit(
     request: &str,
     plan: &DelegationPlan,
     agent: &MasterAgent,
 ) -> anyhow::Result<()> {
     let mut placements = Vec::new();
-    for worker in &agent.workers.snapshot() {
+    for worker in &targets(agent) {
         let pattern = format!(
             r"(?i)\b(claude|codex|agy|opencode)(?:\s+agent)?\s+on\s+{}(?:\s+(?:using|with)\s+(?:the\s+)?model\s+([[:alnum:]][[:alnum:]_.:/@\[\]-]*[[:alnum:]_\]])|(?:$|\.(?:\s|$)|[^[:alnum:]_.-]))",
-            regex::escape(&worker.info.name)
+            regex::escape(&worker.name)
         );
         for captures in regex::Regex::new(&pattern)?.captures_iter(request) {
             let selected = captures[1].to_ascii_lowercase();
             let model = captures.get(2).map(|m| m.as_str().to_string());
             let matches = |a: &Assignment| {
-                a.device == worker.info.name
+                a.device == worker.name
                     && a.agent == selected
                     && model.as_ref().is_none_or(|m| a.model.as_ref() == Some(m))
             };
@@ -190,13 +239,13 @@ pub fn validate_explicit(
                 plan.assignments.iter().any(matches),
                 "Explicit placement requires {} on {}{}",
                 selected,
-                worker.info.name,
+                worker.name,
                 model
                     .as_ref()
                     .map(|m| format!(" using model {m}"))
                     .unwrap_or_default()
             );
-            placements.push((worker.info.name.clone(), selected, model));
+            placements.push((worker.name.clone(), selected, model));
         }
     }
     let count = regex::Regex::new(
@@ -241,8 +290,8 @@ fn coordinator_note(agent: &MasterAgent) -> String {
     if agent.workers.find(agent.master_name()).is_some() {
         return String::new();
     }
-    format!("{} is this Hive coordinator (the machine the user is talking to, e.g. their \"mac mini\"). It is not a delegation device: \
-        never assign work to it. If the user asks for it, explain in summary that it must first be added as an SSH worker, with no assignments.\n",
+    format!("{} is this Hive coordinator (the machine the user is talking to). Its agents run locally, and its inventory is listed like any device. \
+        Assign work to it only when the user names it (a shortened name like \"mac mini\" counts); otherwise prefer the other devices.\n",
         agent.master_name())
 }
 
@@ -252,7 +301,7 @@ pub async fn plan(
     history: &str,
 ) -> anyhow::Result<DelegationPlan> {
     agent.refresh_machine_graph().await?;
-    inventory::refresh(agent).await?;
+    inventory::refresh_stale(agent, 120, 45).await?;
     let fleet = crate::memory::machines::describe_for_prompt(&agent.memory.graph)?;
     let agents = inventory::describe(&agent.memory.graph)?;
     let coordinator = coordinator_note(agent);
@@ -290,6 +339,7 @@ pub async fn plan(
                 repair_workspaces(&mut p);
                 validate(&p, agent)?;
                 validate_explicit(request, &p, agent)?;
+                validate_coordinator(request, &p, agent)?;
                 Ok(p)
             });
         match parsed {
@@ -356,12 +406,45 @@ pub fn setup_reason(
     Ok(None)
 }
 
+/// How much an agent Hive launches may do without asking.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Autonomy {
+    /// No prompts: every tool call runs and native sandboxes are off.
+    #[default]
+    Yolo,
+    /// Hive's task policy decides; anything else waits for a person.
+    Ask,
+}
+
+/// Persisted next to the other private coordinator state, never in the repo.
+fn autonomy_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".hive/autonomy.json"))
+}
+
+/// The configured autonomy. Missing or unreadable state means the default.
+pub fn autonomy() -> Autonomy {
+    autonomy_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| serde_json::from_value(value["mode"].clone()).ok())
+        .unwrap_or_default()
+}
+
+pub fn set_autonomy(mode: Autonomy) -> anyhow::Result<()> {
+    let path = autonomy_path().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    std::fs::create_dir_all(path.parent().expect("nested path"))?;
+    std::fs::write(path, json!({ "mode": mode }).to_string())?;
+    Ok(())
+}
+
 pub fn remote_assignment(
     run: &store::Run,
     peers: &[store::Run],
     executable: Option<&str>,
 ) -> Value {
     let mut value = serde_json::to_value(&run.assignment).expect("serializable assignment");
+    value["autonomy"] = json!(autonomy());
     value["id"] = json!(run.id);
     value["task_id"] = json!(run.task_id);
     value["executable"] = json!(executable);
@@ -381,6 +464,7 @@ mod tests {
                 user: "test".into(),
                 port: None,
                 tags: vec!["light".into()],
+                local: false,
             }]),
             crate::skills::SkillRegistry::new(),
             crate::memory::MemorySystem::new(),
@@ -407,9 +491,6 @@ mod tests {
         assert!(validate(&p, &agent).is_ok());
         p.assignments[0].device = "ssh-alias".into();
         assert!(validate(&p, &agent).is_err());
-        p.assignments[0].device = agent.master_name().to_string();
-        let err = validate(&p, &agent).unwrap_err().to_string();
-        assert!(err.contains("Hive coordinator"), "{err}");
         p.assignments[0].device = "air".into();
         p.assignments[0].dependencies = vec!["a".into()];
         assert!(validate(&p, &agent).is_err());
@@ -420,26 +501,74 @@ mod tests {
         p.assignments[0].required_capabilities = vec!["heavy-compute".into()];
         assert!(validate(&p, &agent).is_err());
     }
-    #[test]
-    fn coordinator_is_rejected_unless_it_is_also_a_worker() {
-        let agent = agent().with_master_name("mac-mini");
-        let mut p = plan();
-        p.assignments[0].device = "mac-mini".into();
-        let err = validate(&p, &agent).unwrap_err().to_string();
-        assert!(err.contains("mac-mini is the Hive coordinator"), "{err}");
-        assert!(err.contains("Settings"), "the error says how to fix it: {err}");
-        // Any other unknown name keeps the plain error.
-        p.assignments[0].device = "nowhere".into();
-        assert_eq!(validate(&p, &agent).unwrap_err().to_string(), "Unknown device: nowhere");
-        // A coordinator that is also a configured worker is a normal device.
-        let both = super::tests::agent().with_master_name("air");
-        assert!(validate(&plan(), &both).is_ok());
+    fn coordinator(name: &str) -> MasterAgent {
+        let agent = agent().with_master_name(name);
+        crate::memory::machines::project_into_graph(
+            &agent.memory.graph,
+            &crate::memory::machines::MachineFacts {
+                name: name.into(),
+                reachable: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        agent
     }
     #[test]
-    fn planner_is_told_the_coordinator_is_not_a_device() {
+    fn the_coordinator_runs_agents_locally_unless_a_worker_has_its_name() {
+        let agent = coordinator("mac-mini");
+        let local = target(&agent, "mac-mini").unwrap();
+        assert!(local.local);
+        assert_eq!(local.name, "mac-mini");
+        assert!(!target(&agent, "air").unwrap().local);
+        assert!(target(&agent, "nowhere").is_none());
+        let names: Vec<_> = targets(&agent).into_iter().map(|t| (t.name, t.local)).collect();
+        assert_eq!(names, [("air".to_string(), false), ("mac-mini".to_string(), true)]);
+        let mut p = plan();
+        p.assignments[0].device = "mac-mini".into();
+        assert!(validate(&p, &agent).is_ok());
+        p.assignments[0].device = "nowhere".into();
+        assert_eq!(validate(&p, &agent).unwrap_err().to_string(), "Unknown device: nowhere");
+        // A configured worker with the coordinator's name is reached over SSH.
+        let both = coordinator("air");
+        assert!(!target(&both, "air").unwrap().local);
+        assert_eq!(targets(&both).len(), 1);
+    }
+    #[test]
+    fn work_goes_to_the_coordinator_only_when_the_user_names_it() {
+        let agent = coordinator("manus-mac-mini");
+        let mut p = plan();
+        p.assignments[0].device = "manus-mac-mini".into();
+        for request in [
+            "start a session on mac-mini",
+            "use codex on the Mac Mini",
+            "run it on macmini",
+            "on manus-mac-mini please",
+        ] {
+            assert!(validate_coordinator(request, &p, &agent).is_ok(), "{request}");
+        }
+        for request in ["fix the failing tests", "start a session on mac-air", "use my mini"] {
+            let err = validate_coordinator(request, &p, &agent).unwrap_err().to_string();
+            assert!(err.contains("only when the user names it"), "{request}: {err}");
+        }
+        // Other devices never need naming.
+        p.assignments[0].device = "air".into();
+        assert!(validate_coordinator("fix the failing tests", &p, &agent).is_ok());
+    }
+    #[test]
+    fn coordinator_names_match_whole_words_of_two_or_more_parts() {
+        assert!(names_coordinator("on mac mini", "manus-mac-mini"));
+        assert!(names_coordinator("on MANUS.MAC", "manus-mac-mini"));
+        assert!(!names_coordinator("on mac", "manus-mac-mini"));
+        assert!(!names_coordinator("on mac-minimal", "manus-mac-mini"));
+        assert!(names_coordinator("on master", "master"));
+        assert!(!names_coordinator("on masters", "master"));
+    }
+    #[test]
+    fn planner_is_told_the_coordinator_runs_agents_when_named() {
         let note = coordinator_note(&agent().with_master_name("mac-mini"));
         assert!(note.starts_with("mac-mini is this Hive coordinator"), "{note}");
-        assert!(note.contains("never assign work to it"));
+        assert!(note.contains("only when the user names it"), "{note}");
         assert!(coordinator_note(&agent().with_master_name("air")).is_empty());
     }
     #[test]

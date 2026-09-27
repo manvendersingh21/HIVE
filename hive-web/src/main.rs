@@ -12,6 +12,7 @@ mod chat;
 mod delegation;
 mod incidents;
 mod sessions;
+mod ssh_setup;
 mod terminal;
 mod workers;
 
@@ -40,6 +41,8 @@ use tracing::{info, warn};
 ///
 /// Short enough that a worker coming back is usable quickly, long enough that a
 /// fleet of unreachable hosts is not a steady stream of SSH timeouts.
+/// Read once at startup, then removed from the process environment.
+const SECRET_ENV: [&str; 2] = ["HIVE_WEB_PASSWORD", "HIVE_WORKER_TOKEN"];
 const WORKER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
@@ -189,6 +192,13 @@ async fn main() -> anyhow::Result<()> {
     if password.len() < 8 {
         anyhow::bail!("HIVE_WEB_PASSWORD must be at least 8 characters");
     }
+    let workers = workers::WorkerIngest::from_env();
+    // Both secrets are held in memory now. Drop them from the environment
+    // before anything spawns ssh, tmux or agents, which would inherit them;
+    // a tmux server started from here keeps them for every pane it opens.
+    for key in SECRET_ENV {
+        std::env::remove_var(key);
+    }
 
     let bind_addr: SocketAddr = std::env::var("HIVE_WEB_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -206,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         auth: auth::Auth::new(password),
         agent: build_agent(&master_name).await,
-        workers: workers::WorkerIngest::from_env(),
+        workers,
         incidents: incidents::IncidentReview::from_env(),
     };
 
@@ -240,9 +250,21 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
             get(chat::master_agent_settings).post(chat::set_master_agent),
         )
         .route(
+            "/api/settings/autonomy",
+            get(delegation::autonomy).post(delegation::set_autonomy),
+        )
+        .route(
             "/api/fleet",
             get(chat::list_fleet).post(chat::add_fleet_worker),
         )
+        .route(
+            "/api/fleet/ssh/key",
+            get(ssh_setup::get_key).post(ssh_setup::create_key),
+        )
+        .route("/api/fleet/ssh/test", post(ssh_setup::test_connection))
+        .route("/api/fleet/ssh/host-key", post(ssh_setup::scan_host_key))
+        .route("/api/fleet/ssh/trust", post(ssh_setup::trust_host_key))
+        .route("/api/fleet/ssh/install-key", post(ssh_setup::install_key))
         .route(
             "/api/fleet/{name}",
             axum::routing::delete(chat::remove_fleet_worker),
@@ -301,6 +323,33 @@ mod router_tests {
     };
     use hive_core::watchdog::incidents::IncidentStore;
     use tower::ServiceExt;
+
+    #[test]
+    fn coordinator_runs_attach_to_local_tmux_and_workers_keep_ssh() {
+        let agent = hive_core::agent::MasterAgent::new(
+            hive_core::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            hive_core::workers::WorkerPool::new(vec![hive_common::WorkerInfo {
+                name: "air".into(),
+                host: "air-ssh".into(),
+                user: "test".into(),
+                port: None,
+                tags: vec![],
+                local: false,
+            }]),
+            hive_core::skills::SkillRegistry::new(),
+            hive_core::memory::MemorySystem::new(),
+        )
+        .with_master_name("mac-mini");
+        let h = chat::AgentHandle {
+            agent: Some(std::sync::Arc::new(agent)),
+            history: None,
+            master_name: "mac-mini".into(),
+        };
+        assert!(session_worker(&h, "local").unwrap().is_none());
+        assert!(session_worker(&h, "mac-mini").unwrap().is_none());
+        assert_eq!(session_worker(&h, "air").unwrap().unwrap().host, "air-ssh");
+        assert_eq!(session_worker(&h, "nowhere").unwrap_err().status(), StatusCode::NOT_FOUND);
+    }
 
     #[tokio::test]
     async fn actual_router_gates_static_pages_and_apis() {
@@ -484,11 +533,12 @@ fn session_worker(
     if host == "local" {
         return Ok(None);
     }
-    h.agent
-        .as_ref()
-        .and_then(|a| a.workers.find(host))
-        .map(|w| Some(w.info))
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown worker").into_response())
+    match h.agent.as_ref().and_then(|a| hive_core::delegation::target(a, host)) {
+        // An agent run on the coordinator names its device, not "local".
+        Some(t) if t.local => Ok(None),
+        Some(t) => Ok(Some(t)),
+        None => Err((StatusCode::NOT_FOUND, "unknown worker").into_response()),
+    }
 }
 
 async fn session_hosts(State(h): State<chat::AgentHandle>) -> Json<serde_json::Value> {
@@ -536,15 +586,22 @@ async fn list_sessions(State(h): State<chat::AgentHandle>) -> Response {
     if let Ok(store) = delegation::store(&h) {
         if let Ok(runs) = store.list() {
             for run in runs {
+                // Runs on the coordinator live in its local tmux server.
+                let host = match h.agent.as_deref().and_then(|a| {
+                    hive_core::delegation::target(a, &run.assignment.device)
+                }) {
+                    Some(t) if t.local => sessions::local_host(),
+                    _ => run.assignment.device.clone(),
+                };
                 if let Some(session) = list
                     .iter_mut()
-                    .find(|s| s.name == run.tmux_name && s.host == run.assignment.device)
+                    .find(|s| s.name == run.tmux_name && s.host == host)
                 {
                     session.run = Some(run);
                 } else {
                     list.push(sessions::Session {
                         name: run.tmux_name.clone(),
-                        host: run.assignment.device.clone(),
+                        host,
                         windows: 0,
                         created: 0,
                         attached: false,
