@@ -218,7 +218,7 @@ fn parse_probe(name: &str, host: &str, tags: Vec<String>, raw: &str) -> MachineF
     facts
 }
 
-static CACHED_LOGIN_PATH: tokio::sync::RwLock<Option<String>> = tokio::sync::RwLock::const_new(None);
+static CACHED_LOGIN_PATH: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// Query the user's login shell once to resolve PATH additions from shell profiles.
 async fn query_login_path() -> String {
@@ -232,9 +232,21 @@ async fn query_login_path() -> String {
         shell
     };
 
-    let mut cmd = tokio::process::Command::new(&shell);
-    cmd.args(["-lic", "printf %s \"$PATH\""])
-        .kill_on_drop(true);
+    let mut std_cmd = std::process::Command::new(&shell);
+    std_cmd.args(["-lic", "printf %s \"$PATH\""]);
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        std_cmd.pre_exec(|| {
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.kill_on_drop(true);
 
     match tokio::time::timeout(std::time::Duration::from_secs(3), cmd.output()).await {
         Ok(Ok(out)) if out.status.success() => {
@@ -249,33 +261,92 @@ async fn query_login_path() -> String {
     }
 }
 
-/// Resolve PATH from the user's login shell once and cache it.
-pub async fn resolve_login_path() -> String {
-    {
-        let guard = CACHED_LOGIN_PATH.read().await;
+fn query_login_path_sync() -> String {
+    let fallback = || {
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string())
+    };
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let shell = if shell.trim().is_empty() {
+        "/bin/sh".to_string()
+    } else {
+        shell
+    };
+
+    let mut std_cmd = std::process::Command::new(&shell);
+    std_cmd.args(["-lic", "printf %s \"$PATH\""]);
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        std_cmd.pre_exec(|| {
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+
+    match std_cmd.output() {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() {
+                fallback()
+            } else {
+                if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
+                    *guard = Some(s.clone());
+                }
+                s
+            }
+        }
+        _ => fallback(),
+    }
+}
+
+/// Synchronously retrieve the cached login PATH, or resolve it if not yet cached.
+pub fn login_path() -> String {
+    if let Ok(guard) = CACHED_LOGIN_PATH.read() {
         if let Some(ref path) = *guard {
             return path.clone();
         }
     }
-    let mut guard = CACHED_LOGIN_PATH.write().await;
-    if let Some(ref path) = *guard {
-        return path.clone();
+    query_login_path_sync()
+}
+
+/// Resolve PATH from the user's login shell once and cache it.
+pub async fn resolve_login_path() -> String {
+    if let Ok(guard) = CACHED_LOGIN_PATH.read() {
+        if let Some(ref path) = *guard {
+            return path.clone();
+        }
     }
     let resolved = query_login_path().await;
-    *guard = Some(resolved.clone());
+    if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
+        *guard = Some(resolved.clone());
+    }
     resolved
 }
 
 #[cfg(test)]
 pub async fn reset_cached_login_path() {
-    let mut guard = CACHED_LOGIN_PATH.write().await;
-    *guard = None;
+    if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
+        *guard = None;
+    }
 }
 
 /// Command to run the local probe through the user's login shell environment.
 pub async fn local_probe_command() -> tokio::process::Command {
     let path = resolve_login_path().await;
-    let mut cmd = tokio::process::Command::new("sh");
+    let mut std_cmd = std::process::Command::new("sh");
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        std_cmd.pre_exec(|| {
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.env("PATH", path)
         .arg("-c")
         .arg(probe_script())
