@@ -69,10 +69,14 @@ may still change without a deprecation period.
   review warning now names the `task_id` it was reviewing.
 - Review sees what OpenCode and AGY runs actually did. Native evidence is
   extracted from OpenCode's terminal assistant message and bash tool output and
-  from AGY's `result.event.result.response`, alongside the Claude and Codex
-  shapes, so a finished run no longer looks like it produced nothing.
-- A review answer that is not valid JSON is retried once with the parse error
-  appended to the prompt, instead of leaving the task unreviewed.
+  from an AGY stream-json event whose `event` is `"result"`, reading its
+  `result.response`, alongside the Claude and Codex shapes, so a finished run no
+  longer looks like it produced nothing.
+- Review evidence is capped to the newest output. A long run keeps its final
+  report, test results and branch reference and loses its beginning, behind an
+  `[earlier output truncated]` marker.
+- A review answer is retried once whether it was not valid JSON or not a valid
+  review object, with the exact failure appended to the prompt.
 - NVIDIA planning no longer fails wholesale with "NVIDIA request deadline
   exceeded": the first attempt gets ~80s of the 120s deadline (so a healthy but
   slow generation still completes on the first try), and a hung first attempt is
