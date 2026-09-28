@@ -52,6 +52,12 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- Peer dependency deadlocks: a queued verifier can start when its implementer
+  is waiting for a peer with a pending message addressed to that verifier.
+  Other working or failed prerequisites still block launch. Plans can declare
+  `peer_dependencies` for required replies or agreements; validation rejects
+  peers queued directly or transitively behind their asker. Waiting runs explain
+  when a requested peer is queued behind them, across repeated sync cycles.
 - `config/workers.toml` is no longer tracked. It describes a specific fleet,
   including real hostnames and SSH account names; copy
   `config/workers.example.toml` instead.
