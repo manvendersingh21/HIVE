@@ -1,6 +1,7 @@
 //! Durable fleet delegation. Remote journals own native conversations; the
 //! coordinator synchronizes evidence and never retries uncertain launches.
 pub mod containers;
+pub mod coordination;
 pub mod inventory;
 pub mod review;
 pub mod store;
@@ -22,6 +23,9 @@ pub struct Assignment {
     pub objective: String,
     pub dependencies: Vec<String>,
     pub acceptance_criteria: Vec<String>,
+    /// Repository-relative globs exclusively owned by this assignment.
+    #[serde(default)]
+    pub owned_paths: Vec<String>,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
 }
@@ -173,6 +177,7 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
         "At most 16 assignments per task"
     );
     validate_new_containers(plan, agent)?;
+    validate_owned_paths(&plan.assignments)?;
     // Assignments may target a container this plan creates. It has no
     // inventory yet; its setup is checked once it exists.
     let planned: Vec<&str> = plan.containers.iter().map(|c| c.name.as_str()).collect();
@@ -263,6 +268,40 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             done.len() > before,
             "Unknown or cyclic assignment dependencies"
         );
+    }
+    Ok(())
+}
+
+fn ownership_root(path: &str) -> anyhow::Result<&str> {
+    let path = path.trim().trim_start_matches("./").trim_end_matches('/');
+    anyhow::ensure!(!path.is_empty() && !path.starts_with('/')
+        && !path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        && !path.contains(['\n', '\r', '\0']),
+        "Owned paths must be non-empty repository-relative globs");
+    let wildcard = path.find(['*', '?', '[', '{']).unwrap_or(path.len());
+    Ok(path[..wildcard].trim_end_matches('/'))
+}
+
+fn paths_overlap(left: &str, right: &str) -> anyhow::Result<bool> {
+    let left = ownership_root(left)?;
+    let right = ownership_root(right)?;
+    Ok(left.is_empty() || right.is_empty() || left == right
+        || left.strip_prefix(right).is_some_and(|rest| rest.starts_with('/'))
+        || right.strip_prefix(left).is_some_and(|rest| rest.starts_with('/')))
+}
+
+/// Reject equal or parent/child ownership across assignments in one task.
+pub fn validate_owned_paths(assignments: &[Assignment]) -> anyhow::Result<()> {
+    for (index, left) in assignments.iter().enumerate() {
+        for right in assignments.iter().skip(index + 1) {
+            for left_path in &left.owned_paths {
+                for right_path in &right.owned_paths {
+                    anyhow::ensure!(!paths_overlap(left_path, right_path)?,
+                        "Assignments {} and {} have overlapping owned paths: {} and {}",
+                        left.key, right.key, left_path, right_path);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -419,6 +458,7 @@ pub async fn plan(
         Ordinary CLI coding tasks need required_capabilities=[]: Claude/Codex provider inference does NOT require local-inference on the worker. \
         Only require GPU or heavy-compute when the user explicitly needs that capability. \
         Every workspace is a fresh unique child of ~/hive-workspaces/. Each assignment has a unique key. \
+        owned_paths are repository-relative globs exclusively owned by that assignment; never assign equal, parent, or child paths to two assignments. \
         dependencies are assignment keys that must complete before this starts; peers that must negotiate concurrently have no dependency on each other. \
         Acceptance criteria must require implementation, independent verification, deployment evidence when requested and peer agreement. \
         For questions that need no work, answer in summary and use an empty assignments list. \
@@ -432,10 +472,11 @@ pub async fn plan(
     "containers":{"type":"array","maxItems":MAX_NEW_CONTAINERS,"items":{"type":"object","additionalProperties":false,
         "required":["name","host"],"properties":{"name":{"type":"string"},"host":{"type":"string"}}}},
     "assignments":{"type":"array","items":{"type":"object","additionalProperties":false,
-    "required":["key","device","agent","model","workspace","objective","dependencies","acceptance_criteria","required_capabilities"],"properties":{
+    "required":["key","device","agent","model","workspace","objective","dependencies","acceptance_criteria","owned_paths","required_capabilities"],"properties":{
         "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode"]},
         "model":{"type":["string","null"]},"workspace":{"type":"string"},"objective":{"type":"string"},
         "dependencies":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},
+        "owned_paths":{"type":"array","items":{"type":"string"}},
         "required_capabilities":{"type":"array","items":{"type":"string"}}
     }}}}});
     for attempt in 0..2 {
@@ -598,6 +639,20 @@ mod tests {
     }
     fn nc(name: &str, host: &str) -> NewContainer {
         NewContainer { name: name.into(), host: host.into() }
+    }
+
+    #[test]
+    fn owned_paths_accept_disjoint_and_reject_equal_or_nested() {
+        let mut left = plan().assignments.remove(0);
+        left.owned_paths = vec!["hive-core/src/**".into()];
+        let mut right = left.clone();
+        right.key = "b".into();
+        right.owned_paths = vec!["hive-web/src/**".into()];
+        validate_owned_paths(&[left.clone(), right.clone()]).unwrap();
+        right.owned_paths = vec!["hive-core/src/**".into()];
+        assert!(validate_owned_paths(&[left.clone(), right.clone()]).is_err());
+        right.owned_paths = vec!["hive-core/src/delegation/mod.rs".into()];
+        assert!(validate_owned_paths(&[left, right]).is_err());
     }
 
     #[test]
