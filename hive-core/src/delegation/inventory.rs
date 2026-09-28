@@ -113,8 +113,9 @@ pub fn project(graph: &KnowledgeGraph, device: &str, records: &[Value]) -> anyho
         let mut attrs = record.clone();
         if let Some(existing) = graph.entity(&entity_id("device-agent", &id))? {
             // Discovery never fabricates successful invocation evidence or erases
-            // evidence merely because no new inference was requested.
-            for key in ["invocation", "models"] {
+            // evidence merely because no new inference was requested. A probe
+            // never sees provider usage; only runs record it.
+            for key in ["invocation", "models", "usage"] {
                 if attrs[key].is_null() || attrs[key].as_array().is_some_and(Vec::is_empty) {
                     attrs[key] = existing.attrs[key].clone();
                 }
@@ -141,6 +142,11 @@ pub fn describe(graph: &KnowledgeGraph) -> anyhow::Result<String> {
             .unwrap_or(i64::MAX);
         entity.attrs["stale"] =
             json!(!reachable || age > 180 || entity.attrs["probe_error"].is_string());
+        if let Some(until) =
+            super::quota_exhausted_until(&entity.attrs, chrono::Utc::now().timestamp())
+        {
+            entity.attrs["quota"] = json!(super::quota_note(until));
+        }
         records.push(entity.attrs);
     }
     Ok(serde_json::to_string_pretty(&records)?)
