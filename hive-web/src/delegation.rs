@@ -33,51 +33,80 @@ fn error(e: anyhow::Error) -> Response {
 
 /// Overall deadline for one delegation planning attempt. A deadline failure
 /// is retried once by [`crate::chat::plan_with_retry`]. The planner-slot
-/// wait happens outside the deadline timer, and NVIDIA's own overall
-/// deadline (120s by default) fits inside this budget.
+/// wait is bounded by the whole-request budget (PLANNING_DEADLINE + retry),
+/// and NVIDIA's own overall deadline (120s by default) fits inside this budget.
 const PLANNING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
 
-/// Flatten a planner HTTP error into a loggable, storable error so every
-/// planning failure keeps the same durable failure path.
-async fn planning_error(response: Response) -> anyhow::Error {
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), 65536)
-        .await
-        .unwrap_or_default();
-    anyhow::anyhow!("HTTP {status}: {}", String::from_utf8_lossy(&body))
+pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
+    process_with_deadline_slots(h, turn, PLANNING_DEADLINE, &crate::chat::PLANNER_SLOTS).await
 }
 
-pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
-    let result=async {
-        let agent=h.agent.as_ref().unwrap();
-        let history=h.history.as_ref().unwrap();
-        let context=history.context(&turn)?;
-        let context_text=context.join("\n");
-        let plan=match crate::chat::plan_with_retry(
-            ||delegation::plan(agent,&turn.user_input,&context_text),
-            PLANNING_DEADLINE,
-        ).await{
-            Ok(plan)=>plan,
-            Err(response)=>return Err(planning_error(response).await),
-        };
-        let reply=start_plan(agent,&store(&h)?,&turn.id,&turn.conversation_id,&plan).await?;
-        // A detached run owns its own state. Finishing the receipt keeps this
-        // conversation's composer available while the real agents work.
-        history.finish(&turn.id,"completed",&plan.summary,Some(&reply))?;
-        Ok::<_,anyhow::Error>(reply)
-    }.await;
-    match result {
-        Ok(reply) => Json(reply).into_response(),
+pub(crate) async fn process_with_deadline_slots(
+    h: AgentHandle,
+    turn: SavedTurn,
+    deadline: std::time::Duration,
+    slots: &tokio::sync::Semaphore,
+) -> Response {
+    let agent = match h.agent.as_ref() {
+        Some(a) => a,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "No agent configured").into_response(),
+    };
+    let history = match h.history.as_ref() {
+        Some(hist) => hist,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "No chat store configured").into_response(),
+    };
+    let context = match history.context(&turn) {
+        Ok(c) => c,
         Err(e) => {
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation context lookup failed");
+            let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
+            return error(e);
+        }
+    };
+    let context_text = context.join("\n");
+    let plan = match crate::chat::plan_with_retry_slots(
+        slots,
+        || delegation::plan(agent, &turn.user_input, &context_text),
+        deadline,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(response) => {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&body).to_string();
             // Every planning failure is recorded with the conversation it
             // belongs to, so a lost plan is traceable from the logs alone.
-            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation planning failed");
-            if let Some(history) = &h.history {
-                let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
-            }
-            error(e)
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, status = %status, error = %text, "delegation planning failed");
+            let _ = history.finish(&turn.id, "failed", &text, None);
+            return (status, text).into_response();
         }
+    };
+    let store = match store(&h) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation store lookup failed");
+            let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
+            return error(e);
+        }
+    };
+    let reply = match start_plan(agent, &store, &turn.id, &turn.conversation_id, &plan).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation plan startup failed");
+            let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
+            return error(e);
+        }
+    };
+    // A detached run owns its own state. Finishing the receipt keeps this
+    // conversation's composer available while the real agents work.
+    if let Err(e) = history.finish(&turn.id, "completed", &plan.summary, Some(&reply)) {
+        return error(e);
     }
+    Json(reply).into_response()
 }
 
 /// How long Hive gives one container to be created, image build included.
@@ -965,6 +994,44 @@ mod tests {
             history: None,
             master_name: "master".into(),
         }
+    }
+
+    fn handle_with_history() -> AgentHandle {
+        let agent = std::sync::Arc::new(hive_core::agent::MasterAgent::new(
+            hive_core::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            hive_core::workers::WorkerPool::new(vec![]),
+            hive_core::skills::SkillRegistry::new(),
+            hive_core::memory::MemorySystem::new(),
+        ));
+        AgentHandle::enabled(agent, "master".into()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn planning_deadline_failure_preserves_504_status() {
+        let h = handle_with_history();
+        let history = h.history.as_ref().unwrap();
+        let chat = history.create(None).unwrap();
+        let start_turn = history.begin(&chat.id, "req-1", "test prompt").unwrap();
+        let turn = match start_turn {
+            hive_core::memory::chats::StartTurn::New(t) => t,
+            _ => unreachable!(),
+        };
+        let slots = tokio::sync::Semaphore::new(2);
+        let response = process_with_deadline_slots(
+            h.clone(),
+            turn.clone(),
+            std::time::Duration::from_millis(20),
+            &slots,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Planning timed out"), "{text}");
+        assert!(text.contains("retry also timed out"), "{text}");
+
+        let saved = history.turn(&turn.id).unwrap().unwrap();
+        assert_eq!(saved.status, "failed");
     }
     #[tokio::test]
     async fn run_list_filters_by_state_and_task() {

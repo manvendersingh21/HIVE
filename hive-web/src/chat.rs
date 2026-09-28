@@ -25,8 +25,10 @@ use tracing::{info, warn};
 
 // Planner-call budget, chat path:
 // 1. Concurrency limit: PLANNER_SLOTS bounds concurrent planning calls to 2.
-// 2. Semaphore exclusion: The permit is acquired *before* the deadline timer starts
-//    in `bounded_plan`, so waiting in the semaphore queue does NOT count against `deadline`.
+// 2. Permit wait bounding: In `bounded_plan`, acquiring a permit from `slots` is bounded by
+//    the whole-request budget (PLANNING_TIMEOUT + retry, i.e. 2 * deadline). Waiting does not
+//    consume the single-attempt `deadline` timer once the permit is acquired, but the wait itself
+//    is capped so queued requests cannot hang indefinitely.
 // 3. Deadline hierarchy: A single planning attempt runs within PLANNING_TIMEOUT (150s).
 //    Inside this window, NVIDIA's own overall deadline is 120s by default (split into
 //    an ~80s / ~2/3 first attempt, and the remaining budget for retries). This leaves
@@ -39,21 +41,32 @@ const CONTINUATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Bounds how many planner calls run at once. The planner hits a single
 /// upstream model endpoint; two concurrent plans is the most it serves
 /// without timing out.
-static PLANNER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+pub(crate) static PLANNER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 // Bound the whole planning phase, including sequential model and memory calls.
 // This future never executes commands, so dropping it on timeout is safe.
-// The permit is acquired before the timer starts, so semaphore wait time does
-// not count against `deadline`; the permit is then held for the whole call,
-// bounding concurrent planner calls.
-async fn bounded_plan<T>(
+// Waiting for a permit from `slots` is bounded by the whole-request budget
+// (PLANNING_TIMEOUT + retry, or 2 * deadline) as a cap on wait+plan, so
+// queued requests cannot hang indefinitely. Once acquired, the deadline timer
+// starts, bounding concurrent planner calls.
+pub(crate) async fn bounded_plan<T>(
+    slots: &tokio::sync::Semaphore,
     plan: impl std::future::Future<Output = anyhow::Result<T>>,
     deadline: std::time::Duration,
 ) -> Result<T, Response> {
-    let _permit = PLANNER_SLOTS
-        .acquire()
-        .await
-        .expect("planner semaphore is never closed");
+    let wait_budget = deadline * 2;
+    let _permit = match tokio::time::timeout(wait_budget, slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => panic!("planner semaphore is closed"),
+        Err(_) => {
+            warn!("planner semaphore permit wait timed out");
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "Planning timed out waiting for an available planner slot. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
+            )
+                .into_response());
+        }
+    };
     match tokio::time::timeout(deadline, plan).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => {
@@ -83,12 +96,24 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    match bounded_plan(make_plan(), deadline).await {
+    plan_with_retry_slots(&PLANNER_SLOTS, make_plan, deadline).await
+}
+
+pub(crate) async fn plan_with_retry_slots<T, F, Fut>(
+    slots: &tokio::sync::Semaphore,
+    make_plan: F,
+    deadline: std::time::Duration,
+) -> Result<T, Response>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match bounded_plan(slots, make_plan(), deadline).await {
         Ok(plan) => Ok(plan),
         Err(response) if response.status() != StatusCode::GATEWAY_TIMEOUT => Err(response),
         Err(_) => {
             warn!("planning deadline exceeded; retrying the whole plan once");
-            match bounded_plan(make_plan(), deadline).await {
+            match bounded_plan(slots, make_plan(), deadline).await {
                 Ok(plan) => Ok(plan),
                 Err(response) if response.status() == StatusCode::GATEWAY_TIMEOUT => Err((
                     StatusCode::GATEWAY_TIMEOUT,
@@ -518,6 +543,7 @@ async fn drive_workflow(
         let mut planning_attempts = 0;
         let next = loop {
             let proposed = bounded_plan(
+                &PLANNER_SLOTS,
                 agent.continue_run(&reply.run, &reply.result, reply.workflow.as_ref().unwrap()),
                 CONTINUATION_TIMEOUT,
             )
@@ -1320,10 +1346,12 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn a_planning_deadline_failure_is_retried_once_and_can_succeed() {
+        let slots = tokio::sync::Semaphore::new(2);
         let attempts = Arc::new(AtomicUsize::new(0));
         let seen = attempts.clone();
         let plan = empty_plan();
-        let result = plan_with_retry(
+        let result = plan_with_retry_slots(
+            &slots,
             move || {
                 let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
                 let plan = plan.clone();
@@ -1345,7 +1373,9 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn a_second_deadline_failure_tells_the_user_what_to_do() {
-        let response = plan_with_retry(
+        let slots = tokio::sync::Semaphore::new(2);
+        let response = plan_with_retry_slots(
+            &slots,
             || std::future::pending::<anyhow::Result<PlannedRun>>(),
             Duration::from_millis(20),
         )
@@ -1366,36 +1396,72 @@ mod deadline_tests {
         // Both slots occupied: the caller below must wait longer than its
         // own deadline before its plan even starts. If the permit wait
         // counted against the deadline, this call would time out; it must
-        // instead succeed once a slot frees up.
-        let hog1 = PLANNER_SLOTS.acquire().await.unwrap();
-        let hog2 = PLANNER_SLOTS.acquire().await.unwrap();
-        let waiter = tokio::spawn(bounded_plan(
-            async { anyhow::Ok(()) },
-            Duration::from_millis(50),
-        ));
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // instead succeed once a slot frees up (within the whole-request budget).
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let hog1 = slots.clone().acquire_owned().await.unwrap();
+        let hog2 = slots.clone().acquire_owned().await.unwrap();
+        let s = slots.clone();
+        let waiter = tokio::spawn(async move {
+            bounded_plan(
+                &s,
+                async { anyhow::Ok(()) },
+                Duration::from_millis(50),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(75)).await;
         drop(hog1);
         drop(hog2);
         assert!(waiter.await.unwrap().is_ok());
     }
 
     #[tokio::test]
+    async fn waiting_for_a_planner_slot_beyond_whole_request_budget_times_out() {
+        // When all slots stay occupied beyond whole-request budget (2 * deadline),
+        // the permit wait times out with GATEWAY_TIMEOUT.
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let _hog1 = slots.clone().acquire_owned().await.unwrap();
+        let _hog2 = slots.clone().acquire_owned().await.unwrap();
+        let s = slots.clone();
+        let waiter = tokio::spawn(async move {
+            bounded_plan(
+                &s,
+                async { anyhow::Ok(()) },
+                Duration::from_millis(30),
+            )
+            .await
+        });
+        let response = waiter.await.unwrap().unwrap_err();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("No commands were executed"), "{text}");
+    }
+
+    #[tokio::test]
     async fn planner_calls_are_bounded_to_two_concurrent() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
         let inside = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let tasks: Vec<_> = (0..4)
             .map(|_| {
-                let (inside, peak) = (inside.clone(), peak.clone());
-                tokio::spawn(bounded_plan(
-                    async move {
-                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(now, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(60)).await;
-                        inside.fetch_sub(1, Ordering::SeqCst);
-                        anyhow::Ok(())
-                    },
-                    Duration::from_secs(30),
-                ))
+                let (slots, inside, peak) = (slots.clone(), inside.clone(), peak.clone());
+                tokio::spawn(async move {
+                    bounded_plan(
+                        &slots,
+                        async move {
+                            let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                            anyhow::Ok(())
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await
+                })
             })
             .collect();
         for task in tasks {
@@ -1417,7 +1483,9 @@ mod deadline_tests {
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         let guard = PendingWork(cancelled.clone());
+        let slots = tokio::sync::Semaphore::new(2);
         let response = bounded_plan(
+            &slots,
             async move {
                 let _guard = guard;
                 std::future::pending::<anyhow::Result<PlannedRun>>().await
@@ -1438,7 +1506,9 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn provider_failure_is_reported_without_waiting_for_total_deadline() {
+        let slots = tokio::sync::Semaphore::new(2);
         let response = bounded_plan::<()>(
+            &slots,
             async { anyhow::bail!("NVIDIA request deadline exceeded") },
             Duration::from_secs(150),
         )

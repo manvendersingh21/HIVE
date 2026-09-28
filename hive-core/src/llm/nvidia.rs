@@ -198,14 +198,25 @@ impl NvidiaClient {
                 }
                 .max(Duration::from_millis(1));
 
-                let response = self
-                    .http
-                    .post(format!("{}/chat/completions", self.base_url))
-                    .bearer_auth(key)
-                    .json(&body)
-                    .timeout(attempt_timeout)
-                    .send()
-                    .await;
+                // Limit only time-to-headers; body progress is governed by
+                // idle_timeout and the overall deadline.
+                let response = match tokio::time::timeout(
+                    attempt_timeout,
+                    self.http
+                        .post(format!("{}/chat/completions", self.base_url))
+                        .bearer_auth(key)
+                        .json(&body)
+                        .send(),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) if attempt + 1 < ATTEMPTS => {
+                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                        continue;
+                    }
+                    Err(_) => anyhow::bail!("NVIDIA streaming response headers timed out"),
+                };
 
                 let mut r = match response {
                     Ok(r) => {
@@ -255,22 +266,26 @@ impl NvidiaClient {
 
                 let mut full_text = String::new();
                 let mut model_name = self.model.clone();
-                let mut line_buffer = String::new();
+                let mut line_buffer: Vec<u8> = Vec::new();
                 let mut finish_reason = None;
                 let mut stream_retry = false;
 
-                loop {
+                'stream: loop {
                     let chunk_result = tokio::time::timeout(idle_timeout, r.chunk()).await;
                     match chunk_result {
                         Ok(Ok(Some(bytes))) => {
-                            line_buffer.push_str(&String::from_utf8_lossy(&bytes));
-                            while let Some(idx) = line_buffer.find('\n') {
-                                let line = line_buffer[..idx].trim().to_string();
-                                line_buffer = line_buffer[idx + 1..].to_string();
+                            line_buffer.extend_from_slice(&bytes);
+                            anyhow::ensure!(
+                                line_buffer.len() <= 1 << 20,
+                                "NVIDIA streaming line exceeds 1 MiB"
+                            );
+                            while let Some(idx) = line_buffer.iter().position(|&b| b == b'\n') {
+                                let raw: Vec<u8> = line_buffer.drain(..=idx).collect();
+                                let line = String::from_utf8_lossy(&raw).trim().to_string();
                                 if let Some(data) = line.strip_prefix("data: ") {
                                     let data = data.trim();
                                     if data == "[DONE]" {
-                                        break;
+                                        break 'stream;
                                     }
                                     if let Ok(val) = serde_json::from_str::<Value>(data) {
                                         if let Some(m) = val["model"].as_str() {
@@ -294,13 +309,13 @@ impl NvidiaClient {
                             }
                         }
                         Ok(Ok(None)) => {
-                            break;
+                            break 'stream;
                         }
                         Ok(Err(e)) => {
                             let retry = e.is_connect() || e.is_timeout();
                             if retry && attempt + 1 < ATTEMPTS {
                                 stream_retry = true;
-                                break;
+                                break 'stream;
                             }
                             return Err(anyhow::anyhow!(
                                 "NVIDIA streaming transport error: {}",
@@ -310,7 +325,7 @@ impl NvidiaClient {
                         Err(_) => {
                             if attempt + 1 < ATTEMPTS {
                                 stream_retry = true;
-                                break;
+                                break 'stream;
                             }
                             anyhow::bail!("NVIDIA streaming idle timeout exceeded");
                         }
@@ -322,7 +337,7 @@ impl NvidiaClient {
                     continue;
                 }
 
-                let remaining = line_buffer.trim();
+                let remaining = String::from_utf8_lossy(&line_buffer).trim().to_string();
                 if let Some(data) = remaining.strip_prefix("data: ") {
                     let data = data.trim();
                     if data != "[DONE]" {
@@ -346,12 +361,11 @@ impl NvidiaClient {
                     }
                 }
 
-                if let Some(fr) = finish_reason {
-                    anyhow::ensure!(
-                        fr == "stop",
-                        "NVIDIA response incomplete or truncated (finish_reason: {fr})"
-                    );
-                }
+                anyhow::ensure!(
+                    finish_reason.as_deref() == Some("stop"),
+                    "NVIDIA response incomplete or truncated (finish_reason: {})",
+                    finish_reason.as_deref().unwrap_or("none")
+                );
                 let text = full_text.trim();
                 anyhow::ensure!(!text.is_empty(), "NVIDIA returned an empty final answer");
                 return Ok(super::LlmResponse {
@@ -586,8 +600,8 @@ pub(crate) mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
-    pub async fn streaming_server(
-        replies: Vec<(u16, Vec<(&'static str, Duration)>)>,
+    pub async fn streaming_server_bytes(
+        replies: Vec<(u16, Vec<(Vec<u8>, Duration)>)>,
     ) -> (String, Requests, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -650,13 +664,33 @@ pub(crate) mod tests {
                             _ = stream.read(&mut eof) => break,
                         }
                     }
-                    if stream.write_all(chunk.as_bytes()).await.is_err() {
+                    if stream.write_all(&chunk).await.is_err() {
                         break;
                     }
                 }
             }
         });
         (url, requests, task)
+    }
+
+    pub async fn streaming_server(
+        replies: Vec<(u16, Vec<(&'static str, Duration)>)>,
+    ) -> (String, Requests, tokio::task::JoinHandle<()>) {
+        streaming_server_bytes(
+            replies
+                .into_iter()
+                .map(|(status, chunks)| {
+                    (
+                        status,
+                        chunks
+                            .into_iter()
+                            .map(|(s, d)| (s.as_bytes().to_vec(), d))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -729,6 +763,89 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("deadline"), "{err}");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_split_utf8_across_chunks_is_preserved() {
+        // "✓" is 3 bytes in UTF-8: 0xE2, 0x9C, 0x93
+        let part1 = b"data: {\"choices\":[{\"delta\":{\"content\":\"valid \xe2".to_vec();
+        let part2 = b"\x9c\x93 plan\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_vec();
+        let (url, _, task) = streaming_server_bytes(vec![(
+            200,
+            vec![
+                (part1, Duration::ZERO),
+                (part2, Duration::ZERO),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.stream = true;
+        let resp = r.nvidia.complete("make plan", "high").await.unwrap();
+        assert_eq!(resp.text, "valid ✓ plan");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_finish_reason_validation() {
+        // Case 1: finish_reason is "length"
+        let (url, _, task) = streaming_server(vec![(
+            200,
+            vec![
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"truncated plan\"},\"finish_reason\":\"length\"}]}\n\n", Duration::ZERO),
+                ("data: [DONE]\n\n", Duration::ZERO),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.stream = true;
+        let err = r.nvidia.complete("make plan", "high").await.unwrap_err().to_string();
+        assert!(err.contains("finish_reason: length"), "{err}");
+        task.await.unwrap();
+
+        // Case 2: stream ends without finish_reason before [DONE] or EOF
+        let (url, _, task) = streaming_server(vec![(
+            200,
+            vec![
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"incomplete plan\"}}]}\n\n", Duration::ZERO),
+                ("data: [DONE]\n\n", Duration::ZERO),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.stream = true;
+        let err = r.nvidia.complete("make plan", "high").await.unwrap_err().to_string();
+        assert!(err.contains("finish_reason: none"), "{err}");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_slow_steady_stream_exceeding_first_attempt_share_succeeds() {
+        // Total deadline = 1500 ms. First attempt share in non-streaming would be ~1000 ms.
+        // 6 chunks arriving every 200 ms = ~1200 ms total, well within 1500 ms deadline.
+        // In streaming mode, body read must NOT time out on the 1000 ms header timeout.
+        let (url, requests, task) = streaming_server(vec![(
+            200,
+            vec![
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 1 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 2 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 3 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 4 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 5 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 6\"},\"finish_reason\":\"stop\"}]}\n\n", Duration::from_millis(200)),
+                ("data: [DONE]\n\n", Duration::ZERO),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.deadline = Duration::from_millis(1500);
+        let resp = r
+            .nvidia
+            .complete_streaming_with_idle("plan", "high", Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(resp.text, "chunk 1 chunk 2 chunk 3 chunk 4 chunk 5 chunk 6");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
