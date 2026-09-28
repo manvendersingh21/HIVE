@@ -123,10 +123,13 @@ impl RunStore {
           CREATE TABLE IF NOT EXISTS delegated_contracts (task_id TEXT NOT NULL, party_a TEXT NOT NULL, party_b TEXT NOT NULL, contract TEXT NOT NULL, PRIMARY KEY(task_id,party_a,party_b));")?;
         {
             let db = conn.lock().unwrap();
-            db.execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0,continue_reviews INTEGER NOT NULL DEFAULT 0);")?;
+            db.execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0,continue_reviews INTEGER NOT NULL DEFAULT 0,claim_token TEXT NOT NULL DEFAULT '');")?;
             // A database created before review rounds were bounded has no counter yet.
             if db.prepare("SELECT continue_reviews FROM delegated_reviews").is_err() {
                 db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN continue_reviews INTEGER NOT NULL DEFAULT 0;")?;
+            }
+            if db.prepare("SELECT claim_token FROM delegated_reviews").is_err() {
+                db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN claim_token TEXT NOT NULL DEFAULT '';")?;
             }
         }
         {
@@ -175,10 +178,17 @@ impl RunStore {
             .filter(|r| r.task_id == task)
             .collect())
     }
-    pub fn claim_review(&self, task: &str, cursor: &str) -> anyhow::Result<bool> {
+    pub fn claim_review(&self, task: &str, cursor: &str) -> anyhow::Result<Option<String>> {
         let db = self.0.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
-        Ok(db.execute("INSERT INTO delegated_reviews(task_id,cursor,lock_until) VALUES (?,?,?) ON CONFLICT(task_id) DO UPDATE SET cursor=excluded.cursor,status='reviewing',lock_until=excluded.lock_until WHERE delegated_reviews.lock_until<? AND (delegated_reviews.cursor!=excluded.cursor OR delegated_reviews.status='reviewing')",params![task,cursor,now+240,now])?==1)
+        let token = uuid::Uuid::new_v4().to_string();
+        let changed = db.execute(
+            "INSERT INTO delegated_reviews(task_id,cursor,lock_until,claim_token) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(task_id) DO UPDATE SET cursor=excluded.cursor,status='reviewing',lock_until=excluded.lock_until,claim_token=excluded.claim_token
+             WHERE delegated_reviews.lock_until<?5 AND (delegated_reviews.cursor!=excluded.cursor OR delegated_reviews.status='reviewing')",
+            params![task, cursor, now + 240, token, now],
+        )?;
+        Ok(if changed == 1 { Some(token) } else { None })
     }
     /// Consecutive `continue` rounds already spent on a task. Reset whenever a
     /// review settles the task, so the bound only ever counts real rounds.
@@ -194,13 +204,20 @@ impl RunStore {
         &self,
         task: &str,
         cursor: &str,
+        claim_token: &str,
         status: &str,
         summary: &str,
         messages: &[(String, Value)],
     ) -> anyhow::Result<()> {
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        anyhow::ensure!(tx.execute("UPDATE delegated_reviews SET status=?,summary=?,lock_until=0,continue_reviews=CASE WHEN ?='continue' THEN continue_reviews+1 ELSE 0 END WHERE task_id=? AND cursor=?",params![status,summary,status,task,cursor])?==1,"Review was superseded");
+        anyhow::ensure!(
+            tx.execute(
+                "UPDATE delegated_reviews SET status=?,summary=?,lock_until=0,claim_token='',continue_reviews=CASE WHEN ?='continue' THEN continue_reviews+1 ELSE 0 END WHERE task_id=? AND cursor=? AND claim_token=?",
+                params![status, summary, status, task, cursor, claim_token]
+            )? == 1,
+            "Review was superseded"
+        );
         for (destination, payload) in messages {
             let same_task: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM delegated_runs WHERE id=? AND task_id=? AND state!='superseded')",
@@ -672,9 +689,9 @@ mod tests {
         let s = RunStore::new(g.shared_conn()).unwrap();
         let run = s.create("task", "chat", &plan()).unwrap().remove(0);
         let other = s.create("other", "chat", &plan()).unwrap().remove(0);
-        assert!(s.claim_review("task", "cursor-1").unwrap());
-        assert!(!s.claim_review("task", "cursor-1").unwrap());
-        assert!(!s.claim_review("task", "cursor-2").unwrap());
+        let token1 = s.claim_review("task", "cursor-1").unwrap().unwrap();
+        assert!(s.claim_review("task", "cursor-1").unwrap().is_none());
+        assert!(s.claim_review("task", "cursor-2").unwrap().is_none());
         // Simulate coordinator recovery after the existing review lease expires.
         g.shared_conn()
             .lock()
@@ -684,14 +701,15 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(s.claim_review("task", "cursor-2").unwrap());
+        let token2 = s.claim_review("task", "cursor-2").unwrap().unwrap();
         assert!(s
-            .finish_review("task", "cursor-1", "complete", "old result", &[])
+            .finish_review("task", "cursor-1", &token1, "complete", "old result", &[])
             .is_err());
         let message = json!({"id":"review-message","text":"verify hashes"});
         s.finish_review(
             "task",
             "cursor-2",
+            &token2,
             "continue",
             "verification required",
             &[(run.id.clone(), message.clone())],
@@ -706,8 +724,8 @@ mod tests {
             "verification required"
         );
         assert_eq!(s.pending_messages(&run.id).unwrap(), vec![message.clone()]);
-        assert!(!s.claim_review("task", "cursor-2").unwrap());
-        assert!(s.claim_review("task", "cursor-3").unwrap());
+        assert!(s.claim_review("task", "cursor-2").unwrap().is_none());
+        let token3 = s.claim_review("task", "cursor-3").unwrap().unwrap();
         let valid = (run.id.clone(), json!({"id":"valid","text":"one"}));
         let changed = (
             run.id.clone(),
@@ -717,6 +735,7 @@ mod tests {
             .finish_review(
                 "task",
                 "cursor-3",
+                &token3,
                 "continue",
                 "must roll back",
                 &[valid.clone(), changed]
@@ -728,17 +747,57 @@ mod tests {
             .finish_review(
                 "task",
                 "cursor-3",
+                &token3,
                 "continue",
                 "wrong task",
                 &[valid, (other.id, json!({"id":"cross-task","text":"bad"}))]
             )
             .is_err());
         assert_eq!(s.pending_messages(&run.id).unwrap(), vec![message]);
-        s.finish_review("task", "cursor-3", "complete", "verified", &[])
+        s.finish_review("task", "cursor-3", &token3, "complete", "verified", &[])
             .unwrap();
         drop(s);
         drop(g);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn two_claims_of_same_cursor_with_first_expiring_increments_continue_reviews_once() {
+        let path = std::env::temp_dir().join(format!("hive-review-claim-{}.db", uuid::Uuid::new_v4()));
+        let g = crate::memory::graph::KnowledgeGraph::open(&path).unwrap();
+        let s = RunStore::new(g.shared_conn()).unwrap();
+        let _run = s.create("task", "chat", &plan()).unwrap().remove(0);
+
+        // First claim of cursor-1
+        let token1 = s.claim_review("task", "cursor-1").unwrap().expect("first claim must succeed");
+        assert_eq!(s.continue_reviews("task").unwrap(), 0);
+
+        // Simulate lease expiration of the first claim
+        g.shared_conn()
+            .lock()
+            .unwrap()
+            .execute("UPDATE delegated_reviews SET lock_until=0 WHERE task_id='task'", [])
+            .unwrap();
+
+        // Second claim of the same cursor-1 succeeds with a new token
+        let token2 = s.claim_review("task", "cursor-1").unwrap().expect("second claim must succeed");
+        assert_ne!(token1, token2);
+
+        // Both finish:
+        // First claim finishes, but its token was superseded so it must be rejected
+        let res1 = s.finish_review("task", "cursor-1", &token1, "continue", "expired review result", &[]);
+        assert!(res1.is_err(), "superseded claim token must be rejected");
+
+        // Second claim finishes as the current token holder
+        let res2 = s.finish_review("task", "cursor-1", &token2, "continue", "active review result", &[]);
+        assert!(res2.is_ok(), "current claim token holder must succeed");
+
+        // continue_reviews increased by exactly 1
+        assert_eq!(s.continue_reviews("task").unwrap(), 1);
+
+        drop(s);
+        drop(g);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

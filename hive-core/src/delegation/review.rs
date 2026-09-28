@@ -230,9 +230,10 @@ pub async fn task(agent: &MasterAgent, store: &RunStore, runs: &[Run]) -> anyhow
         .map(|r| format!("{}:{}", r.id, r.cursor))
         .collect::<Vec<_>>()
         .join(";");
-    if !store.claim_review(task, &signature)? {
-        return Ok(());
-    }
+    let claim_token = match store.claim_review(task, &signature)? {
+        Some(token) => token,
+        None => return Ok(()),
+    };
     let mut evidence = Vec::new();
     for run in runs {
         let (outputs, peer_events) = run_evidence(store, run)?;
@@ -298,7 +299,7 @@ pub async fn task(agent: &MasterAgent, store: &RunStore, runs: &[Run]) -> anyhow
     );
     anyhow::ensure!(!review.objective_result_note.trim().is_empty(), "Review must compare objective and result");
     let summary = format!("{}\nObjective versus result: {}", summary, review.objective_result_note);
-    store.finish_review(task, &signature, &status, &summary, &messages)?;
+    store.finish_review(task, &signature, &claim_token, &status, &summary, &messages)?;
     Ok(())
 }
 
@@ -665,22 +666,22 @@ mod tests {
         assert_eq!(store.continue_reviews("task").unwrap(), 0);
         for round in 1..=MAX_CONTINUE_REVIEWS {
             let cursor = format!("cursor-{round}");
-            assert!(store.claim_review("task", &cursor).unwrap());
+            let token = store.claim_review("task", &cursor).unwrap().unwrap();
             store
-                .finish_review("task", &cursor, "continue", "more work needed", &[])
+                .finish_review("task", &cursor, &token, "continue", "more work needed", &[])
                 .unwrap();
             assert_eq!(store.continue_reviews("task").unwrap(), round);
         }
         // The store only counts; refusing the fourth round is review.rs's job.
-        assert!(store.claim_review("task", "cursor-4").unwrap());
+        let token = store.claim_review("task", "cursor-4").unwrap().unwrap();
         store
-            .finish_review("task", "cursor-4", "continue", "one more try", &[])
+            .finish_review("task", "cursor-4", &token, "continue", "one more try", &[])
             .unwrap();
         assert_eq!(store.continue_reviews("task").unwrap(), 4);
         // A settled task clears the budget.
-        assert!(store.claim_review("task", "cursor-5").unwrap());
+        let token = store.claim_review("task", "cursor-5").unwrap().unwrap();
         store
-            .finish_review("task", "cursor-5", "complete", "verified", &[])
+            .finish_review("task", "cursor-5", &token, "complete", "verified", &[])
             .unwrap();
         assert_eq!(store.continue_reviews("task").unwrap(), 0);
         assert_eq!(store.continue_reviews("never-reviewed").unwrap(), 0);
@@ -688,7 +689,7 @@ mod tests {
         drop(graph);
         let graph = KnowledgeGraph::open(&path).unwrap();
         let store = RunStore::new(graph.shared_conn()).unwrap();
-        assert!(store.claim_review("task", "cursor-6").unwrap());
+        assert!(store.claim_review("task", "cursor-6").unwrap().is_some());
         assert_eq!(store.continue_reviews("task").unwrap(), 0);
     }
 }
