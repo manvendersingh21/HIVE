@@ -172,7 +172,41 @@ pub async fn add(State(h): State<AgentHandle>, Json(req): Json<AddRequest>) -> R
     (StatusCode::CREATED, Json(json!({"name": entry.name}))).into_response()
 }
 
-pub async fn remove(Path(name): Path<String>) -> Response {
+#[derive(Deserialize)]
+pub struct RemoveQuery {
+    #[serde(default)]
+    delete: bool,
+}
+
+/// Forget a container. `?delete=1` also deletes one Hive created; a container
+/// Hive didn't create is never deleted, only forgotten.
+pub async fn remove(
+    State(h): State<AgentHandle>,
+    Path(name): Path<String>,
+    Query(q): Query<RemoveQuery>,
+) -> Response {
+    if q.delete {
+        let Some(entry) = containers::load().into_iter().find(|c| c.name == name) else {
+            return (StatusCode::NOT_FOUND, format!("No container named {name}")).into_response();
+        };
+        if !entry.managed {
+            return bad(format!("{name} wasn't created by Hive; it can only be removed from the list"));
+        }
+        let agent = match h.require() {
+            Ok(agent) => agent,
+            Err(response) => return response,
+        };
+        let Some(machine) = delegation::machine(agent, &entry.host) else {
+            return bad(format!("{} is no longer a configured machine", entry.host));
+        };
+        return match containers::delete(&machine, &entry).await {
+            Ok(()) => {
+                tracing::info!(container = %name, "managed container deleted");
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        };
+    }
     match containers::remove(&name) {
         Ok(removed) => {
             tracing::info!(container = %removed.name, "container removed");
