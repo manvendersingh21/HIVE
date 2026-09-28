@@ -401,19 +401,32 @@ pub fn start(h: AgentHandle) {
     tokio::spawn(async move {
         let mut active: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
             std::collections::HashMap::new();
+        let unacknowledged = Unacknowledged::default();
         loop {
             if let Ok(store) = store(&h) {
                 if let Ok(runs) = store.list() {
+                    // A run that no longer exists can never acknowledge anything.
+                    unacknowledged
+                        .lock()
+                        .unwrap()
+                        .retain(|id, _| runs.iter().any(|run| &run.id == id));
                     for run in &runs {
                         if active.get(&run.id).is_some_and(|task| !task.is_finished()) {
                             continue;
                         }
-                        let (h, store, run, runs) =
-                            (h.clone(), store.clone(), run.clone(), runs.clone());
+                        let (h, store, run, runs, unacknowledged) = (
+                            h.clone(),
+                            store.clone(),
+                            run.clone(),
+                            runs.clone(),
+                            unacknowledged.clone(),
+                        );
                         active.insert(
                             run.id.clone(),
                             tokio::spawn(async move {
-                                if let Err(error) = sync_run(&h, &store, &run, &runs).await {
+                                if let Err(error) =
+                                    sync_run(&h, &store, &run, &runs, &unacknowledged).await
+                                {
                                     let _ =
                                         store.state(&run.id, "disconnected", &error.to_string());
                                     // Holding the task open keeps this run out of the
@@ -449,13 +462,61 @@ fn apply_runtime_evidence(attrs: &mut Value, metadata: &Value) -> bool {
 ///
 /// A run whose agent session has ended can't change at all: its journal still
 /// reports the last state, so syncing it would only revive that stale state.
-fn idle(store: &RunStore, run: &Run) -> anyhow::Result<bool> {
+fn idle(
+    store: &RunStore,
+    run: &Run,
+    unacknowledged: &Unacknowledged,
+) -> anyhow::Result<bool> {
     if run.state == "disconnected" && run.metadata["reason"] == SESSION_ENDED {
         return Ok(true);
     }
+    let delivered = unacknowledged.lock().unwrap();
     Ok(run.state == "completed"
         && store.pending_decisions(&run.id)?.is_empty()
-        && store.pending_messages(&run.id)?.is_empty())
+        && store.pending_messages(&run.id)?.is_empty()
+        && delivered.get(&run.id).is_none_or(|ids| ids.is_empty()))
+}
+
+/// Delivered message IDs per run whose journal acknowledgment is not synced yet.
+///
+/// Handing a message to a runner only queues it in the remote inbox. The turn it
+/// provokes emits an `acknowledgment` event carrying that message ID, and the
+/// state it finishes in arrives after it. A completed run that received a
+/// message therefore still has events to import, and is not idle until its
+/// journal has confirmed every message Hive delivered.
+type Unacknowledged =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>;
+
+/// Remembers a delivered message so its run keeps syncing until the journal
+/// acknowledges it.
+fn deliver(unacknowledged: &Unacknowledged, run: &str, message: &str) {
+    let mut unacknowledged = unacknowledged.lock().unwrap();
+    let delivered = unacknowledged.entry(run.to_string()).or_default();
+    if !delivered.iter().any(|id| id == message) {
+        delivered.push(message.to_string());
+    }
+}
+
+/// Retires the delivered messages that a synced snapshot acknowledges. Only the
+/// exact message IDs count, so an unrelated event never ends a revival.
+fn acknowledge(unacknowledged: &Unacknowledged, run: &str, snapshot: &Value) {
+    let acknowledged: std::collections::HashSet<&str> = snapshot["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| event["kind"] == "acknowledgment")
+        .filter_map(|event| event["payload"]["message_id"].as_str())
+        .collect();
+    if acknowledged.is_empty() {
+        return;
+    }
+    let mut unacknowledged = unacknowledged.lock().unwrap();
+    if let Some(delivered) = unacknowledged.get_mut(run) {
+        delivered.retain(|id| !acknowledged.contains(id.as_str()));
+        if delivered.is_empty() {
+            unacknowledged.remove(run);
+        }
+    }
 }
 
 const SESSION_ENDED: &str = "The agent's session has ended, so this run can't continue.";
@@ -482,8 +543,9 @@ async fn sync_run(
     store: &RunStore,
     run: &Run,
     runs: &[Run],
+    unacknowledged: &Unacknowledged,
 ) -> anyhow::Result<()> {
-    if idle(store, run)? {
+    if idle(store, run, unacknowledged)? {
         return Ok(());
     }
     let agent = h.agent.as_ref().unwrap();
@@ -636,6 +698,9 @@ async fn sync_run(
         }
     }
     store.sync(&run.id, &snapshot)?;
+    // The journal's report is authoritative, so a message it acknowledged in
+    // this snapshot no longer needs a run that keeps syncing for it.
+    acknowledge(unacknowledged, &run.id, &snapshot);
     // Re-evaluate pending actions with the current deterministic policy. This
     // permits routine controls when an older persistent runner asked too broadly.
     // The policy only inspects arguments and paths; it never executes the action.
@@ -680,8 +745,13 @@ async fn sync_run(
         store.decision_delivered(&run.id, decision["id"].as_str().unwrap())?;
     }
     for message in store.pending_messages(&run.id)? {
+        let id = message["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Message ID missing"))?
+            .to_string();
         transport::control(&worker, runner, "enqueue", &run.id, 0, Some(&message)).await?;
-        store.message_delivered(message["id"].as_str().unwrap())?;
+        store.message_delivered(&id)?;
+        deliver(unacknowledged, &run.id, &id);
     }
     // Only a completed native invocation proves a model works; the runtime's
     // own catalog is recorded even when that first call failed, so the user
@@ -814,14 +884,15 @@ mod tests {
     fn runs_whose_session_ended_are_never_synced_again() {
         let h = handle();
         let store = store(&h).unwrap();
+        let unacknowledged = Unacknowledged::default();
         let id = run_with_events(&h, 0);
         store.state(&id, "awaiting-approval", "").unwrap();
-        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
         // A runner-reported disconnect can still be reconciled, so keep syncing.
         store.state(&id, "disconnected", "Prior runner exited").unwrap();
-        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
         store.state(&id, "disconnected", SESSION_ENDED).unwrap();
-        assert!(idle(&store, &store.get(&id).unwrap()).unwrap());
+        assert!(idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
     }
     fn run_with_events(h: &AgentHandle, count: i64) -> String {
         let store = store(h).unwrap();
@@ -892,20 +963,73 @@ mod tests {
         let path = std::env::temp_dir().join(format!("hive-idle-{}.db", uuid::Uuid::new_v4()));
         let graph = hive_core::memory::graph::KnowledgeGraph::open(&path).unwrap();
         let store = RunStore::new(graph.shared_conn()).unwrap();
+        let unacknowledged = Unacknowledged::default();
         let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"claude","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
         let id = store.create("task", "chat", &plan).unwrap().remove(0).id;
-        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
         store.state(&id, "completed", "").unwrap();
-        assert!(idle(&store, &store.get(&id).unwrap()).unwrap());
+        // Nothing queued and nothing delivered: the journal cannot change, so
+        // the SSH round trip and remote runner process are skipped.
+        assert!(idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
         store
             .message("follow-up", "user", &id, &json!({"id":"follow-up","text":"verify"}))
             .unwrap();
-        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
         store.message_delivered("follow-up").unwrap();
-        assert!(idle(&store, &store.get(&id).unwrap()).unwrap());
         drop(store);
         drop(graph);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_revived_completed_run_is_synced_until_its_message_is_acknowledged() {
+        let h = handle();
+        let store = store(&h).unwrap();
+        let unacknowledged = Unacknowledged::default();
+        let id = run_with_events(&h, 0);
+        store.state(&id, "completed", "").unwrap();
+        let wake = |message: &str| {
+            store
+                .message(message, "user", &id, &json!({"id":message,"text":"verify"}))
+                .unwrap();
+        };
+        let idle_now = || idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap();
+        assert!(idle_now());
+        // A follow-up wakes the finished run, and delivering it only queues a
+        // turn in the remote inbox.
+        wake("first");
+        assert!(!idle_now());
+        store.message_delivered("first").unwrap();
+        deliver(&unacknowledged, &id, "first");
+        // The journal has not reported that turn yet, so its acknowledgment and
+        // the state it finishes in are still to be imported.
+        assert!(!idle_now());
+        // A second message revives the run again, and each is tracked on its own.
+        wake("second");
+        assert!(!idle_now());
+        store.message_delivered("second").unwrap();
+        deliver(&unacknowledged, &id, "second");
+        // Events that acknowledge nothing, and other messages' acknowledgments,
+        // leave the run waiting.
+        for event in [
+            json!({"kind":"output","payload":{"text":"working on it"}}),
+            json!({"kind":"state","payload":{"state":"working"}}),
+            json!({"kind":"acknowledgment","payload":{"message_id":"initial"}}),
+        ] {
+            acknowledge(&unacknowledged, &id, &json!({"events":[event]}));
+        }
+        assert!(!idle_now());
+        // Syncing the acknowledgment and the later state retires it, and the
+        // optimization for truly idle completed runs applies again.
+        let snapshot = json!({"metadata":{"state":"completed"},"approvals":[],"events":[
+            {"id":"ack-1","seq":1,"kind":"acknowledgment","payload":{"message_id":"first"}},
+            {"id":"state-1","seq":2,"kind":"state","payload":{"state":"working"}},
+            {"id":"ack-2","seq":3,"kind":"acknowledgment","payload":{"message_id":"second"}},
+            {"id":"state-2","seq":4,"kind":"state","payload":{"state":"completed"}}]});
+        store.sync(&id, &snapshot).unwrap();
+        acknowledge(&unacknowledged, &id, &snapshot);
+        assert_eq!(store.events(&id, 0).unwrap().len(), 4);
+        assert!(idle_now());
     }
 
     #[test]
