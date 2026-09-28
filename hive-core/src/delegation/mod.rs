@@ -1,5 +1,6 @@
 //! Durable fleet delegation. Remote journals own native conversations; the
 //! coordinator synchronizes evidence and never retries uncertain launches.
+pub mod containers;
 pub mod inventory;
 pub mod review;
 pub mod store;
@@ -30,7 +31,23 @@ pub struct Assignment {
 pub struct DelegationPlan {
     pub summary: String,
     pub assignments: Vec<Assignment>,
+    /// Containers Hive creates before any assignment starts. Only the planner
+    /// proposes them, and only when the user asked; worker agents never can.
+    #[serde(default)]
+    pub containers: Vec<NewContainer>,
 }
+
+/// A container the planner wants. Hive chooses the image, mounts and flags;
+/// the model names only the new device and the machine that runs it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NewContainer {
+    pub name: String,
+    pub host: String,
+}
+
+/// At most this many new containers per request.
+pub const MAX_NEW_CONTAINERS: usize = 2;
 
 pub fn enabled() -> bool {
     std::env::var("HIVE_DELEGATION").as_deref() == Ok("1")
@@ -70,8 +87,23 @@ fn repair_workspaces(plan: &mut DelegationPlan) {
 }
 
 /// Where delegated work for `device` runs. A configured SSH worker wins; the
-/// coordinator's own name runs agents here without SSH.
+/// coordinator's own name runs agents here without SSH; a registered
+/// container runs them inside Docker on its machine.
 pub fn target(agent: &MasterAgent, device: &str) -> Option<WorkerInfo> {
+    resolve(agent, device, &containers::load())
+}
+
+fn resolve(agent: &MasterAgent, device: &str, registered: &[containers::Container]) -> Option<WorkerInfo> {
+    machine(agent, device).or_else(|| {
+        registered
+            .iter()
+            .find(|c| c.name == device)
+            .and_then(|c| in_container(agent, c))
+    })
+}
+
+/// A fleet machine or the coordinator, never a container.
+pub fn machine(agent: &MasterAgent, device: &str) -> Option<WorkerInfo> {
     if let Some(worker) = agent.workers.find(device) {
         return Some(worker.info);
     }
@@ -82,14 +114,57 @@ pub fn target(agent: &MasterAgent, device: &str) -> Option<WorkerInfo> {
         port: None,
         tags: vec![],
         local: true,
+        container: None,
     })
 }
 
-/// Every device delegation can reach: the SSH fleet plus the coordinator.
+/// The container's machine, addressed as the container. `local` comes from
+/// the machine, never from the registry file.
+fn in_container(agent: &MasterAgent, c: &containers::Container) -> Option<WorkerInfo> {
+    let mut info = machine(agent, &c.host)?;
+    info.name = c.name.clone();
+    info.container = Some(c.container.clone());
+    Some(info)
+}
+
+/// Every device delegation can reach: the SSH fleet, the coordinator and the
+/// registered containers whose machine is still configured.
 pub fn targets(agent: &MasterAgent) -> Vec<WorkerInfo> {
     let mut all: Vec<WorkerInfo> = agent.workers.snapshot().into_iter().map(|w| w.info).collect();
-    all.extend(target(agent, agent.master_name()).filter(|t| t.local));
+    all.extend(machine(agent, agent.master_name()).filter(|t| t.local));
+    all.extend(containers::load().iter().filter_map(|c| in_container(agent, c)));
     all
+}
+
+/// New containers must be few, well named, new, and hosted on a real
+/// machine (never inside another container).
+fn validate_new_containers(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        plan.containers.len() <= MAX_NEW_CONTAINERS,
+        "At most {MAX_NEW_CONTAINERS} new containers per request"
+    );
+    let existing: Vec<String> = targets(agent).into_iter().map(|t| t.name).collect();
+    let mut names = std::collections::HashSet::new();
+    for c in &plan.containers {
+        anyhow::ensure!(
+            containers::valid_name(&c.name),
+            "Invalid container name {:?}: use letters, numbers, '-', '_' or '.'",
+            c.name
+        );
+        anyhow::ensure!(names.insert(c.name.as_str()), "Container {} is planned twice", c.name);
+        anyhow::ensure!(
+            !existing.contains(&c.name),
+            "{} already exists; use it instead of creating a container",
+            c.name
+        );
+        anyhow::ensure!(
+            machine(agent, &c.host).is_some(),
+            "Container {} must be hosted on a fleet machine or the coordinator, not {}",
+            c.name,
+            c.host
+        );
+    }
+    Ok(())
 }
 
 pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
@@ -97,13 +172,18 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
         plan.assignments.len() <= 16,
         "At most 16 assignments per task"
     );
+    validate_new_containers(plan, agent)?;
+    // Assignments may target a container this plan creates. It has no
+    // inventory yet; its setup is checked once it exists.
+    let planned: Vec<&str> = plan.containers.iter().map(|c| c.name.as_str()).collect();
     let mut keys = std::collections::HashSet::new();
     for a in &plan.assignments {
         anyhow::ensure!(
             !a.key.is_empty() && keys.insert(a.key.clone()),
             "Assignment keys must be unique"
         );
-        if target(agent, &a.device).is_none() {
+        let new_container = planned.contains(&a.device.as_str());
+        if !new_container && target(agent, &a.device).is_none() {
             anyhow::bail!("Unknown device: {}", a.device);
         }
         anyhow::ensure!(
@@ -119,6 +199,14 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             !a.objective.trim().is_empty() && !a.acceptance_criteria.is_empty(),
             "Objective and acceptance criteria required"
         );
+        if new_container {
+            anyhow::ensure!(
+                !a.required_capabilities.iter().any(|c| c == "gpu-compute" || c == "heavy-compute"),
+                "{} is a new container; it can't be promised GPU or heavy compute",
+                a.device
+            );
+            continue;
+        }
         let machine = agent
             .memory
             .graph
@@ -201,11 +289,27 @@ pub fn names_coordinator(request: &str, master: &str) -> bool {
     })
 }
 
+/// Whether the request asks for a container: creating one is never the
+/// planner's own idea.
+pub fn asks_for_container(request: &str) -> bool {
+    regex::Regex::new(r"(?i)\b(containers?|sandbox(es)?|docker)\b")
+        .is_ok_and(|r| r.is_match(request))
+}
+
+fn validate_container_request(request: &str, plan: &DelegationPlan) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        plan.containers.is_empty() || asks_for_container(request),
+        "The user did not ask for a new container; use existing devices and return an empty containers list"
+    );
+    Ok(())
+}
+
 /// Agents on the coordinator sit next to Hive's own config and database, so
-/// work goes there only when the user asks for that machine by name.
+/// work goes there only when the user asks for that machine by name. A
+/// container on the coordinator is walled off from both and needs no ask.
 fn validate_coordinator(request: &str, plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
     for a in &plan.assignments {
-        if target(agent, &a.device).is_some_and(|t| t.local) {
+        if target(agent, &a.device).is_some_and(|t| t.local && t.container.is_none()) {
             anyhow::ensure!(
                 names_coordinator(request, agent.master_name()),
                 "{} is the Hive coordinator; place work there only when the user names it",
@@ -317,11 +421,17 @@ pub async fn plan(
         Every workspace is a fresh unique child of ~/hive-workspaces/. Each assignment has a unique key. \
         dependencies are assignment keys that must complete before this starts; peers that must negotiate concurrently have no dependency on each other. \
         Acceptance criteria must require implementation, independent verification, deployment evidence when requested and peer agreement. \
-        For questions that need no work, answer in summary and use an empty assignments list.\n\
+        For questions that need no work, answer in summary and use an empty assignments list. \
+        containers: leave it empty unless the user explicitly asks for a new container or sandbox; existing containers are already in the fleet with a container tag, so reuse them. \
+        When asked, list at most {MAX_NEW_CONTAINERS} new containers as {{name, host}}: host is a fleet machine or the coordinator (never a container), and name becomes a new device that assignments in this plan may use. \
+        Hive creates them with its own image and the host's agent logins before any assignment starts; you never choose images, mounts or flags.\n\
         Fleet:\n{fleet}\n{coordinator}Agent inventory (installation, authentication, runtime, models and invocation evidence are distinct):\n{agents}\n\
         Prior conversation (context only):\n{history}\nUser request:\n{request}");
-    let schema = json!({"type":"object","additionalProperties":false,"required":["summary","assignments"],"properties":{
-    "summary":{"type":"string"},"assignments":{"type":"array","items":{"type":"object","additionalProperties":false,
+    let schema = json!({"type":"object","additionalProperties":false,"required":["summary","assignments","containers"],"properties":{
+    "summary":{"type":"string"},
+    "containers":{"type":"array","maxItems":MAX_NEW_CONTAINERS,"items":{"type":"object","additionalProperties":false,
+        "required":["name","host"],"properties":{"name":{"type":"string"},"host":{"type":"string"}}}},
+    "assignments":{"type":"array","items":{"type":"object","additionalProperties":false,
     "required":["key","device","agent","model","workspace","objective","dependencies","acceptance_criteria","required_capabilities"],"properties":{
         "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode"]},
         "model":{"type":["string","null"]},"workspace":{"type":"string"},"objective":{"type":"string"},
@@ -340,6 +450,7 @@ pub async fn plan(
                 validate(&p, agent)?;
                 validate_explicit(request, &p, agent)?;
                 validate_coordinator(request, &p, agent)?;
+                validate_container_request(request, &p)?;
                 Ok(p)
             });
         match parsed {
@@ -465,6 +576,7 @@ mod tests {
                 port: None,
                 tags: vec!["light".into()],
                 local: false,
+                container: None,
             }]),
             crate::skills::SkillRegistry::new(),
             crate::memory::MemorySystem::new(),
@@ -484,6 +596,73 @@ mod tests {
     fn plan() -> DelegationPlan {
         serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"claude","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap()
     }
+    fn nc(name: &str, host: &str) -> NewContainer {
+        NewContainer { name: name.into(), host: host.into() }
+    }
+
+    #[test]
+    fn plans_parse_with_and_without_containers_and_reject_extra_fields() {
+        assert!(plan().containers.is_empty());
+        let with: DelegationPlan = serde_json::from_value(json!({"summary":"s","assignments":[],
+            "containers":[{"name":"box","host":"air"}]})).unwrap();
+        assert_eq!(with.containers, vec![nc("box", "air")]);
+        // The model never picks images, mounts or flags.
+        assert!(serde_json::from_value::<DelegationPlan>(json!({"summary":"s","assignments":[],
+            "containers":[{"name":"box","host":"air","image":"alpine"}]})).is_err());
+    }
+
+    #[test]
+    fn assignments_may_target_a_container_the_plan_creates() {
+        let agent = agent();
+        let mut p = plan();
+        p.containers = vec![nc("sandbox-1", agent.master_name())];
+        p.assignments[0].device = "sandbox-1".into();
+        validate(&p, &agent).unwrap();
+        // Without the container in the plan the device is unknown.
+        p.containers.clear();
+        assert_eq!(validate(&p, &agent).unwrap_err().to_string(), "Unknown device: sandbox-1");
+        // A brand-new container can't be promised heavy compute.
+        p.containers = vec![nc("sandbox-1", "air")];
+        p.assignments[0].required_capabilities = vec!["gpu-compute".into()];
+        assert!(validate(&p, &agent).unwrap_err().to_string().contains("new container"));
+        // Dependency checks still apply.
+        p.assignments[0].required_capabilities.clear();
+        p.assignments[0].dependencies = vec!["missing".into()];
+        assert!(validate(&p, &agent).unwrap_err().to_string().contains("dependencies"));
+    }
+
+    #[test]
+    fn new_containers_are_few_well_named_new_and_on_real_machines() {
+        let agent = agent();
+        let check = |containers: Vec<NewContainer>| {
+            let mut p = plan();
+            p.containers = containers;
+            validate(&p, &agent).map_err(|e| e.to_string())
+        };
+        assert!(check(vec![nc("a", "air"), nc("b", "air")]).is_ok());
+        assert!(check(vec![nc("a", "air"), nc("b", "air"), nc("c", "air")])
+            .unwrap_err()
+            .contains("At most 2"));
+        assert!(check(vec![nc("bad name", "air")]).unwrap_err().contains("Invalid container name"));
+        assert!(check(vec![nc("a", "air"), nc("a", "air")]).unwrap_err().contains("planned twice"));
+        assert!(check(vec![nc("air", "air")]).unwrap_err().contains("already exists"));
+        assert!(check(vec![nc("a", "nowhere")]).unwrap_err().contains("fleet machine or the coordinator"));
+    }
+
+    #[test]
+    fn only_a_request_for_a_container_may_create_one() {
+        let mut p = plan();
+        assert!(validate_container_request("fix the tests", &p).is_ok());
+        p.containers = vec![nc("box", "air")];
+        for asked in ["run it in a new container", "use a Sandbox", "spin up docker for this"] {
+            assert!(validate_container_request(asked, &p).is_ok(), "{asked}");
+        }
+        for not_asked in ["fix the tests on air", "contain the blast radius", "sandboxed-ish"] {
+            let err = validate_container_request(not_asked, &p).unwrap_err().to_string();
+            assert!(err.contains("did not ask for a new container"), "{not_asked}");
+        }
+    }
+
     #[test]
     fn validates_placement_dependencies_and_workspaces() {
         let agent = agent();
@@ -514,6 +693,28 @@ mod tests {
         .unwrap();
         agent
     }
+    #[test]
+    fn containers_resolve_through_their_machine_and_never_shadow_one() {
+        let agent = agent();
+        let c = |name: &str, host: &str| containers::Container {
+            name: name.into(),
+            host: host.into(),
+            container: format!("{name}-docker"),
+            managed: false,
+            image: None,
+        };
+        let registered = [c("box", "air"), c("here", agent.master_name()), c("air", "air"), c("lost", "gone")];
+        let on_worker = resolve(&agent, "box", &registered).unwrap();
+        assert_eq!((on_worker.host.as_str(), on_worker.local), ("ssh-alias", false));
+        assert_eq!(on_worker.container.as_deref(), Some("box-docker"));
+        let here = resolve(&agent, "here", &registered).unwrap();
+        assert!(here.local && here.container.as_deref() == Some("here-docker"));
+        // The fleet machine wins over a same-named container.
+        assert_eq!(resolve(&agent, "air", &registered).unwrap().container, None);
+        // A container whose machine left the fleet resolves to nothing.
+        assert!(resolve(&agent, "lost", &registered).is_none());
+    }
+
     #[test]
     fn the_coordinator_runs_agents_locally_unless_a_worker_has_its_name() {
         let agent = coordinator("mac-mini");

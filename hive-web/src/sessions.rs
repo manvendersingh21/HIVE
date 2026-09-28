@@ -68,15 +68,30 @@ pub fn remote_command(command: &str) -> String {
     format!("{}; {command}", hive_core::workers::ssh::REMOTE_PATH)
 }
 
+/// The command as the worker's own shell runs it: inside `docker exec` for a
+/// container, which itself runs on the container's machine.
+pub fn worker_command(worker: &hive_common::protocol::WorkerInfo, command: &str, tty: bool) -> String {
+    match &worker.container {
+        Some(container) => hive_core::delegation::containers::exec(container, command, tty),
+        None => command.to_string(),
+    }
+}
+
 async fn remote(
     worker: &hive_common::protocol::WorkerInfo,
     command: &str,
 ) -> anyhow::Result<String> {
-    let mut cmd = Command::new("ssh");
-    cmd.args(ssh_args(worker))
-        .arg(remote_command(command))
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+    let command = worker_command(worker, command, false);
+    // Only a container on the coordinator is a local `WorkerInfo` here; the
+    // coordinator itself is served by the local functions below.
+    let mut cmd = if worker.local {
+        hive_core::delegation::transport::local_shell(&command)
+    } else {
+        let mut cmd = Command::new("ssh");
+        cmd.args(ssh_args(worker)).arg(remote_command(&command));
+        cmd
+    };
+    cmd.stdin(Stdio::null()).kill_on_drop(true);
     let out = tokio::time::timeout(std::time::Duration::from_secs(8), cmd.output()).await??;
     anyhow::ensure!(
         out.status.success(),
@@ -128,12 +143,14 @@ pub async fn create_on(
     if let Some(dir) = dir {
         command.push_str(&format!(" -c {}", quote(dir)));
     }
+    // Container images may lack bash; their login shell is `sh`.
+    let shell = if worker.container.is_some() { "sh" } else { "bash" };
     match kind.launch_command() {
         Some(program) => command.push_str(&format!(
-            " bash -lc {}",
-            quote(&format!("{program}; exec bash -l"))
+            " {shell} -lc {}",
+            quote(&format!("{program}; exec {shell} -l"))
         )),
-        None => command.push_str(" bash -l"),
+        None => command.push_str(&format!(" {shell} -l")),
     }
     remote(worker, &command).await?;
     Ok(())
@@ -302,6 +319,29 @@ mod tests {
             .await
             .unwrap();
         assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), value);
+    }
+
+    #[tokio::test]
+    async fn container_commands_reach_the_inner_shell_intact() {
+        // Stand in for docker: drop `exec -i <container>` and run the rest.
+        let value = "space ' quote; $(exit 17) `exit 18`";
+        let worker = hive_common::protocol::WorkerInfo {
+            name: "dev-box".into(),
+            host: "h".into(),
+            user: "u".into(),
+            port: None,
+            tags: vec![],
+            local: false,
+            container: Some("box".into()),
+        };
+        let line = worker_command(&worker, &format!("printf '%s' {}", quote(value)), false);
+        let output = Command::new("sh")
+            .args(["-c", &format!("docker() {{ shift 3; \"$@\"; }}; {line}")])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
         assert_eq!(String::from_utf8(output.stdout).unwrap(), value);
     }
 

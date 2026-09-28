@@ -94,6 +94,8 @@ async function defaults(page: Page) {
         { host: "worker-a", name: "worker-a" },
       ],
       "/api/incidents": [incident],
+      "/api/containers": [],
+      "/api/containers/hosts": ["local"],
       "/api/machines": {
         entities: [
           {
@@ -611,6 +613,49 @@ for (const [button, decision, note] of [
     ).toHaveAttribute("href", "/terminal/?name=ui-test&host=worker-a");
   });
 }
+// Incidents exist *because* a session printed something dangerous, and
+// `reason` quotes the matched line verbatim. Every field is untrusted process
+// output and must render as text, never as markup.
+test("incident fields from untrusted output render as inert text", async ({ page }) => {
+  const payload = '<img src=x onerror="window.__pwned=1"><script>window.__pwned=1</script>';
+  const hostile = {
+    ...incident,
+    worker: 'w<b id="injected">x</b>',
+    tmux_session: '"><svg onload="window.__pwned=1">',
+    analysis: { ...incident.analysis, reason: "matched: " + payload },
+    flagged_output: payload,
+  };
+  let dialogs = 0;
+  page.on("dialog", (dialog) => {
+    dialogs++;
+    void dialog.dismiss();
+  });
+  await page.route("**/api/incidents", (route) => route.fulfill({ json: [hostile] }));
+  await page.goto("/incidents/");
+  await expect(page.getByText(hostile.flagged_output, { exact: true })).toBeVisible();
+  await expect(page.getByText(hostile.analysis.reason, { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: /^Open w<b id="injected">x<\/b> \/ / })).toBeVisible();
+  await expect(page.locator("main img, main script, main svg, #injected")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();
+  expect(dialogs).toBe(0);
+});
+
+// Rendering through React's text nodes is what makes the test above hold;
+// a raw-HTML sink anywhere in the app would bypass it for whatever it renders.
+test("app source has no raw HTML sinks", async () => {
+  const { readdir } = await import("node:fs/promises");
+  const sinks = /dangerouslySetInnerHTML|\.innerHTML|\.outerHTML|insertAdjacentHTML|document\.write/;
+  const offenders: string[] = [];
+  for (const dir of ["app", "components", "lib"]) {
+    for (const entry of await readdir(resolve(__dirname, "..", dir), { recursive: true })) {
+      if (![".ts", ".tsx"].includes(extname(entry))) continue;
+      const file = resolve(__dirname, "..", dir, entry);
+      if (sinks.test(await readFile(file, "utf8"))) offenders.push(`${dir}/${entry}`);
+    }
+  }
+  expect(offenders).toEqual([]);
+});
+
 test("canceling incident note sends no decision; server failures display", async ({
   page,
 }) => {
@@ -804,7 +849,7 @@ test("chat run cards show both agents, approvals, setup retry and link to the se
 });
 test("session page renders a readable transcript and streams new events", async ({ page }) => {
   const requests: string[] = [];
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/events*", (route) => {
     const query = new URL(route.request().url()).searchParams;
     requests.push(query.toString());
@@ -839,7 +884,7 @@ test("session opened at its tail can page back to earlier activity", async ({ pa
     kind: "native",
     payload: { method: "item/completed", params: { item: { type: "agentMessage", text } } },
   });
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [{ ...run, state: "completed" }] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [{ ...run, state: "completed" }] }));
   await page.route("**/api/runs/run-1/events*", (route) => {
     const query = new URL(route.request().url()).searchParams;
     if (query.get("tail")) return route.fulfill({ json: [message(700, "Newest update")] });
@@ -862,7 +907,7 @@ test("failed session explains why and queued session names what it waits for", a
     state: "queued",
     assignment: { ...run.assignment, key: "consumer", device: "worker-b", dependencies: ["codex-a"] },
   };
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [failed, queued] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [failed, queued] }));
   await page.route("**/api/runs/*/events*", (route) =>
     route.fulfill({
       json: route.request().url().includes("run-1")
@@ -987,6 +1032,8 @@ test("Hive replies render Markdown as elements, never as HTML", async ({ page })
 });
 
 test("the chat follows new replies unless the reader has scrolled up", async ({ page }) => {
+  // An idle chat refreshes every 15s; skip the wait.
+  await page.clock.install();
   await page.setViewportSize({ width: 1000, height: 500 });
   const messages = Array.from({ length: 30 }, (_, i) => ({
     role: i % 2 ? "assistant" : "user",
@@ -998,10 +1045,12 @@ test("the chat follows new replies unless the reader has scrolled up", async ({ 
   const feed = page.locator(".chat-feed");
   await expect(page.getByText("message 29")).toBeInViewport();
   messages.push({ role: "assistant", content: "message 30", status: "completed" });
+  await page.clock.runFor(16000);
   await expect(page.getByText("message 30")).toBeInViewport();
   await feed.evaluate((el) => el.scrollTo({ top: 0 }));
   await expect(page.getByText("message 0", { exact: true })).toBeInViewport();
   messages.push({ role: "assistant", content: "message 31", status: "completed" });
+  await page.clock.runFor(16000);
   await expect(page.getByText("message 31")).toBeAttached();
   await expect(page.getByText("message 0", { exact: true })).toBeInViewport();
 });
@@ -1320,7 +1369,7 @@ test("agent message preserves a new draft typed while sending", async ({ page })
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let received: any;
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/messages", async (route) => {
     received = route.request().postDataJSON();
     await gate;
@@ -1338,7 +1387,7 @@ test("agent message preserves a new draft typed while sending", async ({ page })
 });
 
 test("fleet message failure retains draft", async ({ page }) => {
-  await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [run] }));
   await page.route("**/api/runs/run-1/messages", (route) =>
     route.fulfill({ status: 503, body: "Agent unreachable" }),
   );
@@ -1780,7 +1829,7 @@ test.describe("delegated sessions", () => {
     await page.goto("/machines/");
     await expect(page.getByRole("heading", { name: "Machines" })).toBeVisible();
     await expect(page.locator(".nav-count")).toHaveCount(0);
-    await page.route(/\/api\/runs$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
+    await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
     await page.goto("/incidents/");
     await expect(page.locator(".nav-count")).toHaveCount(0);
     await expect(page.locator('p[role="alert"]')).toHaveCount(0);
@@ -1854,7 +1903,7 @@ test.describe("delegated sessions", () => {
   });
 
   test("session page reports a runs API failure", async ({ page }) => {
-    await page.route(/\/api\/runs$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
+    await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ status: 400, body: "Delegation unavailable" }));
     await page.goto("/session/?run=run-1");
     await expect(page.locator('main [role="alert"]')).toHaveText("Delegation unavailable");
   });
@@ -2045,5 +2094,251 @@ test.describe("delegated sessions", () => {
     await page.reload();
     await expect(page.getByText("No agent sessions yet.", { exact: false })).toBeVisible();
     await expect(page.getByText("No terminal sessions. Start one above.")).toBeVisible();
+  });
+});
+
+test.describe("polling", () => {
+  // Pretend the tab is hidden or shown, the way a browser does on tab switch.
+  async function setHidden(page: Page, hidden: boolean) {
+    await page.evaluate((value) => {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => value });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }, hidden);
+  }
+
+  for (const [path, api, empty] of [
+    ["/sessions/", "**/api/sessions", "No terminal sessions. Start one above."],
+    ["/incidents/", "**/api/incidents", "No incidents recorded."],
+  ]) {
+    test(`a failed refresh on ${path} clears once refreshing works again`, async ({ page }) => {
+      await page.clock.install();
+      let failing = true;
+      await page.route(api, (route) =>
+        failing ? route.fulfill({ status: 502, body: "worker unreachable" }) : route.fulfill({ json: [] }),
+      );
+      await page.goto(path);
+      await expect(page.locator('p[role="alert"]')).toHaveText("worker unreachable");
+      failing = false;
+      await page.clock.runFor(10000);
+      await expect(page.locator('p[role="alert"]')).toHaveCount(0);
+      await expect(page.getByText(empty)).toBeVisible();
+    });
+  }
+
+  test("an action's error is not cleared by the next refresh", async ({ page }) => {
+    await page.clock.install();
+    await page.route("**/api/sessions/*", (route) => route.fulfill({ status: 502, body: "SSH unavailable" }));
+    await page.goto("/sessions/");
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Kill" }).click();
+    await expect(page.locator('p[role="alert"]')).toHaveText("SSH unavailable");
+    await page.clock.runFor(20000);
+    await expect(page.locator('p[role="alert"]')).toHaveText("SSH unavailable");
+  });
+
+  test("a hidden tab stops polling and refreshes when shown again", async ({ page }) => {
+    await page.clock.install();
+    const requests: string[] = [];
+    await page.route(/\/api\/runs(\?.*)?$/, (route) => {
+      requests.push(new URL(route.request().url()).search);
+      return route.fulfill({ json: [{ ...run, state: "awaiting-approval" }] });
+    });
+    await page.goto("/machines/");
+    await expect(page.locator(".nav-count")).toHaveText("1");
+    // The badge asks only for the runs it counts.
+    expect(requests[0]).toBe("?state=awaiting-approval,needs-setup");
+    await setHidden(page, true);
+    await page.clock.runFor(15000);
+    const whileVisible = requests.length;
+    await page.clock.runFor(60000);
+    expect(requests.length).toBe(whileVisible);
+    await setHidden(page, false);
+    await expect.poll(() => requests.length).toBe(whileVisible + 1);
+  });
+
+  test("a session page asks only for its own task's runs", async ({ page }) => {
+    const queries: string[] = [];
+    await page.route(/\/api\/runs(\?.*)?$/, (route) => {
+      queries.push(new URL(route.request().url()).search);
+      return route.fulfill({ json: [{ ...run, state: "completed" }] });
+    });
+    await page.route("**/api/runs/run-1/events*", (route) => route.fulfill({ json: [] }));
+    await page.goto("/session/?run=run-1");
+    await expect(page.getByText("No agent activity yet.")).toBeVisible();
+    expect(queries).toContain("?task_of=run-1");
+    expect(queries.filter((q) => q === "")).toEqual([]);
+  });
+
+  test("an idle chat slows down and a working one keeps up", async ({ page }) => {
+    await page.clock.install();
+    let status = "completed";
+    let fetches = 0;
+    await page.route("**/api/chats/chat-1", (route) => {
+      fetches++;
+      return route.fulfill({ json: { messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "ok", status }] } });
+    });
+    // Fetches resolve in real time, so step the fake clock and let each land.
+    async function advance(seconds: number) {
+      for (let i = 0; i < seconds; i++) {
+        await page.clock.runFor(1000);
+        await page.waitForTimeout(50);
+      }
+    }
+    await page.goto("/?chat=chat-1");
+    await expect(page.getByText("ok", { exact: true })).toBeVisible();
+    await advance(1);
+    let before = fetches;
+    await advance(10);
+    expect(fetches - before).toBe(0);
+    status = "executing";
+    await advance(6);
+    await expect(page.getByText("Running…")).toBeVisible();
+    before = fetches;
+    await advance(10);
+    expect(fetches - before).toBeGreaterThanOrEqual(4);
+  });
+});
+
+test.describe("containers", () => {
+  const registered = {
+    name: "dev-box",
+    host: "local",
+    container: "box",
+    managed: false,
+    reachable: true,
+    missing: ["tmux"],
+    agents: ["codex"],
+  };
+
+  test("lists, adds and removes containers without touching Docker", async ({ page }) => {
+    let items: unknown[] = [registered];
+    let added: unknown;
+    let removed = "";
+    await page.route("**/api/containers", (route) => {
+      if (route.request().method() === "POST") {
+        added = route.request().postDataJSON();
+        items = [...items, { ...registered, name: "web", container: "web-1", missing: [] }];
+        return route.fulfill({ status: 201, json: { name: "web" } });
+      }
+      return route.fulfill({ json: items });
+    });
+    await page.route("**/api/containers/hosts", (route) => route.fulfill({ json: ["local", "worker-a"] }));
+    await page.route("**/api/containers/available?*", (route) =>
+      route.fulfill({
+        json: [
+          { container: "web-1", image: "python:3.12", status: "Up 2 hours", running: true },
+          { container: "old", image: "alpine", status: "Exited (0)", running: false },
+        ],
+      }),
+    );
+    await page.route("**/api/containers/dev-box", (route) => {
+      removed = route.request().method();
+      items = items.slice(1);
+      return route.fulfill({ status: 204 });
+    });
+    await page.goto("/settings/");
+    const box = page.locator('[data-container="dev-box"]');
+    await expect(box).toContainText("box on local");
+    await expect(box).toContainText("Agents: codex · Missing: tmux");
+
+    await page.getByLabel("Docker machine").selectOption("worker-a");
+    await page.getByRole("button", { name: "List containers" }).click();
+    // Stopped containers can't run agents, so they can't be picked.
+    await expect(page.getByRole("radio", { name: /old/ })).toBeDisabled();
+    await page.getByRole("radio", { name: /web-1/ }).check();
+    await expect(page.getByLabel("Name in Hive")).toHaveValue("web-1");
+    await page.getByLabel("Name in Hive").fill("web");
+    await page.getByRole("button", { name: "Add container" }).click();
+    await expect(page.getByRole("status")).toContainText("Added web");
+    expect(added).toEqual({ name: "web", host: "worker-a", container: "web-1" });
+    await expect(page.locator('[data-container="web"]')).toBeVisible();
+
+    await box.getByRole("button", { name: "Remove" }).click();
+    await expect(page.getByRole("status")).toContainText("The container itself is still there");
+    expect(removed).toBe("DELETE");
+    await expect(box).toHaveCount(0);
+  });
+
+  test("a machine whose Docker refuses says why", async ({ page }) => {
+    await page.route("**/api/containers", (route) => route.fulfill({ json: [] }));
+    await page.route("**/api/containers/hosts", (route) => route.fulfill({ json: ["cis-a6000"] }));
+    await page.route("**/api/containers/available?*", (route) =>
+      route.fulfill({ status: 502, body: "permission denied while trying to connect to the Docker daemon socket" }),
+    );
+    await page.goto("/settings/");
+    await expect(page.getByText("No containers added.")).toBeVisible();
+    await page.getByRole("button", { name: "List containers" }).click();
+    await expect(page.locator('p[role="alert"]')).toHaveText(
+      "Docker on cis-a6000: permission denied while trying to connect to the Docker daemon socket",
+    );
+  });
+
+  test("an unreachable container shows its error and can't open a shell", async ({ page }) => {
+    await page.route("**/api/containers", (route) =>
+      route.fulfill({ json: [{ ...registered, reachable: false, error: "No such container: box" }] }),
+    );
+    await page.route("**/api/containers/hosts", (route) => route.fulfill({ json: ["local"] }));
+    await page.goto("/settings/");
+    const box = page.locator('[data-container="dev-box"]');
+    await expect(box).toContainText("No such container: box");
+    await expect(box.getByRole("button", { name: "Open shell" })).toBeDisabled();
+  });
+});
+
+test.describe("managed containers", () => {
+  const managed = {
+    name: "scratch",
+    host: "local",
+    container: "hive-scratch",
+    managed: true,
+    reachable: true,
+    missing: [],
+    agents: ["claude", "codex", "opencode"],
+  };
+
+  test("removing a Hive-made container asks in the page, then deletes it", async ({ page }) => {
+    let items: unknown[] = [managed];
+    const deletes: string[] = [];
+    await page.route("**/api/containers", (route) => route.fulfill({ json: items }));
+    await page.route("**/api/containers/scratch*", (route) => {
+      deletes.push(new URL(route.request().url()).search);
+      items = [];
+      return route.fulfill({ status: 204 });
+    });
+    let dialogs = 0;
+    page.on("dialog", (dialog) => {
+      dialogs++;
+      void dialog.dismiss();
+    });
+    await page.goto("/settings/");
+    const box = page.locator('[data-container="scratch"]');
+    await expect(box).toContainText("Managed by Hive");
+    await box.getByRole("button", { name: "Remove" }).click();
+    await expect(box).toContainText("This deletes the container hive-scratch on local");
+    expect(deletes).toEqual([]);
+    await box.getByRole("button", { name: "Cancel" }).click();
+    await expect(box.getByRole("button", { name: "Remove" })).toBeVisible();
+    await box.getByRole("button", { name: "Remove" }).click();
+    await box.getByRole("button", { name: "Delete container" }).click();
+    await expect(page.getByRole("status")).toHaveText("Deleted scratch and its container.");
+    expect(deletes).toEqual(["?delete=1"]);
+    expect(dialogs).toBe(0);
+  });
+
+  test("a container Hive didn't make is only forgotten", async ({ page }) => {
+    const deletes: string[] = [];
+    await page.route("**/api/containers", (route) =>
+      route.fulfill({ json: [{ ...managed, name: "mine", container: "mine", managed: false }] }),
+    );
+    await page.route("**/api/containers/mine*", (route) => {
+      deletes.push(new URL(route.request().url()).search);
+      return route.fulfill({ status: 204 });
+    });
+    await page.goto("/settings/");
+    const box = page.locator('[data-container="mine"]');
+    await expect(box).not.toContainText("Managed by Hive");
+    await box.getByRole("button", { name: "Remove" }).click();
+    await expect(page.getByRole("status")).toContainText("The container itself is still there");
+    expect(deletes).toEqual([""]);
   });
 });

@@ -41,13 +41,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-/// The review page's old server-rendered markup. `/incidents` is now served
-/// from the Next.js static export via `page_shell` (see `main.rs`), but this
-/// stays around — and compiled in, not just on disk — for the XSS-regression
-/// tests below.
-#[allow(dead_code)]
-pub const PAGE: &str = include_str!("../static/incidents.html");
-
 /// How much history `?all=1` returns. A review page is for triage, not for
 /// forensics — the full log is in the database for anyone who wants it.
 const HISTORY_LIMIT: usize = 200;
@@ -609,25 +602,6 @@ mod tests {
         assert!(
             json.contains("onerror=alert(1)"),
             "the payload must carry what was flagged, escaped only by JSON"
-        );
-    }
-
-    #[test]
-    fn the_review_page_never_uses_innerhtml() {
-        // `flagged_output` is untrusted process output that reached the
-        // watchdog *because* it looked dangerous, and `reason` embeds the
-        // matched line verbatim. Rendering either with innerHTML would turn
-        // "an agent printed a string" into stored XSS in the operator's
-        // browser, reachable by any command a supervised session runs. The
-        // page builds nodes and assigns textContent instead; this test is
-        // here so that stays true.
-        assert!(
-            !PAGE.contains("innerHTML"),
-            "incidents.html must not use innerHTML — see this test's comment"
-        );
-        assert!(
-            !PAGE.contains("insertAdjacentHTML") && !PAGE.contains("outerHTML"),
-            "nor the other HTML-parsing sinks"
         );
     }
 

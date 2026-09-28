@@ -513,6 +513,7 @@ mod tests {
             port: None,
             tags: vec!["gpu".into()],
             local: false,
+            container: None,
         })
         .unwrap();
 
@@ -529,6 +530,7 @@ mod tests {
                 port: None,
                 tags: vec![],
                 local: false,
+                container: None,
             })
             .unwrap_err();
         assert!(err.to_string().contains("already configured"), "{err}");
@@ -545,6 +547,7 @@ mod tests {
             port: None,
             tags: vec![],
             local: false,
+            container: None,
         })
         .unwrap();
         assert_eq!(pool.worker_count(), 2);
@@ -574,6 +577,7 @@ mod tests {
             port: None,
             tags: vec![],
             local: false,
+            container: None,
         }])
     }
 
@@ -624,6 +628,7 @@ mod tests {
             port: None,
             tags: vec![],
             local: false,
+            container: None,
         };
         let pool = WorkerPool::new(vec![worker_info]);
         let nodes = pool.snapshot();

@@ -35,13 +35,23 @@ fn attach_command(
     worker: Option<&hive_common::protocol::WorkerInfo>,
 ) -> CommandBuilder {
     match worker {
+        // A container on the coordinator: attach through `docker exec -it`.
+        Some(w) if w.local => {
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            cmd.arg("-c");
+            cmd.arg(crate::sessions::remote_command(&format!(
+                "exec {}",
+                attach_inside(w, session)
+            )));
+            cmd
+        }
         Some(w) => {
             let mut cmd = CommandBuilder::new("ssh");
             cmd.arg("-tt");
             cmd.args(crate::sessions::ssh_args(w));
             cmd.arg(crate::sessions::remote_command(&format!(
-                "exec tmux attach-session -t {}",
-                crate::sessions::quote(&format!("={session}"))
+                "exec {}",
+                attach_inside(w, session)
             )));
             cmd
         }
@@ -50,6 +60,18 @@ fn attach_command(
             cmd.args(["attach-session", "-t", &format!("={session}")]);
             cmd
         }
+    }
+}
+
+/// `tmux attach` as the worker runs it, inside the container when there is one.
+fn attach_inside(worker: &hive_common::protocol::WorkerInfo, session: &str) -> String {
+    let attach = format!(
+        "tmux attach-session -t {}",
+        crate::sessions::quote(&format!("={session}"))
+    );
+    match &worker.container {
+        Some(_) => crate::sessions::worker_command(worker, &format!("exec {attach}"), true),
+        None => attach,
     }
 }
 
@@ -190,6 +212,7 @@ mod tests {
             port: Some(2222),
             tags: vec![],
             local: false,
+            container: None,
         };
         let command = attach_command("ws-share", Some(&worker));
         let args = command
@@ -208,6 +231,34 @@ mod tests {
         assert!(args.last().unwrap().contains("/opt/homebrew/bin"));
         let local = attach_command("ws-share", None);
         assert_eq!(local.get_argv()[0], "tmux");
+    }
+
+    #[test]
+    fn container_attach_goes_through_docker_exec_on_its_machine() {
+        let mut worker = hive_common::protocol::WorkerInfo {
+            name: "dev-box".into(),
+            host: "air-ssh".into(),
+            user: "alice".into(),
+            port: None,
+            tags: vec![],
+            local: false,
+            container: Some("box".into()),
+        };
+        let argv = |w: &hive_common::protocol::WorkerInfo| {
+            attach_command("s1", Some(w))
+                .get_argv()
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let remote = argv(&worker);
+        assert_eq!(remote[0], "ssh");
+        assert!(remote.last().unwrap().contains("docker exec -it 'box' sh -lc"));
+        worker.local = true;
+        let local = argv(&worker);
+        assert_eq!(local[..2], ["/bin/sh", "-c"]);
+        assert!(local[2].contains("docker exec -it 'box' sh -lc"));
+        assert!(local[2].contains("attach-session -t"));
     }
 
     #[test]

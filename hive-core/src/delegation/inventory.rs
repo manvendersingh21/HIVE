@@ -14,6 +14,15 @@ pub async fn refresh(agent: &MasterAgent) -> anyhow::Result<()> {
     probe_devices(agent, super::targets(agent), PROBE_SECONDS).await
 }
 
+/// Probe the named devices now, such as a container that was just added.
+pub async fn refresh_devices(agent: &MasterAgent, names: &[&str]) -> anyhow::Result<()> {
+    let devices = super::targets(agent)
+        .into_iter()
+        .filter(|t| names.contains(&t.name.as_str()))
+        .collect();
+    probe_devices(agent, devices, PROBE_SECONDS).await
+}
+
 /// Probe only devices without an inventory verified in the last `max_age`
 /// seconds. Planning uses this with a short budget: the background refresh
 /// keeps healthy devices current, and a slow probe here must not mark their
@@ -154,6 +163,7 @@ mod tests {
                         port: None,
                         tags: vec![],
                         local: false,
+                        container: None,
                     })
                     .collect(),
             ),

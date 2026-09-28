@@ -1,10 +1,11 @@
 "use client";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useState } from "react";
 import Link from "next/link";
 import { api, request, terminalUrl } from "../../lib/api";
 import { Shell } from "../../components/Nav";
 import { Run, StateChip, sessionUrl } from "../../components/RunView";
 import { stateTone } from "../../lib/runEvents";
+import { usePoll } from "../../lib/poll";
 type Session = {
   name: string;
   host: string;
@@ -32,6 +33,9 @@ export default function SessionsPage() {
   const [kind, setKind] = useState("shell");
   const [directory, setDirectory] = useState("");
   const [error, setError] = useState("");
+  // A failed refresh clears itself on the next good one; `error` is for what
+  // the person did and stays until they act again.
+  const [loadError, setLoadError] = useState("");
   const [warning, setWarning] = useState("");
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -47,17 +51,15 @@ export default function SessionsPage() {
         ).join("; "),
       );
       setHosts(await api<Host[]>("/api/session-hosts"));
+      setLoadError("");
     } catch (e) {
-      setError((e as Error).message);
+      setLoadError((e as Error).message);
     } finally {
       setLoaded(true);
     }
   }
-  useEffect(() => {
-    void load();
-    const timer = setInterval(() => void load(), 4000);
-    return () => clearInterval(timer);
-  }, []);
+  // Listing asks every machine over SSH, so refresh at a gentler pace.
+  usePoll(load, 8000, []);
   async function create(event: FormEvent) {
     event.preventDefault();
     if (busy || !name.trim()) return;
@@ -159,9 +161,9 @@ export default function SessionsPage() {
             {busy ? "Working…" : "Start"}
           </button>
         </form>
-        {error && (
+        {(error || loadError) && (
           <p role="alert" className="error">
-            {error}
+            {error || loadError}
           </p>
         )}
         {warning && (

@@ -31,6 +31,14 @@ pub async fn ssh_timeout(
     input: Option<&Value>,
     seconds: u64,
 ) -> anyhow::Result<String> {
+    let wrapped;
+    let command = match &worker.container {
+        Some(container) => {
+            wrapped = super::containers::exec(container, command, false);
+            wrapped.as_str()
+        }
+        None => command,
+    };
     let mut cmd = if worker.local {
         local_shell(command)
     } else {
@@ -93,7 +101,7 @@ fn remote_shell(worker: &WorkerInfo, command: &str) -> Command {
 /// variables (credentials, config paths) never reach agents on the coordinator.
 const LOCAL_ENV: [&str; 6] = ["HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR"];
 
-fn local_shell(command: &str) -> Command {
+pub fn local_shell(command: &str) -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.env_clear()
         .envs(LOCAL_ENV.iter().filter_map(|k| Some((*k, std::env::var_os(k)?))))
@@ -198,6 +206,7 @@ mod tests {
             port: None,
             tags: vec![],
             local: true,
+            container: None,
         }
     }
 

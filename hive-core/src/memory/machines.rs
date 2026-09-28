@@ -286,6 +286,35 @@ pub async fn probe_remote(name: &str, ssh_target: &str, tags: Vec<String>) -> Ma
 /// Ceiling on one remote probe, SSH connect included.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Probe a registered container through `docker exec` on its machine. A
+/// stopped container, or a machine without Docker, is simply unreachable.
+pub async fn probe_container(worker: &hive_common::protocol::WorkerInfo) -> MachineFacts {
+    let host = format!(
+        "{}@{}",
+        worker.container.as_deref().unwrap_or_default(),
+        if worker.local { "local" } else { worker.host.as_str() }
+    );
+    let mut tags = worker.tags.clone();
+    tags.push("container".into());
+    let script = probe_script();
+    let probe =
+        crate::delegation::transport::ssh_timeout(worker, &script, None, PROBE_TIMEOUT.as_secs());
+    match probe.await {
+        Ok(stdout) => parse_probe(&worker.name, &host, tags, &stdout),
+        Err(e) => {
+            warn!(container = %worker.name, error = %e, "container probe failed");
+            MachineFacts {
+                name: worker.name.clone(),
+                host,
+                reachable: false,
+                tags,
+                probed_at: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            }
+        }
+    }
+}
+
 /// Single-quote a string for POSIX shells.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))

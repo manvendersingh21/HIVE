@@ -37,8 +37,7 @@ pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
         let history=h.history.as_ref().unwrap();
         let context=history.context(&turn)?;
         let plan=tokio::time::timeout(std::time::Duration::from_secs(240),delegation::plan(agent,&turn.user_input,&context.join("\n"))).await??;
-        let runs=store(&h)?.create(&turn.id,&turn.conversation_id,&plan)?;
-        let reply=json!({"conversation_id":turn.conversation_id,"delegation":{"task_id":turn.id,"summary":plan.summary,"runs":runs}});
+        let reply=start_plan(agent,&store(&h)?,&turn.id,&turn.conversation_id,&plan).await?;
         // A detached run owns its own state. Finishing the receipt keeps this
         // conversation's composer available while the real agents work.
         history.finish(&turn.id,"completed",&plan.summary,Some(&reply))?;
@@ -55,6 +54,72 @@ pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
     }
 }
 
+/// How long Hive gives one container to be created, image build included.
+const CONTAINER_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+/// How long to wait for a new container's agents to be probed.
+const CONTAINER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+
+/// Create the plan's containers, then its runs. A container that can't be
+/// created stops the whole plan before any agent starts; nothing is retried.
+async fn start_plan(
+    agent: &hive_core::agent::MasterAgent,
+    store: &RunStore,
+    task_id: &str,
+    conversation_id: &str,
+    plan: &delegation::DelegationPlan,
+) -> anyhow::Result<Value> {
+    let created = create_containers(agent, plan).await?;
+    let runs = store.create(task_id, conversation_id, plan)?;
+    Ok(json!({"conversation_id":conversation_id,"delegation":{
+        "task_id":task_id,"summary":plan.summary,"runs":runs,"containers_created":created}}))
+}
+
+async fn create_containers(
+    agent: &hive_core::agent::MasterAgent,
+    plan: &delegation::DelegationPlan,
+) -> anyhow::Result<Vec<String>> {
+    let mut created = Vec::new();
+    for planned in &plan.containers {
+        let result = async {
+            let machine = delegation::machine(agent, &planned.host)
+                .ok_or_else(|| anyhow::anyhow!("{} is not a configured machine", planned.host))?;
+            let taken: Vec<String> =
+                delegation::targets(agent).into_iter().map(|t| t.name).collect();
+            tokio::time::timeout(
+                CONTAINER_CREATE_TIMEOUT,
+                delegation::containers::create(&machine, &planned.name, &taken),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out"))?
+        }
+        .await;
+        if let Err(e) = result {
+            anyhow::bail!(
+                "Could not create container {} on {}: {e}. No agents were started.",
+                planned.name,
+                planned.host
+            );
+        }
+        tracing::info!(container = %planned.name, host = %planned.host, "planner created a container");
+        created.push(planned.name.clone());
+    }
+    if !created.is_empty() {
+        // Setup checks read the inventory, so learn the new agents first.
+        let names: Vec<&str> = created.iter().map(String::as_str).collect();
+        match tokio::time::timeout(
+            CONTAINER_PROBE_TIMEOUT,
+            delegation::inventory::refresh_devices(agent, &names),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "probing new containers failed"),
+            Err(_) => tracing::warn!("probing new containers timed out"),
+        }
+    }
+    Ok(created)
+}
+
 #[derive(Default, Deserialize)]
 pub struct RunQuery {
     pub conversation_id: Option<String>,
@@ -62,19 +127,31 @@ pub struct RunQuery {
     pub after: i64,
     /// Latest N events in order, for opening a long session at its end.
     pub tail: Option<usize>,
+    /// Comma-separated states to keep, for callers that only count some.
+    pub state: Option<String>,
+    /// A run ID: return only the runs of that run's task, for a session page.
+    pub task_of: Option<String>,
 }
 pub async fn list(State(h): State<AgentHandle>, Query(q): Query<RunQuery>) -> Response {
     match store(&h).and_then(|s| s.list()) {
-        Ok(runs) => Json(
-            runs.into_iter()
-                .filter(|r| {
-                    q.conversation_id
-                        .as_ref()
-                        .is_none_or(|id| id == &r.conversation_id)
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(runs) => {
+            let task = q.task_of.as_ref().map(|id| {
+                runs.iter().find(|r| &r.id == id).map(|r| r.task_id.clone())
+            });
+            let states = q.state.as_deref().map(|s| s.split(',').collect::<Vec<_>>());
+            Json(
+                runs.iter()
+                    .filter(|r| {
+                        q.conversation_id
+                            .as_ref()
+                            .is_none_or(|id| id == &r.conversation_id)
+                            && states.as_ref().is_none_or(|s| s.contains(&r.state.as_str()))
+                            && task.as_ref().is_none_or(|t| t.as_ref() == Some(&r.task_id))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
         Err(e) => error(e),
     }
 }
@@ -182,6 +259,7 @@ pub async fn replace(
         let plan = delegation::DelegationPlan {
             summary: "Move assignment while retaining peer work".into(),
             assignments: vec![assignment.clone()],
+            containers: vec![],
         };
         delegation::validate(&plan, h.agent.as_ref().unwrap())?;
         store.replace(&id, &assignment)
@@ -368,10 +446,35 @@ fn apply_runtime_evidence(attrs: &mut Value, metadata: &Value) -> bool {
 /// A completed run only changes again once Hive has something to deliver to
 /// it: a coordinator follow-up, a user message or a decision. Polling it anyway
 /// costs an SSH round trip and a remote runner process every loop.
+///
+/// A run whose agent session has ended can't change at all: its journal still
+/// reports the last state, so syncing it would only revive that stale state.
 fn idle(store: &RunStore, run: &Run) -> anyhow::Result<bool> {
+    if run.state == "disconnected" && run.metadata["reason"] == SESSION_ENDED {
+        return Ok(true);
+    }
     Ok(run.state == "completed"
         && store.pending_decisions(&run.id)?.is_empty()
         && store.pending_messages(&run.id)?.is_empty())
+}
+
+const SESSION_ENDED: &str = "The agent's session has ended, so this run can't continue.";
+
+/// States in which a launched run's tmux session must still exist.
+const LIVE_STATES: [&str; 4] = ["working", "awaiting-approval", "waiting-for-peer", "reviewing"];
+
+/// Whether the run's tmux session exists. `None` when the device couldn't be
+/// asked: an unreachable machine says nothing about the session.
+async fn session_alive(worker: &hive_common::protocol::WorkerInfo, run: &Run) -> Option<bool> {
+    let command = format!(
+        "tmux has-session -t {} 2>/dev/null && echo alive || echo gone",
+        transport::quote(&format!("={}", run.tmux_name))
+    );
+    match transport::ssh(worker, &command, None).await.ok()?.trim() {
+        "alive" => Some(true),
+        "gone" => Some(false),
+        _ => None,
+    }
 }
 
 async fn sync_run(
@@ -398,6 +501,15 @@ async fn sync_run(
             )
             .await;
         }
+        return Ok(());
+    }
+    // Checked before the snapshot, which would rewrite the state from the
+    // journal of a runner that no longer exists.
+    if run.runner_path.is_some()
+        && LIVE_STATES.contains(&run.state.as_str())
+        && session_alive(&worker, run).await == Some(false)
+    {
+        store.state(&run.id, "disconnected", SESSION_ENDED)?;
         return Ok(());
     }
     if run.state == "queued" {
@@ -636,6 +748,80 @@ mod tests {
             history: None,
             master_name: "master".into(),
         }
+    }
+    #[tokio::test]
+    async fn run_list_filters_by_state_and_task() {
+        let h = handle();
+        let id = run_with_events(&h, 0);
+        store(&h).unwrap().state(&id, "awaiting-approval", "").unwrap();
+        let ids = |q: RunQuery| {
+            let h = h.clone();
+            async move {
+                let response = list(State(h), Query(q)).await;
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<Vec<Value>>(&body).unwrap().len()
+            }
+        };
+        let q = |state: Option<&str>, task_of: Option<&str>| RunQuery {
+            state: state.map(Into::into),
+            task_of: task_of.map(Into::into),
+            ..Default::default()
+        };
+        assert_eq!(ids(q(Some("needs-setup,awaiting-approval"), None)).await, 1);
+        assert_eq!(ids(q(Some("working"), None)).await, 0);
+        assert_eq!(ids(q(None, Some(&id))).await, 1);
+        assert_eq!(ids(q(None, Some("unknown-run"))).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_container_that_cant_be_created_starts_no_agents() {
+        let h = handle();
+        let agent = h.agent.as_ref().unwrap();
+        let store = store(&h).unwrap();
+        let mut plan: delegation::DelegationPlan = serde_json::from_value(json!({"summary":"work","assignments":[
+            {"key":"a","device":"box","agent":"codex","model":null,"workspace":"~/hive-workspaces/t","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        plan.containers = vec![delegation::NewContainer { name: "box".into(), host: "master".into() }];
+        let err = start_plan(agent, &store, "task", "chat", &plan).await.unwrap_err().to_string();
+        assert!(err.starts_with("Could not create container box on "), "{err}");
+        assert!(err.ends_with("No agents were started."), "{err}");
+        assert!(store.list().unwrap().is_empty());
+        // A plan without containers creates its runs as before.
+        plan.containers.clear();
+        let reply = start_plan(agent, &store, "task", "chat", &plan).await.unwrap();
+        assert_eq!(reply["delegation"]["containers_created"], json!([]));
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_container_is_unknown_not_gone() {
+        // No such container (or no Docker at all): docker exec fails, which
+        // says nothing about the agent's session inside it.
+        let h = handle();
+        let run = store(&h).unwrap().get(&run_with_events(&h, 0)).unwrap();
+        let worker = hive_common::protocol::WorkerInfo {
+            name: "dev-box".into(),
+            host: "localhost".into(),
+            user: "u".into(),
+            port: None,
+            tags: vec![],
+            local: true,
+            container: Some(format!("hive-test-missing-{}", uuid::Uuid::new_v4().simple())),
+        };
+        assert_eq!(session_alive(&worker, &run).await, None);
+    }
+
+    #[test]
+    fn runs_whose_session_ended_are_never_synced_again() {
+        let h = handle();
+        let store = store(&h).unwrap();
+        let id = run_with_events(&h, 0);
+        store.state(&id, "awaiting-approval", "").unwrap();
+        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        // A runner-reported disconnect can still be reconciled, so keep syncing.
+        store.state(&id, "disconnected", "Prior runner exited").unwrap();
+        assert!(!idle(&store, &store.get(&id).unwrap()).unwrap());
+        store.state(&id, "disconnected", SESSION_ENDED).unwrap();
+        assert!(idle(&store, &store.get(&id).unwrap()).unwrap());
     }
     fn run_with_events(h: &AgentHandle, count: i64) -> String {
         let store = store(h).unwrap();

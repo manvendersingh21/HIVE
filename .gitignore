@@ -6,6 +6,9 @@ graphify-out/
 hive-web/frontend/node_modules/
 hive-web/frontend/.next/
 hive-web/frontend/out/
+hive-web/frontend/tsconfig.tsbuildinfo
+# The served export, built from hive-web/frontend by scripts/run-hive-web.sh.
+hive-web/static/
 
 # Secrets — never commit. This repo is public.
 .env
