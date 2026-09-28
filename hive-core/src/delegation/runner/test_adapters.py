@@ -1,11 +1,13 @@
 """Native interface contracts; no providers or model processes are started.
 
-Fixtures follow AGY headless/hooks documentation and OpenCode 1.18.29 /doc.
+Fixtures follow AGY headless/hooks documentation, OpenCode 1.18.29 /doc and
+Cursor Agent 2026.09.26 stream-json events.
 """
 import asyncio
 import contextlib
 import io
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -257,6 +259,98 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
                 await adapter.turn('implement')
         permission.assert_not_called()
         self.assertEqual(adapter.http.call_args.args, ('POST', '/permission/per_opaque/reply', {'reply': 'reject'}))
+
+    def cursor_script(self, events, exit_code=0, stderr=''):
+        """A fake `cursor-agent` CLI: logs argv, prints canned stream-json events."""
+        script = self.root/'cursor-agent'
+        log = shlex.quote(str(self.root/'cursor-args.log'))
+        parts = ['#!/bin/sh', '{ IFS=$(printf \'\\037\'); printf \'%s\\n\' "$*"; } >> '+log]
+        for event in events:
+            parts.append('printf \'%s\\n\' '+shlex.quote(runner.encode(event)))
+        if stderr:
+            parts.append('printf \'%s\\n\' '+shlex.quote(stderr)+' >&2')
+        parts.append('exit '+str(exit_code))
+        script.write_text('\n'.join(parts)+'\n')
+        script.chmod(0o755)
+
+    def cursor_args(self):
+        return [line.split('\x1f') for line in (self.root/'cursor-args.log').read_text().splitlines()]
+
+    def cursor_stream(self, text='ok', chat='chat-native', **result):
+        """The event sequence a real `cursor-agent -p ... stream-json` turn emits."""
+        init = dict(type='system', subtype='init', apiKeySource='login', cwd=str(self.workspace),
+                    session_id=chat, model='GPT-5.2 Medium', permissionMode='default')
+        user = dict(type='user', message=dict(role='user', content=[dict(type='text', text=text)]), session_id=chat)
+        assistant = dict(type='assistant', message=dict(role='assistant', content=[dict(type='text', text=text)]), session_id=chat)
+        end = dict(type='result', subtype='success', duration_ms=1844, duration_api_ms=1844,
+                   is_error=False, result=text, session_id=chat, request_id='req-native',
+                   usage=dict(inputTokens=11379, outputTokens=8, cacheReadTokens=0, cacheWriteTokens=0))
+        end.update(result)
+        return [init, user, assistant, end]
+
+    async def test_cursor_per_turn_arguments_resume_and_native_events(self):
+        self.cursor_script(self.cursor_stream())
+        adapter = runner.Cursor()
+        assignment = dict(self.assignment, agent='cursor', autonomy='yolo', model='gpt-5.2')
+        with patch.object(runner, 'executable', return_value=str(self.root/'cursor-agent')):
+            await adapter.connect(assignment, self.j)
+            await adapter.turn('first prompt')
+            await adapter.turn('follow-up')
+        turns = self.cursor_args()
+        self.assertEqual(turns[0], ['-p', 'first prompt', '--output-format', 'stream-json',
+                                    '--trust', '--workspace', str(self.workspace),
+                                    '--force', '--model', 'gpt-5.2'])
+        self.assertNotIn('--resume', turns[0])
+        # Turn 2 resumes the chat stored from turn 1; --force and --model persist.
+        self.assertEqual(turns[1], ['-p', 'follow-up', '--output-format', 'stream-json',
+                                    '--trust', '--workspace', str(self.workspace),
+                                    '--force', '--model', 'gpt-5.2', '--resume', 'chat-native'])
+        self.assertEqual(self.j.get('native_conversation_id'), 'chat-native')
+        self.assertEqual(self.j.get('actual_model'), 'GPT-5.2 Medium')
+        emitted = [json.loads(row['payload']) for row in self.j.db.execute("SELECT payload FROM events WHERE kind='native'")]
+        self.assertEqual(emitted, self.cursor_stream()*2)
+
+    async def test_cursor_omits_model_and_resume_before_they_apply(self):
+        self.cursor_script(self.cursor_stream())
+        adapter = runner.Cursor()
+        assignment = dict(self.assignment, agent='cursor', autonomy='yolo')
+        with patch.object(runner, 'executable', return_value=str(self.root/'cursor-agent')):
+            await adapter.connect(assignment, self.j)
+            await adapter.turn('first prompt')
+        self.assertEqual(self.cursor_args()[0], ['-p', 'first prompt', '--output-format', 'stream-json',
+                                                '--trust', '--workspace', str(self.workspace), '--force'])
+
+    async def test_cursor_failures_raise_with_error_text(self):
+        adapter = runner.Cursor()
+        assignment = dict(self.assignment, agent='cursor', autonomy='yolo')
+        with patch.object(runner, 'executable', return_value=str(self.root/'cursor-agent')):
+            await adapter.connect(assignment, self.j)
+            # A rejected model never reaches NDJSON: stderr plus a non-zero exit.
+            self.cursor_script([], exit_code=1, stderr='Cannot use this model: not-a-real-model')
+            with self.assertRaisesRegex(RuntimeError, 'Cannot use this model: not-a-real-model'):
+                await adapter.turn('work')
+            # An error event mid-stream carries the message.
+            self.cursor_script([dict(type='error', message='rate limited')])
+            with self.assertRaisesRegex(RuntimeError, 'rate limited'):
+                await adapter.turn('work')
+            # A failed result is not a completed turn.
+            self.cursor_script(self.cursor_stream(is_error=True, subtype='error', result=''))
+            with self.assertRaisesRegex(RuntimeError, 'error'):
+                await adapter.turn('work')
+            # A stream that stops early is never treated as a completed turn.
+            self.cursor_script(self.cursor_stream()[:2])
+            with self.assertRaisesRegex(RuntimeError, 'without a terminal result event'):
+                await adapter.turn('work')
+
+    async def test_cursor_requires_yolo_autonomy_for_setup(self):
+        adapter = runner.Cursor()
+        for autonomy in ('ask', None):
+            with self.subTest(autonomy=autonomy):
+                with self.assertRaisesRegex(RuntimeError, 'no approval bridge'):
+                    await adapter.connect(dict(self.assignment, agent='cursor', autonomy=autonomy), self.j)
+
+    def test_cursor_probe_uses_the_cursor_agent_binary(self):
+        self.assertEqual(runner.executable('cursor'), runner.executable('cursor-agent'))
 
     def elicitation(self, tool, args):
         return dict(serverName='hive', threadId='native-thread', mode='form',

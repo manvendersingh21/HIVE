@@ -20,7 +20,9 @@ import time
 import uuid
 
 VERSION = 1
-AGENTS = ('claude', 'codex', 'opencode', 'agy')
+AGENTS = ('claude', 'codex', 'opencode', 'agy', 'cursor')
+# Agent type -> CLI binary, for the ones whose executable is not the type name.
+EXECUTABLES = {'cursor': 'cursor-agent'}
 BASE = Path.home() / '.hive' / 'runs'
 
 
@@ -29,6 +31,7 @@ def encode(value):
 
 
 def executable(name):
+    name = EXECUTABLES.get(name, name)
     found = shutil.which(name)
     if found:
         return found
@@ -95,6 +98,26 @@ def probe():
                 record['controls'] = ['pre-tool-hook', 'persistent-stream']
                 # The hook capability is verified independently before rollout.
                 record['runtime_ready'] = '--input-format' in capture([path, '--help'], include_stderr=True)[1]
+            elif name == 'cursor':
+                record['controls'] = ['always-approve', 'persistent-session']
+                # Headless turns need every documented flag; a build that lost
+                # one cannot run delegated work.
+                help_text = capture([path, '--help'], include_stderr=True)[1]
+                record['runtime_ready'] = all(flag in help_text for flag in (
+                    '--print', '--output-format', 'stream-json', '--trust',
+                    '--workspace', '--force', '--resume', '--model'))
+                # `cursor-agent status` states the login; the account line is
+                # never retained. An unproven login stays 'unknown'.
+                code, output = capture([path, 'status'])
+                if code == 0 and 'Logged in' in output:
+                    record['authentication'] = 'authenticated'
+                if record['runtime_ready']:
+                    code, listing = capture([path, '--list-models'], timeout=20)
+                    if code == 0:
+                        # `cursor-agent --list-models` prints "Available models"
+                        # then one "id - Description" line per model.
+                        record['models'] = [line.split(' - ', 1)[0].strip()
+                                            for line in listing.splitlines() if ' - ' in line]
             else:
                 record['controls'] = ['native-approval', 'persistent-session']
                 record['runtime_ready'] = capture([path, 'serve', '--help'])[0] == 0
@@ -730,6 +753,94 @@ class Agy(JsonProcess):
                 return
 
 
+class Cursor:
+    """One `cursor-agent -p` process per turn; stream-json lines are native events.
+
+    Cursor exposes no approval bridge to Hive, so only yolo autonomy can start
+    a turn. Turn N>1 passes --resume with the stored native_conversation_id,
+    which is Cursor's own `session_id` and keeps one chat across the run.
+    """
+
+    def command(self, prompt):
+        args = [executable('cursor-agent'), '-p', prompt, '--output-format', 'stream-json',
+                '--trust', '--workspace', self.a['workspace']]
+        if self.a.get('autonomy') == 'yolo':
+            args += ['--force']
+        if self.a.get('model'):
+            args += ['--model', self.a['model']]
+        resume = self.j.get('native_conversation_id')
+        if resume:
+            args += ['--resume', resume]
+        return args
+
+    async def connect(self, assignment, journal):
+        self.a, self.j = assignment, journal
+        if assignment.get('autonomy') != 'yolo':
+            raise RuntimeError('Cursor has no approval bridge yet; delegated Cursor assignments require yolo autonomy')
+
+    async def turn(self, prompt):
+        self.proc = await asyncio.create_subprocess_exec(*self.command(prompt), cwd=self.a['workspace'],
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=4*1024*1024)
+        errors, result = [], None
+
+        async def drain_stderr():
+            while True:
+                line = await self.proc.stderr.readline()
+                if not line:
+                    return
+                text = line.decode('utf-8', 'replace').strip()
+                if text:
+                    errors.append(text)
+        drained = asyncio.create_task(drain_stderr())
+        try:
+            while True:
+                raw = await self.proc.stdout.readline()
+                if not raw:
+                    break
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                self.j.emit('native', event)
+                kind = event.get('type')
+                if kind == 'error':
+                    errors.append(str(event.get('message') or event.get('error') or encode(event)))
+                elif kind == 'system' and event.get('subtype') == 'init' and event.get('model'):
+                    self.j.set('actual_model', event['model'])
+                if event.get('session_id'):
+                    self.j.set('native_conversation_id', event['session_id'])
+                if kind == 'result':
+                    result = event
+            code = await self.proc.wait()
+            await drained
+            detail = errors[-1][:2000] if errors else ''
+            if code != 0:
+                raise RuntimeError('Cursor exited '+str(code)+(': '+detail if detail else ' without an error message'))
+            if errors:
+                raise RuntimeError('Cursor reported an error: '+detail)
+            if result is None:
+                raise RuntimeError('Cursor stream ended without a terminal result event')
+            if result.get('is_error') or result.get('subtype') != 'success':
+                raise RuntimeError('Cursor turn ended with '+str(result.get('subtype'))+': '+str(result.get('error') or result.get('result', ''))[:2000])
+        finally:
+            if self.proc.returncode is None:
+                self.proc.kill()
+                await self.proc.wait()
+            try:
+                await drained
+            except Exception:
+                pass
+
+    async def close(self):
+        if getattr(self, 'proc', None) is not None and self.proc.returncode is None:
+            self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 5)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+                await self.proc.wait()
+
+
 class OpenCode:
     async def http(self, method, path, body=None):
         import urllib.request
@@ -1019,7 +1130,7 @@ async def run(assignment, journal):
     journal.set('assignment', assignment)
     journal.set('pid', os.getpid())
     journal.state('working')
-    adapter = {'codex': Codex, 'claude': Claude, 'agy': Agy, 'opencode': OpenCode}[assignment['agent']]()
+    adapter = {'codex': Codex, 'claude': Claude, 'agy': Agy, 'opencode': OpenCode, 'cursor': Cursor}[assignment['agent']]()
     try:
         await adapter.connect(assignment, journal)
         peers = assignment.get('peers', [])

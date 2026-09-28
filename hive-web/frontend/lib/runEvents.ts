@@ -283,6 +283,89 @@ function opencode(seq: number, p: any): Entry[] {
   });
 }
 
+// Cursor headless (`cursor-agent -p --output-format stream-json`) wraps the
+// tool it is running in one `<name>ToolCall` key. `call_id` is the correlation
+// key: the same string arrives in `args.toolCallId` on the started event and
+// again on the completed one.
+const cursorTool = (body: any): [string, any] | undefined => {
+  if (!body || typeof body !== "object") return undefined;
+  const key = Object.keys(body).find((k) => k.endsWith("ToolCall") && k !== "toolCallId");
+  return key ? [key.slice(0, -"ToolCall".length), body[key]] : undefined;
+};
+
+// Tools that change the workspace render as diffs from the edit's own result,
+// not as a JSON blob of arguments that have not been applied yet.
+const CURSOR_EDIT_TOOLS = /^(edit|write|delete|create|apply|patch|move|rename|search_replace|multi_edit)$/;
+
+function cursorShell(seq: number, id: string, call: any, started: boolean): Entry {
+  const args = call?.args || {};
+  return {
+    type: "command",
+    seq,
+    toolId: id,
+    command: str(args.command),
+    cwd: args.workingDirectory || undefined,
+    output: started ? undefined : str(call?.result?.success?.stdout) || undefined,
+    exitCode: started ? undefined : (call?.result?.success?.exitCode ?? null),
+    status: started ? "started" : (call?.result?.success?.exitCode ? "failed" : "completed"),
+  };
+}
+
+function cursorToolCall(out: Entry[], seq: number, p: any): Entry[] {
+  const id = str(p.call_id);
+  const tool = cursorTool(p.tool_call);
+  if (!tool) return [];
+  const [name, call] = tool;
+  const started = p.subtype !== "completed";
+  const result = call?.result?.success || {};
+  if (name === "shell" || (call?.args?.command != null && !CURSOR_EDIT_TOOLS.test(name)))
+    return started ? [cursorShell(seq, id, call, true)] : attach(out, id, cursorShell(seq, id, call, false));
+  if (CURSOR_EDIT_TOOLS.test(name)) {
+    // The diff only exists once the edit has been applied.
+    if (started) return [];
+    const path = str(result.path || call?.args?.path);
+    if (!path) return [];
+    return [
+      {
+        type: "files",
+        seq,
+        toolId: id,
+        changes: [{ path, kind: "edit", diff: result.diffString ? str(result.diffString) : undefined }],
+      },
+    ];
+  }
+  if (started)
+    return [
+      {
+        type: "tool",
+        seq,
+        toolId: id,
+        name,
+        input: Object.keys(call?.args || {}).length ? JSON.stringify(call.args, null, 2) : undefined,
+        status: "started",
+      },
+    ];
+  return attach(out, id, { type: "tool", seq, toolId: id, name, output: str(result), status: "completed" });
+}
+
+// A completed call answers the started one with the same call_id; update that
+// entry in place. An unmatched completion still shows its own output.
+function attach(out: Entry[], id: string, entry: Entry): Entry[] {
+  const use = id && out.findLast((x) => "toolId" in x && x.toolId === id);
+  if (use && use.type === "command" && entry.type === "command") {
+    if (entry.output) use.output = entry.output;
+    if (entry.exitCode !== undefined) use.exitCode = entry.exitCode;
+    use.status = entry.status;
+    return [];
+  }
+  if (use && use.type === "tool" && entry.type === "tool") {
+    if (entry.output) use.output = entry.output;
+    use.status = entry.status;
+    return [];
+  }
+  return [entry];
+}
+
 export function transcript(events: RunEvent[]): Entry[] {
   const out: Entry[] = [];
   const push = (entry: Entry) => {
@@ -300,8 +383,28 @@ export function transcript(events: RunEvent[]): Entry[] {
     }
     out.push(entry);
   };
+  // Cursor streams its reasoning as `thinking` deltas until it sends the
+  // matching `completed`; join consecutive deltas into one entry, flushed by
+  // any other event. Its assistant text and result already render as they do
+  // for Claude, so only thoughts and tool calls need handling here.
+  let thought: Extract<Entry, { type: "reasoning" }> | null = null;
+  const flushThought = () => {
+    if (thought && thought.text.trim()) push(thought);
+    thought = null;
+  };
   for (const e of events) {
     const p = e.payload || {};
+    if (e.kind === "native" && (p.type === "thinking" || p.type === "tool_call")) {
+      if (p.type === "thinking" && p.subtype === "delta" && str(p.text)) {
+        if (!thought) thought = { type: "reasoning", seq: e.seq, text: "" };
+        thought.text += str(p.text);
+        continue;
+      }
+      flushThought();
+      (p.type === "thinking" ? [] : cursorToolCall(out, e.seq, p)).forEach(push);
+      continue;
+    }
+    flushThought();
     switch (e.kind) {
       case "state":
         // Consecutive repeats ("working", "working") add nothing.

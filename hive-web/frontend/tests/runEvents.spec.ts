@@ -434,3 +434,148 @@ test.describe("helpers", () => {
     for (const live of ["working", "awaiting-approval", "queued", "launching"]) expect(TERMINAL_STATES).not.toContain(live);
   });
 });
+
+// Shapes recorded from a real `cursor-agent -p --output-format stream-json`
+// run of cursor-agent 2026.09.26-dd393fe.
+const cursorInit = (chat = "chat-1") =>
+  ev("native", {
+    type: "system",
+    subtype: "init",
+    apiKeySource: "login",
+    cwd: "/private/tmp/ws",
+    session_id: chat,
+    model: "GPT-5.2 Medium",
+    permissionMode: "default",
+  });
+const cursorUser = (text: string) =>
+  ev("native", { type: "user", message: { role: "user", content: [{ type: "text", text }] }, session_id: "chat-1" });
+const cursorSay = (text: string) =>
+  ev("native", {
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text }] },
+    session_id: "chat-1",
+  });
+const cursorTool = (subtype: string, callId: string, name: string, call: Record<string, unknown>) =>
+  ev("native", { type: "tool_call", subtype, call_id: callId, tool_call: { [`${name}ToolCall`]: call } });
+const cursorResult = (over: Record<string, unknown> = {}) =>
+  ev("native", {
+    type: "result",
+    subtype: "success",
+    duration_ms: 6518,
+    duration_api_ms: 6518,
+    is_error: false,
+    result: "Done",
+    session_id: "chat-1",
+    request_id: "req-1",
+    usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    ...over,
+  });
+
+test.describe("cursor-agent stream-json events", () => {
+  test("the init, user and result events add nothing beyond the reply", () => {
+    expect(types([cursorInit(), cursorUser("Remember PINEAPPLE"), cursorSay("ACK 7419"), cursorResult({ result: "ACK 7419" })])).toEqual([
+      "agent",
+    ]);
+  });
+
+  test("a successful result that repeats the reply is not shown twice", () => {
+    const entries = transcript([cursorInit(), cursorSay("ACK 7419"), cursorResult({ result: "ACK 7419" })]);
+    expect(entries).toEqual([expect.objectContaining({ type: "agent", text: "ACK 7419" })]);
+  });
+
+  test("thinking deltas join into one reasoning entry, closed by the completed event", () => {
+    const entries = transcript([
+      cursorInit(),
+      ev("native", { type: "thinking", subtype: "delta", text: "Creating ", session_id: "chat-1" }),
+      ev("native", { type: "thinking", subtype: "delta", text: "and running.", session_id: "chat-1" }),
+      ev("native", { type: "thinking", subtype: "completed", session_id: "chat-1" }),
+      cursorSay("Done"),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "reasoning", text: "Creating and running." }),
+      expect.objectContaining({ type: "agent", text: "Done" }),
+    ]);
+  });
+
+  test("unterminated thinking is still flushed by the next event", () => {
+    const entries = transcript([
+      cursorInit(),
+      ev("native", { type: "thinking", subtype: "delta", text: "Still thinking", session_id: "chat-1" }),
+      cursorSay("Done"),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "reasoning", text: "Still thinking" }),
+      expect.objectContaining({ type: "agent" }),
+    ]);
+  });
+
+  test("a shell tool call is a command carrying its output and exit code", () => {
+    const entries = transcript([
+      cursorInit(),
+      cursorTool("started", "call-shell", "shell", { args: { command: "echo SHELLOUT", workingDirectory: "/ws" } }),
+      cursorTool("completed", "call-shell", "shell", {
+        args: { command: "echo SHELLOUT", workingDirectory: "/ws" },
+        result: { success: { exitCode: 0, stdout: "SHELLOUT\n", stderr: "" } },
+      }),
+    ]);
+    expect(entries).toEqual([
+      {
+        type: "command",
+        seq: entries[0].seq,
+        toolId: "call-shell",
+        command: "echo SHELLOUT",
+        cwd: "/ws",
+        output: "SHELLOUT\n",
+        exitCode: 0,
+        status: "completed",
+      },
+    ]);
+  });
+
+  test("a failing command is marked failed", () => {
+    const entries = transcript([
+      cursorInit(),
+      cursorTool("started", "c1", "shell", { args: { command: "false", workingDirectory: "/ws" } }),
+      cursorTool("completed", "c1", "shell", { args: { command: "false" }, result: { success: { exitCode: 1, stdout: "" } } }),
+    ]);
+    expect(entries[0]).toMatchObject({ type: "command", status: "failed", exitCode: 1 });
+  });
+
+  test("a file edit renders as a diff, not as its arguments", () => {
+    const entries = transcript([
+      cursorInit(),
+      cursorTool("started", "c2", "edit", { args: { path: "/ws/probe.txt" } }),
+      cursorTool("completed", "c2", "edit", {
+        args: { path: "/ws/probe.txt" },
+        result: {
+          success: { path: "/ws/probe.txt", linesAdded: 1, linesRemoved: 0, diffString: "--- /dev/null\n+++ probe.txt\n+ZEBRA" },
+        },
+      }),
+    ]);
+    expect(entries).toEqual([
+      {
+        type: "files",
+        seq: entries[0].seq,
+        toolId: "c2",
+        changes: [{ path: "/ws/probe.txt", kind: "edit", diff: "--- /dev/null\n+++ probe.txt\n+ZEBRA" }],
+      },
+    ]);
+  });
+
+  test("an unfamiliar tool is a tool card that its completion fills in", () => {
+    const entries = transcript([
+      cursorInit(),
+      cursorTool("started", "c3", "read", { args: { path: "/ws/a.txt" } }),
+      cursorTool("completed", "c3", "read", { args: { path: "/ws/a.txt" }, result: { success: { content: "hello" } } }),
+    ]);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ type: "tool", name: "read", toolId: "c3", status: "completed" });
+    expect((entries[0] as any).output).toContain("hello");
+  });
+
+  test("a failed result is the error a person should see", () => {
+    const events = [cursorInit(), cursorResult({ subtype: "error", is_error: true, result: "model unavailable" })];
+    expect(transcript(events)).toEqual([expect.objectContaining({ type: "result", text: "model unavailable", error: true })]);
+    expect(lastError(events)).toBe("model unavailable");
+  });
+});
