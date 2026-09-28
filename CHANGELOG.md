@@ -52,6 +52,14 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- The master-agent provider chosen in the settings UI now survives restarts
+  even when `hive.toml` sets `single_provider` (BUG13). The persisted selection
+  overrides the `single_provider` default whenever that provider is still
+  configured; a persisted provider that is no longer usable falls back to the
+  `hive.toml` default. Key precedence is unchanged (env/config keys win over
+  the persisted key). Startup now logs the selected provider and why
+  (`persisted choice`, `config default`, or `fallback`), never any key. See
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#master-agent-settings-persistence).
 - Run journals no longer store one event per streamed token. The Cursor adapter
   joins contiguous `thinking` deltas and contiguous assistant text into one
   event per block, flushed by any other event (tool call, tool result, result)
