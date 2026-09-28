@@ -2284,3 +2284,61 @@ test.describe("containers", () => {
     await expect(box.getByRole("button", { name: "Open shell" })).toBeDisabled();
   });
 });
+
+test.describe("managed containers", () => {
+  const managed = {
+    name: "scratch",
+    host: "local",
+    container: "hive-scratch",
+    managed: true,
+    reachable: true,
+    missing: [],
+    agents: ["claude", "codex", "opencode"],
+  };
+
+  test("removing a Hive-made container asks in the page, then deletes it", async ({ page }) => {
+    let items: unknown[] = [managed];
+    const deletes: string[] = [];
+    await page.route("**/api/containers", (route) => route.fulfill({ json: items }));
+    await page.route("**/api/containers/scratch*", (route) => {
+      deletes.push(new URL(route.request().url()).search);
+      items = [];
+      return route.fulfill({ status: 204 });
+    });
+    let dialogs = 0;
+    page.on("dialog", (dialog) => {
+      dialogs++;
+      void dialog.dismiss();
+    });
+    await page.goto("/settings/");
+    const box = page.locator('[data-container="scratch"]');
+    await expect(box).toContainText("Managed by Hive");
+    await box.getByRole("button", { name: "Remove" }).click();
+    await expect(box).toContainText("This deletes the container hive-scratch on local");
+    expect(deletes).toEqual([]);
+    await box.getByRole("button", { name: "Cancel" }).click();
+    await expect(box.getByRole("button", { name: "Remove" })).toBeVisible();
+    await box.getByRole("button", { name: "Remove" }).click();
+    await box.getByRole("button", { name: "Delete container" }).click();
+    await expect(page.getByRole("status")).toHaveText("Deleted scratch and its container.");
+    expect(deletes).toEqual(["?delete=1"]);
+    expect(dialogs).toBe(0);
+  });
+
+  test("a container Hive didn't make is only forgotten", async ({ page }) => {
+    const deletes: string[] = [];
+    await page.route("**/api/containers", (route) =>
+      route.fulfill({ json: [{ ...managed, name: "mine", container: "mine", managed: false }] }),
+    );
+    await page.route("**/api/containers/mine*", (route) => {
+      deletes.push(new URL(route.request().url()).search);
+      return route.fulfill({ status: 204 });
+    });
+    await page.goto("/settings/");
+    const box = page.locator('[data-container="mine"]');
+    await expect(box).not.toContainText("Managed by Hive");
+    await box.getByRole("button", { name: "Remove" }).click();
+    await expect(page.getByRole("status")).toContainText("The container itself is still there");
+    expect(deletes).toEqual([""]);
+  });
+});

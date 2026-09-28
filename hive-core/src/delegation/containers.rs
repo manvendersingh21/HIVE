@@ -94,6 +94,82 @@ pub fn remove(name: &str) -> anyhow::Result<Container> {
     Ok(removed)
 }
 
+/// Hive's agent base image, built on each Docker machine from this file.
+const DOCKERFILE: &str = include_str!("runner/Dockerfile.agent");
+
+/// Login folders shared with containers Hive creates, relative to `$HOME`.
+/// Folders, never single files: token refreshes replace files atomically,
+/// which a single-file bind mount can't follow. `~/.claude.json` stays out:
+/// the machine's own Claude rewrites it constantly.
+const LOGINS: [&str; 3] = [".claude", ".codex", ".local/share/opencode"];
+
+/// The base image's tag, named by its content so an edit builds a new image.
+pub fn image_tag() -> String {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(DOCKERFILE.as_bytes()));
+    format!("hive-agent:{}", &hash[..12])
+}
+
+/// What `create` learned about the machine before starting the container.
+struct MachineHome {
+    home: String,
+    user: String,
+    logins: Vec<String>,
+}
+
+fn parse_home(out: &str) -> anyhow::Result<MachineHome> {
+    let field = |key: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Could not read {key} on the machine"))
+    };
+    let user = field("user=")?;
+    anyhow::ensure!(
+        user.split(':').count() == 2
+            && user.split(':').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+        "Unexpected uid:gid {user}"
+    );
+    Ok(MachineHome {
+        home: field("home=")?,
+        user,
+        logins: out
+            .lines()
+            .filter_map(|l| l.strip_prefix("login="))
+            .filter(|l| LOGINS.contains(l))
+            .map(str::to_string)
+            .collect(),
+    })
+}
+
+/// `docker run` for a managed container. Every argument is Hive's own: the
+/// planner names the container and nothing else.
+fn run_command(docker_name: &str, tag: &str, machine: &MachineHome) -> String {
+    use super::transport::quote;
+    let mut args = vec![
+        "docker run -d".to_string(),
+        format!("--name {}", quote(docker_name)),
+        "--restart unless-stopped".into(),
+        format!("--user {}", quote(&machine.user)),
+        "--label hive.managed=1".into(),
+    ];
+    for login in &machine.logins {
+        args.push(format!(
+            "-v {}",
+            quote(&format!("{}/{login}:/home/hive/{login}", machine.home))
+        ));
+    }
+    args.push(quote(tag));
+    // Register the uid (see Dockerfile.agent), give Claude its own config file
+    // (it reads its login from the mounted ~/.claude, but won't start without
+    // ~/.claude.json), then idle; agents come in through `docker exec`.
+    args.push(format!(
+        "sh -c {}",
+        quote(r#"grep -q "^[^:]*:x:$(id -u):" /etc/passwd || echo "hive:x:$(id -u):$(id -g)::/home/hive:/bin/sh" >> /etc/passwd; [ -e ~/.claude.json ] || echo '{"hasCompletedOnboarding":true}' > ~/.claude.json; exec sleep infinity"#)
+    ));
+    args.join(" ")
+}
+
 /// Create a Hive-managed container named `name` on `machine` (a fleet machine
 /// or the coordinator, never a container) from Hive's agent base image, with
 /// the machine's agent logins mounted in, and register it with `managed: true`.
@@ -103,8 +179,79 @@ pub async fn create(
     name: &str,
     taken: &[String],
 ) -> anyhow::Result<Container> {
-    let _ = (machine, name, taken);
-    anyhow::bail!("Creating containers is not implemented yet")
+    use super::transport::{quote, ssh_timeout};
+    anyhow::ensure!(machine.container.is_none(), "Containers can't hold containers");
+    let docker_name = format!("hive-{name}");
+    anyhow::ensure!(
+        valid_name(name) && valid_name(&docker_name),
+        "Use up to 58 letters, numbers, '-', '_' or '.' for a container name"
+    );
+    anyhow::ensure!(!taken.iter().any(|t| t == name), "A machine named {name} already exists");
+    anyhow::ensure!(
+        !load().iter().any(|c| c.name == name),
+        "A container named {name} is already added"
+    );
+    let tag = image_tag();
+    // Building takes minutes the first time on each machine, then never again.
+    ssh_timeout(
+        machine,
+        &format!(
+            // A failed build's cause is at the end of its output; errors are
+            // truncated from the front, so keep only the tail.
+            "docker image inspect {tag} >/dev/null 2>&1 || {{ out=$(printf '%s' {} | docker build -q -t {tag} - 2>&1) || {{ printf '%s\\n' \"$out\" | tail -n 25 >&2; exit 1; }}; }}",
+            quote(DOCKERFILE),
+            tag = quote(&tag)
+        ),
+        None,
+        900,
+    )
+    .await?;
+    let probe = LOGINS
+        .iter()
+        .map(|l| format!("[ -d \"$HOME/{l}\" ] && echo login={l}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let home = parse_home(
+        &ssh_timeout(
+            machine,
+            &format!("echo \"home=$HOME\"; echo \"user=$(id -u):$(id -g)\"; {probe}; exit 0"),
+            None,
+            30,
+        )
+        .await?,
+    )?;
+    ssh_timeout(machine, &run_command(&docker_name, &tag, &home), None, 120).await?;
+    let entry = Container {
+        name: name.to_string(),
+        host: machine.name.clone(),
+        container: docker_name,
+        managed: true,
+        image: Some(tag),
+    };
+    add(entry.clone(), taken)?;
+    Ok(entry)
+}
+
+/// Delete a container Hive created, then forget it. Refuses anything else.
+pub async fn delete(
+    machine: &hive_common::protocol::WorkerInfo,
+    entry: &Container,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        entry.managed,
+        "{} wasn't created by Hive; it can only be removed from the list",
+        entry.name
+    );
+    anyhow::ensure!(machine.container.is_none(), "Containers can't hold containers");
+    super::transport::ssh_timeout(
+        machine,
+        &format!("docker rm -f {}", super::transport::quote(&entry.container)),
+        None,
+        60,
+    )
+    .await?;
+    remove(&entry.name)?;
+    Ok(())
 }
 
 /// Run `command` inside the container, as a login shell so the image's PATH
@@ -128,6 +275,77 @@ mod tests {
         for bad in ["", "-flag", "a b", "a;rm", "a$(x)", "a'b", &"x".repeat(64)] {
             assert!(!valid_name(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn run_mounts_only_existing_login_folders_under_hives_home() {
+        let home = parse_home(
+            "home=/Users/me x\nuser=501:20\nlogin=.codex\nlogin=.local/share/opencode\nlogin=../etc\n",
+        )
+        .unwrap();
+        let line = run_command("hive-dev", "hive-agent:abc", &home);
+        assert!(line.starts_with(
+            "docker run -d --name 'hive-dev' --restart unless-stopped --user '501:20'"
+        ));
+        assert!(line.contains("-v '/Users/me x/.codex:/home/hive/.codex'"));
+        assert!(line.contains(
+            "-v '/Users/me x/.local/share/opencode:/home/hive/.local/share/opencode'"
+        ));
+        // Only folders Hive asked about, and never the shared ~/.claude.json.
+        assert!(!line.contains("/.claude:") && !line.contains("../etc") && !line.contains(".claude.json:"));
+        assert!(line.contains(" 'hive-agent:abc' sh -c "));
+        for bad in ["home=/h\nuser=0;rm:0\n", "home=/h\nuser=0\n", "user=1:1\n"] {
+            assert!(parse_home(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Builds the image and starts a real container on this machine's Docker.
+    /// `cargo test -p hive-core live_create -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_create_runs_as_the_machine_user_with_shared_logins() {
+        let registry = std::env::temp_dir().join(format!("hive-containers-{}.json", uuid::Uuid::new_v4()));
+        std::env::set_var("HIVE_CONTAINERS_FILE", &registry);
+        let machine = hive_common::protocol::WorkerInfo {
+            name: "live-machine".into(),
+            host: "localhost".into(),
+            user: std::env::var("USER").unwrap_or_default(),
+            port: None,
+            tags: vec![],
+            local: true,
+            container: None,
+        };
+        let entry = create(&machine, "phase-b-probe", &[]).await.expect("create");
+        assert!(entry.managed && entry.container == "hive-phase-b-probe");
+        let mut inside = machine.clone();
+        inside.container = Some(entry.container.clone());
+        let report = super::super::transport::ssh_timeout(
+            &inside,
+            r#"echo "whoami=$(whoami) home=$HOME uid=$(id -u)"
+python3 --version; tmux -V; node --version
+for t in claude codex opencode; do echo "$t: $($t --version 2>&1 | head -1)"; done
+ls -a ~/.codex >/dev/null 2>&1 && echo codex_dir=readable
+f=~/.codex/.hive-write-test-$$; touch "$f" 2>/dev/null && rm -f "$f" && echo codex_dir=writable
+codex login status 2>&1 | head -2 | sed 's/^/codex login: /'
+claude auth status 2>&1 | grep -m1 loggedIn | sed 's/^/claude auth: /'
+ls ~/.local/share/opencode/auth.json >/dev/null 2>&1 && echo opencode_auth=present
+opencode auth list 2>&1 | head -5 | sed 's/^/opencode: /'
+exit 0"#,
+            None,
+            120,
+        )
+        .await;
+        println!("{}", report.as_deref().unwrap_or_else(|e| panic!("inside: {e}")));
+        delete(&machine, &entry).await.expect("delete");
+        assert!(load().is_empty());
+        std::fs::remove_file(registry).ok();
+    }
+
+    #[test]
+    fn the_image_tag_follows_the_dockerfile() {
+        let tag = image_tag();
+        assert!(tag.starts_with("hive-agent:") && tag.len() == "hive-agent:".len() + 12);
+        assert!(DOCKERFILE.contains("FROM python:3.12-slim"));
     }
 
     #[test]

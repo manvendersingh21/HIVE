@@ -1,0 +1,19 @@
+# Hive's agent base image: everything a delegated agent needs, nothing else.
+# Built on each Docker machine from this file alone (no build context), tagged
+# by its content hash, so changing it builds a new image instead of reusing one.
+FROM python:3.12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tmux nodejs npm git curl ca-certificates procps \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --no-audit --no-fund @anthropic-ai/claude-code @openai/codex opencode-ai \
+ && npm cache clean --force
+
+# Containers run as the machine's own uid so mounted logins keep their owner.
+# That uid has no passwd entry here, so HOME is fixed and writable by anyone.
+# Tools that look the user up (Node's os.userInfo) need a passwd entry, which
+# the container adds for its uid at start; so /etc/passwd stays writable.
+RUN mkdir -p /home/hive/.local/share && chmod -R 1777 /home/hive && chmod 666 /etc/passwd
+ENV HOME=/home/hive
+WORKDIR /home/hive

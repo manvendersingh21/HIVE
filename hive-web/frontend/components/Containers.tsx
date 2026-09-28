@@ -26,6 +26,7 @@ export function Containers() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState("");
 
   async function load() {
     setItems(await api<Registered[]>("/api/containers"));
@@ -79,13 +80,26 @@ export function Containers() {
     }
   }
 
+  // A container Hive created is deleted with it, so that asks once in the page.
   async function remove(item: Registered) {
     setError("");
     setNotice("");
+    if (item.managed && confirming !== item.name) {
+      setConfirming(item.name);
+      return;
+    }
+    setConfirming("");
     setBusy(true);
     try {
-      await api(`/api/containers/${encodeURIComponent(item.name)}`, { method: "DELETE" });
-      setNotice(`Removed ${item.name} from Hive. The container itself is still there.`);
+      await api(
+        `/api/containers/${encodeURIComponent(item.name)}${item.managed ? "?delete=1" : ""}`,
+        { method: "DELETE" },
+      );
+      setNotice(
+        item.managed
+          ? `Deleted ${item.name} and its container.`
+          : `Removed ${item.name} from Hive. The container itself is still there.`,
+      );
       await load();
     } catch (e) {
       setError((e as Error).message);
@@ -140,9 +154,23 @@ export function Containers() {
                 Open shell
               </button>
               <button className="danger" disabled={busy} onClick={() => void remove(item)}>
-                Remove
+                {confirming === item.name ? "Delete container" : "Remove"}
               </button>
+              {confirming === item.name && (
+                <button className="ghost" onClick={() => setConfirming("")}>
+                  Cancel
+                </button>
+              )}
             </div>
+            {item.managed && (
+              <p className="muted small">Managed by Hive · created by Hive&apos;s planner</p>
+            )}
+            {confirming === item.name && (
+              <p className="error small">
+                This deletes the container {item.container} on {item.host} and everything
+                inside it, including agent workspaces. Press Delete container to confirm.
+              </p>
+            )}
             {!item.reachable ? (
               <p className="error small">{item.error || "Not reachable"}</p>
             ) : (
