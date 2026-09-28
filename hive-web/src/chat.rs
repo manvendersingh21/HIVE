@@ -35,6 +35,7 @@ use tracing::{info, warn};
 //    a 30s margin for ancillary tasks (memory retrieval, prompt generation, complexity classification).
 // 4. Automatic retry: `plan_with_retry` grants one automatic retry of the whole plan if
 //    the deadline fires, giving up to ~300s total before a user-facing timeout message.
+//    A permit-wait timeout has already spent that budget, so it is returned without a retry.
 const PLANNING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 const CONTINUATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -54,32 +55,63 @@ pub(crate) async fn bounded_plan<T>(
     plan: impl std::future::Future<Output = anyhow::Result<T>>,
     deadline: std::time::Duration,
 ) -> Result<T, Response> {
+    try_bounded_plan(slots, plan, deadline)
+        .await
+        .map_err(PlanFailure::into_response)
+}
+
+/// Why a bounded plan produced no value. Kept distinct so only a plan that
+/// actually ran out of time is retried; a slot-wait timeout has already spent
+/// the whole-request budget.
+enum PlanFailure {
+    SlotWait,
+    Deadline,
+    Failed(anyhow::Error),
+}
+
+impl IntoResponse for PlanFailure {
+    fn into_response(self) -> Response {
+        match self {
+            PlanFailure::SlotWait => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Planning timed out waiting for an available planner slot. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
+            )
+                .into_response(),
+            PlanFailure::Deadline => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Planning timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
+            )
+                .into_response(),
+            PlanFailure::Failed(e) => {
+                (StatusCode::BAD_GATEWAY, format!("planning failed: {e}")).into_response()
+            }
+        }
+    }
+}
+
+async fn try_bounded_plan<T>(
+    slots: &tokio::sync::Semaphore,
+    plan: impl std::future::Future<Output = anyhow::Result<T>>,
+    deadline: std::time::Duration,
+) -> Result<T, PlanFailure> {
     let wait_budget = deadline * 2;
     let _permit = match tokio::time::timeout(wait_budget, slots.acquire()).await {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => panic!("planner semaphore is closed"),
         Err(_) => {
             warn!("planner semaphore permit wait timed out");
-            return Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                "Planning timed out waiting for an available planner slot. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
-            )
-                .into_response());
+            return Err(PlanFailure::SlotWait);
         }
     };
     match tokio::time::timeout(deadline, plan).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => {
             warn!(error = %e, "planning failed");
-            Err((StatusCode::BAD_GATEWAY, format!("planning failed: {e}")).into_response())
+            Err(PlanFailure::Failed(e))
         }
         Err(_) => {
             warn!("total planning deadline exceeded");
-            Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                "Planning timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
-            )
-                .into_response())
+            Err(PlanFailure::Deadline)
         }
     }
 }
@@ -108,21 +140,21 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    match bounded_plan(slots, make_plan(), deadline).await {
+    match try_bounded_plan(slots, make_plan(), deadline).await {
         Ok(plan) => Ok(plan),
-        Err(response) if response.status() != StatusCode::GATEWAY_TIMEOUT => Err(response),
-        Err(_) => {
+        Err(PlanFailure::Deadline) => {
             warn!("planning deadline exceeded; retrying the whole plan once");
-            match bounded_plan(slots, make_plan(), deadline).await {
+            match try_bounded_plan(slots, make_plan(), deadline).await {
                 Ok(plan) => Ok(plan),
-                Err(response) if response.status() == StatusCode::GATEWAY_TIMEOUT => Err((
+                Err(PlanFailure::Deadline) => Err((
                     StatusCode::GATEWAY_TIMEOUT,
                     "Planning timed out and one automatic retry also timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message in a moment, and if it keeps timing out, try a shorter or simpler request.",
                 )
                     .into_response()),
-                Err(response) => Err(response),
+                Err(failure) => Err(failure.into_response()),
             }
         }
+        Err(failure) => Err(failure.into_response()),
     }
 }
 
@@ -238,6 +270,169 @@ pub async fn get_chat(State(h): State<AgentHandle>, Path(id): Path<String>) -> R
         },
         Ok(None) => storage_error(ChatError::NotFound.into()),
         Err(e) => storage_error(e),
+    }
+}
+
+/// Delegated-run states that still own a live agent session. A chat with any
+/// of these cannot be deleted: the run would keep working with nowhere to
+/// report, and its approvals would point at a conversation that is gone.
+pub(crate) const LIVE_RUN_STATES: [&str; 6] = [
+    "queued",
+    "launching",
+    "working",
+    "waiting-for-peer",
+    "awaiting-approval",
+    "paused-quota",
+];
+
+/// What stopped a chat deletion, if anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeleteRefusal {
+    NotFound,
+    LiveRuns(i64),
+    ActiveTurn,
+}
+
+/// Delete one conversation and everything that exists only because of it, in
+/// a single IMMEDIATE transaction on the shared memory connection:
+///
+/// - web chat turns, messages, and the conversation row;
+/// - RAG memory rows (`rag_chunks`, `rag_indexed`) for that conversation;
+/// - finished delegated runs of that conversation, with their events,
+///   decisions, and the task-scoped contracts/reviews no other run uses.
+///
+/// Relay state is deliberately left alone. The audit chain is append-only
+/// (triggers refuse DELETE), and the envelopes, messages, keys and incidents
+/// it references stay so the chain remains verifiable after the chat is gone.
+pub(crate) fn delete_conversation(
+    agent: &MasterAgent,
+    id: &str,
+) -> anyhow::Result<Result<(), DeleteRefusal>> {
+    let conn = agent.memory.graph.shared_conn();
+    let db = conn.lock().unwrap();
+    db.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> anyhow::Result<Result<(), DeleteRefusal>> {
+        let exists: i64 = db.query_row(
+            "SELECT count(*) FROM conversations WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(Err(DeleteRefusal::NotFound));
+        }
+        let table = |name: &str| -> anyhow::Result<bool> {
+            let n: i64 = db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        };
+        let has_runs = table("delegated_runs")?;
+        if has_runs {
+            let live_list = LIVE_RUN_STATES
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let live: i64 = db.query_row(
+                &format!(
+                    "SELECT count(*) FROM delegated_runs WHERE conversation_id=?1 AND state IN ({live_list})"
+                ),
+                [id],
+                |r| r.get(0),
+            )?;
+            if live > 0 {
+                return Ok(Err(DeleteRefusal::LiveRuns(live)));
+            }
+        }
+        if table("web_chat_turns")? {
+            let active: i64 = db.query_row(
+                "SELECT count(*) FROM web_chat_turns WHERE conversation_id=?1 AND status IN ('planning','executing','awaiting_approval')",
+                [id],
+                |r| r.get(0),
+            )?;
+            if active > 0 {
+                return Ok(Err(DeleteRefusal::ActiveTurn));
+            }
+            db.execute("DELETE FROM web_chat_turns WHERE conversation_id=?1", [id])?;
+        }
+        if has_runs {
+            let runs = "SELECT id FROM delegated_runs WHERE conversation_id=?1";
+            let tasks = "SELECT task_id FROM delegated_runs WHERE conversation_id=?1 \
+                         AND task_id NOT IN (SELECT task_id FROM delegated_runs WHERE conversation_id!=?1)";
+            db.execute(&format!("DELETE FROM delegated_events WHERE run_id IN ({runs})"), [id])?;
+            db.execute(&format!("DELETE FROM delegated_decisions WHERE run_id IN ({runs})"), [id])?;
+            for scoped in ["delegated_contracts", "delegated_reviews"] {
+                if table(scoped)? {
+                    db.execute(&format!("DELETE FROM {scoped} WHERE task_id IN ({tasks})"), [id])?;
+                }
+            }
+            db.execute("DELETE FROM delegated_runs WHERE conversation_id=?1", [id])?;
+        }
+        for memory in ["rag_chunks", "rag_indexed"] {
+            if table(memory)? {
+                db.execute(&format!("DELETE FROM {memory} WHERE conversation_id=?1"), [id])?;
+            }
+        }
+        db.execute("DELETE FROM messages WHERE conversation_id=?1", [id])?;
+        db.execute("DELETE FROM conversations WHERE id=?1", [id])?;
+        Ok(Ok(()))
+    })();
+    // Never leave the shared connection inside an open transaction, and never
+    // let a failed ROLLBACK hide the error that caused it.
+    if matches!(result, Ok(Ok(()))) {
+        if let Err(commit) = db.execute_batch("COMMIT") {
+            let _ = db.execute_batch("ROLLBACK");
+            return Err(commit.into());
+        }
+    } else {
+        let _ = db.execute_batch("ROLLBACK");
+    }
+    result
+}
+
+/// `DELETE /api/chats/{id}` — 204 when deleted, 404 for an unknown chat, 409
+/// while a delegated run or a chat request of that conversation is still live.
+pub async fn delete_chat(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
+    if let Err(r) = h.store() {
+        return r;
+    }
+    let agent = match h.require() {
+        Ok(a) => a.clone(),
+        Err(r) => return r,
+    };
+    // Make sure the delegation tables exist, so the live-run check can never
+    // be skipped just because no run was ever created on this host.
+    if let Err(e) = crate::delegation::store(&h) {
+        return storage_error(e);
+    }
+    let outcome = {
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || delete_conversation(&agent, &id)).await
+    };
+    match outcome {
+        Ok(Ok(Ok(()))) => {
+            info!(conversation_id = %id, "chat deleted");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(Err(DeleteRefusal::NotFound))) => storage_error(ChatError::NotFound.into()),
+        Ok(Ok(Err(DeleteRefusal::LiveRuns(n)))) => (
+            StatusCode::CONFLICT,
+            format!(
+                "This chat still has {n} delegated run{} in progress. Stop or finish {} before deleting the chat.",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "it" } else { "them" },
+            ),
+        )
+            .into_response(),
+        Ok(Ok(Err(DeleteRefusal::ActiveTurn))) => (
+            StatusCode::CONFLICT,
+            "This chat has a request running or awaiting approval. Wait for it to finish before deleting the chat.",
+        )
+            .into_response(),
+        Ok(Err(e)) => storage_error(e),
+        Err(e) => storage_error(anyhow::anyhow!("chat deletion task failed: {e}")),
     }
 }
 
@@ -1438,6 +1633,34 @@ mod deadline_tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("No commands were executed"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_planner_slot_wait_timeout_is_returned_without_a_whole_plan_retry() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let _hog1 = slots.clone().acquire_owned().await.unwrap();
+        let _hog2 = slots.clone().acquire_owned().await.unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let response = plan_with_retry_slots(
+            &slots,
+            move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async { anyhow::Ok(()) }
+            },
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        // A whole-plan retry would build a second plan future.
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("available planner slot"), "{text}");
+        assert!(!text.contains("automatic retry"), "{text}");
     }
 
     #[tokio::test]

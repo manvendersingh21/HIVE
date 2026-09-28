@@ -269,11 +269,13 @@ impl NvidiaClient {
                 let mut line_buffer: Vec<u8> = Vec::new();
                 let mut finish_reason = None;
                 let mut stream_retry = false;
+                let mut received = false;
 
                 'stream: loop {
                     let chunk_result = tokio::time::timeout(idle_timeout, r.chunk()).await;
                     match chunk_result {
                         Ok(Ok(Some(bytes))) => {
+                            received = true;
                             line_buffer.extend_from_slice(&bytes);
                             anyhow::ensure!(
                                 line_buffer.len() <= 1 << 20,
@@ -312,7 +314,10 @@ impl NvidiaClient {
                             break 'stream;
                         }
                         Ok(Err(e)) => {
-                            let retry = e.is_connect() || e.is_timeout();
+                            // Body errors are never connect/timeout errors on this
+                            // client (it has no reqwest timeout). A failure before
+                            // the first chunk consumed nothing, so it is replayable.
+                            let retry = !received || e.is_connect() || e.is_timeout();
                             if retry && attempt + 1 < ATTEMPTS {
                                 stream_retry = true;
                                 break 'stream;
@@ -742,6 +747,84 @@ pub(crate) mod tests {
         assert_eq!(resp.text, "retried ok");
         task.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    /// Answers each connection with raw bytes and then closes it, so a reply
+    /// can promise more body than it sends.
+    async fn raw_server(replies: Vec<Vec<u8>>) -> (String, Requests, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests: Requests = Default::default();
+        let captured = requests.clone();
+        let task = tokio::spawn(async move {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut data = vec![];
+                let header_end = loop {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = data.windows(4).position(|b| b == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&data[..header_end]).to_string();
+                let len: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                while data.len() < header_end + len {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    data.extend_from_slice(&buf[..n]);
+                }
+                captured.lock().unwrap().push((headers, Value::Null));
+                let _ = stream.write_all(&reply).await;
+            }
+        });
+        (url, requests, task)
+    }
+
+    fn truncated_stream(body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n{body}").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn streaming_error_before_first_chunk_is_retried() {
+        let ok = "data: {\"choices\":[{\"delta\":{\"content\":\"retried ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (url, requests, task) = raw_server(vec![
+            truncated_stream(""),
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok}", ok.len()).into_bytes(),
+        ])
+        .await;
+        let resp = router(url)
+            .nvidia
+            .complete_streaming_with_idle("plan", "high", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(resp.text, "retried ok");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_error_after_first_chunk_is_not_retried() {
+        let (url, requests, task) = raw_server(vec![truncated_stream(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        )])
+        .await;
+        let err = router(url)
+            .nvidia
+            .complete_streaming_with_idle("plan", "high", Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("streaming transport error"), "{err}");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -23,8 +23,8 @@ pub struct Run {
 }
 
 /// A message was refused because its ID already names a different envelope, or
-/// its route is not allowed. The refusal is already recorded (as a single
-/// incident where a message exists), so a sync loop may continue past it.
+/// its route is not allowed. The refusal is already recorded as a single
+/// incident, so a sync loop may continue past it.
 #[derive(Debug)]
 pub struct MessageRejected(pub String);
 impl std::fmt::Display for MessageRejected {
@@ -69,6 +69,45 @@ fn insert_message(
         relay::stage(db, id, source, destination, payload, chrono::Utc::now().timestamp())?;
     }
     Ok(())
+}
+
+// A forbidden route is refused before storage, so there is no stored message to
+// attribute it to; the caller's routing is recorded instead. Recorded at most once
+// per (message, reason) so a journal replaying the same event on every sync
+// cannot grow the append-only chain.
+fn reject_route(
+    db: &Connection,
+    id: &str,
+    source: &str,
+    destination: &str,
+    task_id: &str,
+    reason: &str,
+    now: i64,
+) -> anyhow::Result<()> {
+    let seen: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM delegated_relay_incidents WHERE message_id=? AND reason=?)",
+        params![id, reason],
+        |r| r.get(0),
+    )?;
+    if seen {
+        return Ok(());
+    }
+    let at = chrono::DateTime::from_timestamp(now, 0)
+        .ok_or_else(|| anyhow::anyhow!("Invalid relay time"))?
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    db.execute("INSERT INTO delegated_relay_incidents(source,destination,message_id,kind,reason,created_at) VALUES(?,?,?,'route',?,?)", params![source, destination, id, reason, at])?;
+    let envelope = relay::Envelope {
+        id: id.into(),
+        task_id: task_id.into(),
+        source: source.into(),
+        destination: destination.into(),
+        kind: String::new(),
+        text_digest: String::new(),
+        seq: 0,
+        staged_at: String::new(),
+    };
+    relay::audit(db, "reject", &envelope, json!({"kind":"route","reason":reason}), now)
 }
 
 impl RunStore {
@@ -414,7 +453,12 @@ impl RunStore {
     ) -> anyhow::Result<()> {
         let to = self.get(destination)?;
         if source != "user" && self.get(source)?.task_id != to.task_id {
-            return Err(MessageRejected("Peer message crosses task boundary".into()).into());
+            let reason = "Peer message crosses task boundary";
+            let mut db = self.0.lock().unwrap();
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            reject_route(&tx, id, source, destination, &to.task_id, reason, chrono::Utc::now().timestamp())?;
+            tx.commit()?;
+            return Err(MessageRejected(reason.into()).into());
         }
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -546,6 +590,25 @@ mod tests {
         assert!(s
             .message("m", &a.id, &b.id, &json!({"id":"m","text":"bad"}))
             .is_err());
+    }
+
+    #[test]
+    fn repeated_cross_task_peer_sync_records_one_incident_and_one_reject() {
+        let g = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let s = RunStore::new(g.shared_conn()).unwrap();
+        let a = s.create("a", "chat", &plan()).unwrap().remove(0);
+        let b = s.create("b", "chat", &plan()).unwrap().remove(0);
+        let payload = json!({"id":"cross","source":a.id,"text":"bad"});
+        for _ in 0..3 {
+            let error = s.message("cross", &a.id, &b.id, &payload).unwrap_err();
+            assert!(error.is::<MessageRejected>());
+        }
+        let count = |sql: &str| -> i64 { s.0.lock().unwrap().query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM delegated_messages WHERE id='cross'"), 0);
+        assert_eq!(count("SELECT count(*) FROM delegated_relay_incidents WHERE message_id='cross'"), 1);
+        assert_eq!(count("SELECT count(*) FROM delegated_relay_audit WHERE json_extract(record,'$.event')='reject' AND json_extract(record,'$.message_id')='cross'"), 1);
+        assert_eq!(s.audit_full(&a.id).unwrap()["chain_valid"], true);
+        assert!(s.pending_messages(&b.id).unwrap().is_empty());
     }
 
     #[test]
