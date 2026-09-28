@@ -174,8 +174,15 @@ pub async fn add(State(h): State<AgentHandle>, Json(req): Json<AddRequest>) -> R
 
 #[derive(Deserialize)]
 pub struct RemoveQuery {
+    /// `1` (what the page sends) or `true`.
     #[serde(default)]
-    delete: bool,
+    delete: Option<String>,
+}
+
+impl RemoveQuery {
+    fn delete(&self) -> bool {
+        matches!(self.delete.as_deref(), Some("1" | "true"))
+    }
 }
 
 /// Forget a container. `?delete=1` also deletes one Hive created; a container
@@ -185,7 +192,7 @@ pub async fn remove(
     Path(name): Path<String>,
     Query(q): Query<RemoveQuery>,
 ) -> Response {
-    if q.delete {
+    if q.delete() {
         let Some(entry) = containers::load().into_iter().find(|c| c.name == name) else {
             return (StatusCode::NOT_FOUND, format!("No container named {name}")).into_response();
         };
@@ -213,5 +220,21 @@ pub async fn remove(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_is_read_the_way_the_page_sends_it() {
+        let parse = |uri: &str| {
+            Query::<RemoveQuery>::try_from_uri(&uri.parse().unwrap()).unwrap().0.delete()
+        };
+        assert!(parse("/api/containers/box?delete=1"));
+        assert!(parse("/api/containers/box?delete=true"));
+        assert!(!parse("/api/containers/box"));
+        assert!(!parse("/api/containers/box?delete=0"));
     }
 }
