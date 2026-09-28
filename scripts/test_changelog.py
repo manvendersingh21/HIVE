@@ -2,10 +2,18 @@
 """Unit tests for scripts/changelog.py."""
 
 import datetime
+import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
+
+# Allow running this test file directly: python3 scripts/test_changelog.py
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.changelog import (
     ChangelogError,
@@ -180,6 +188,35 @@ class TestChangelogRelease(unittest.TestCase):
         # Changelog was not modified
         self.assertNotIn("## [1.0.0]", self.changelog_file.read_text())
 
+    def test_release_refuses_existing_version(self):
+        frag = self.changelog_dir / "01-feat.md"
+        frag.write_text("### Added\n- Feature A\n")
+        initial_changelog = (
+            "# Changelog\n\n## [Unreleased]\n\n## [1.0.0] - 2026-01-01\n\n### Added\n- Initial release\n"
+        )
+        self.changelog_file.write_text(initial_changelog)
+
+        with self.assertRaises(ChangelogError) as ctx:
+            release(
+                version="1.0.0",
+                changelog_dir=self.changelog_dir,
+                changelog_file=self.changelog_file,
+            )
+        self.assertIn("already exists", str(ctx.exception))
+
+        # Test with 'v' prefix as well
+        with self.assertRaises(ChangelogError) as ctx:
+            release(
+                version="v1.0.0",
+                changelog_dir=self.changelog_dir,
+                changelog_file=self.changelog_file,
+            )
+        self.assertIn("already exists", str(ctx.exception))
+
+        # Verify nothing was written to CHANGELOG.md and fragments were preserved
+        self.assertEqual(self.changelog_file.read_text(), initial_changelog)
+        self.assertTrue(frag.exists())
+
 
 class TestChangelogCLI(unittest.TestCase):
     def setUp(self):
@@ -217,6 +254,41 @@ class TestChangelogCLI(unittest.TestCase):
         ])
         self.assertEqual(ret, 0)
         self.assertIn("## [1.2.0] - 2026-09-28", self.changelog_file.read_text())
+
+    def test_cli_release_refuses_existing_version(self):
+        (self.changelog_dir / "test.md").write_text("### Fixed\n- A bug\n")
+        self.changelog_file.write_text("# Changelog\n\n## [Unreleased]\n\n## [1.2.0] - 2026-09-01\n")
+        ret = main([
+            "release",
+            "1.2.0",
+            "--dir",
+            str(self.changelog_dir),
+            "--file",
+            str(self.changelog_file),
+            "--date",
+            "2026-09-28",
+        ])
+        self.assertEqual(ret, 1)
+        self.assertTrue((self.changelog_dir / "test.md").exists())
+
+
+class TestChangelogDirectExecution(unittest.TestCase):
+    def test_run_directly_as_script(self):
+        # Prevent infinite recursion if child process executes all tests
+        if os.environ.get("_CHANGELOG_SUBPROCESS_TEST"):
+            return
+        env = dict(os.environ, _CHANGELOG_SUBPROCESS_TEST="1")
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve())],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Failed to run test_changelog.py directly via python3:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}",
+        )
 
 
 if __name__ == "__main__":

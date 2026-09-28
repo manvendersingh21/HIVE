@@ -204,6 +204,13 @@ def release(
     if not changelog_file.exists():
         raise ChangelogError(f"Changelog file '{changelog_file}' does not exist.")
 
+    changelog_text = changelog_file.read_text(encoding="utf-8")
+
+    clean_version = version.lstrip("v")
+    existing_pattern = re.compile(rf"^##\s+\[v?{re.escape(clean_version)}\]", re.MULTILINE)
+    if existing_pattern.search(changelog_text):
+        raise ChangelogError(f"Version '{version}' already exists in '{changelog_file}'.")
+
     combined_sections: Dict[str, List[str]] = {}
     for fragment in fragments:
         parsed = parse_fragment(fragment)
@@ -211,7 +218,6 @@ def release(
             combined_sections.setdefault(heading, []).extend(blocks)
 
     release_block = format_release_block(version, combined_sections, release_date)
-    changelog_text = changelog_file.read_text(encoding="utf-8")
 
     unreleased_pattern = re.compile(r"^(##\s+\[Unreleased\]\s*)$", re.MULTILINE)
     match = unreleased_pattern.search(changelog_text)
