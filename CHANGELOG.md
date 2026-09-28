@@ -77,6 +77,23 @@ may still change without a deprecation period.
   `[earlier output truncated]` marker.
 - A review answer is retried once whether it was not valid JSON or not a valid
   review object, with the exact failure appended to the prompt.
+- A run's lock is released when its coordinator is, not when its children are
+  (BUG14). `RunLock` took an exclusive `flock` on `runtime.lock` and relied on
+  closing the descriptor to release it, but an `flock` belongs to the *open file
+  description*, which a child forked while the lock was held inherits — so the
+  lock outlived the coordinator by as long as that child took to `exec`. The next
+  `acquire` on the same run then failed with `EWOULDBLOCK` ("another coordinator
+  owns this run: Resource temporarily unavailable") for a coordinator that had
+  already left, and any run that launched a child — an acceptance command, a
+  tmux session, a `sh` helper — was reported as owned by a phantom peer. The
+  lock descriptor is now opened `O_CLOEXEC` and checked to be, and `Drop`
+  releases the lock with `LOCK_UN` explicitly rather than as a side effect of
+  `close`, so a live child can no longer keep a finished run locked. The
+  `hive-core` `runtime::lifecycle` tests that ran a real `python3` acceptance
+  suite and then resumed the run were the reproducible case, failing under
+  parallel `cargo test`; their fixtures now also use unique scratch paths, and
+  two regression tests cover lock re-acquisition with a child still running and
+  descriptor exhaustion across repeated acquire/release cycles.
 - NVIDIA planning no longer fails wholesale with "NVIDIA request deadline
   exceeded": the first attempt gets ~80s of the 120s deadline (so a healthy but
   slow generation still completes on the first try), and a hung first attempt is
@@ -170,3 +187,13 @@ may still change without a deprecation period.
 - Autonomous device and model scheduling is not implemented; the supervisor
   authors and verifies tasks.
 - Fine-tuning data collection and export are not implemented.
+
+### Secure peer relay
+
+- Attest delegated peer messages with coordinator-held Ed25519 identities,
+  canonical envelopes, sequence checks, and configurable rolling rate budgets.
+- Quarantine integrity failures and show incidents and held-message reasons on
+  both runs; expose an append-only hash-chained audit API and session panel.
+- Label the guarantee “Relay-attested (HACP Secure degraded mode)”; document
+  database custody, trust boundaries, retries, migration and HACP API compatibility
+  in `docs/HACP-RELAY.md`.

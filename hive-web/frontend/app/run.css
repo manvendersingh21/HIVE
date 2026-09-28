@@ -101,3 +101,8 @@ pre.cmd { background: #0a0c10; border: 1px solid var(--line); margin: 6px 0; fon
 .ssh-step ul { padding-left: 18px; overflow-wrap: anywhere; }
 .banner.good { border-color: #1f4a31; background: #10201a; color: #bff0d2; }
 .ssh-step .full { width: 100%; margin: 0; }
+
+.relay-audit { overflow-wrap: anywhere; }
+.relay-audit h3 { font-size: 1rem; }
+.relay-audit ol { padding-left: 1.2rem; }
+.relay-audit li { margin-block: .6rem; }

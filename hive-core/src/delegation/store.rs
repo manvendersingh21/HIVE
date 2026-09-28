@@ -1,6 +1,6 @@
-use super::{coordination::AgreementRecord, Assignment, DelegationPlan};
+use super::{coordination::AgreementRecord, relay, Assignment, DelegationPlan};
 use hacp::v2::ContractState;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -18,10 +18,24 @@ pub struct Run {
     pub runner_path: Option<String>,
     pub review: Value,
     pub contracts: Vec<AgreementRecord>,
+    pub identity: relay::PublicIdentity,
+    pub relay: Value,
 }
 
+/// A message was refused because its ID already names a different envelope, or
+/// its route is not allowed. The refusal is already recorded (as a single
+/// incident where a message exists), so a sync loop may continue past it.
+#[derive(Debug)]
+pub struct MessageRejected(pub String);
+impl std::fmt::Display for MessageRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for MessageRejected {}
+
 #[derive(Clone)]
-pub struct RunStore(Arc<Mutex<Connection>>);
+pub struct RunStore(Arc<Mutex<Connection>>, relay::Budget);
 
 // Message IDs are delivery identities. An exact replay is harmless, but silently
 // accepting a changed envelope could acknowledge work that was never delivered.
@@ -36,7 +50,7 @@ fn insert_message(
         !id.is_empty() && payload["id"].as_str() == Some(id),
         "Message ID must match its payload"
     );
-    db.execute(
+    let inserted = db.execute(
         "INSERT OR IGNORE INTO delegated_messages(id,source,destination,payload) VALUES (?,?,?,?)",
         params![id, source, destination, payload.to_string()],
     )?;
@@ -51,6 +65,9 @@ fn insert_message(
             && serde_json::from_str::<Value>(&existing.2)? == *payload,
         "Message ID already belongs to a different envelope"
     );
+    if inserted == 1 {
+        relay::stage(db, id, source, destination, payload, chrono::Utc::now().timestamp())?;
+    }
     Ok(())
 }
 
@@ -65,14 +82,29 @@ impl RunStore {
           CREATE TABLE IF NOT EXISTS delegated_decisions (run_id TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, decision TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(run_id,id));
           CREATE TABLE IF NOT EXISTS delegated_messages (id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL, payload TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS delegated_contracts (task_id TEXT NOT NULL, party_a TEXT NOT NULL, party_b TEXT NOT NULL, contract TEXT NOT NULL, PRIMARY KEY(task_id,party_a,party_b));")?;
-        let db = conn.lock().unwrap();
-        db.execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0,continue_reviews INTEGER NOT NULL DEFAULT 0);")?;
-        // A database created before review rounds were bounded has no counter yet.
-        if db.prepare("SELECT continue_reviews FROM delegated_reviews").is_err() {
-            db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN continue_reviews INTEGER NOT NULL DEFAULT 0;")?;
+        {
+            let db = conn.lock().unwrap();
+            db.execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0,continue_reviews INTEGER NOT NULL DEFAULT 0);")?;
+            // A database created before review rounds were bounded has no counter yet.
+            if db.prepare("SELECT continue_reviews FROM delegated_reviews").is_err() {
+                db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN continue_reviews INTEGER NOT NULL DEFAULT 0;")?;
+            }
         }
-        drop(db);
-        Ok(Self(conn))
+        {
+            let mut db = conn.lock().unwrap();
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            relay::schema(&tx)?;
+            // Existing runs gain identities; unsigned historical messages are
+            // never retroactively signed and will fail closed before delivery.
+            let ids = {
+                let mut stmt = tx.prepare("SELECT id FROM delegated_runs WHERE id NOT IN (SELECT run_id FROM delegated_relay_keys)")?;
+                let rows = stmt.query_map([], |r| r.get::<_,String>(0))?;
+                rows.collect::<Result<Vec<_>,_>>()?
+            };
+            for id in ids { relay::create_identity(&tx, &id)?; }
+            tx.commit()?;
+        }
+        Ok(Self(conn, relay::Budget::from_env()?))
     }
     pub fn create(
         &self,
@@ -81,7 +113,7 @@ impl RunStore {
         plan: &DelegationPlan,
     ) -> anyhow::Result<Vec<Run>> {
         let mut db = self.0.lock().unwrap();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let count: i64 = tx.query_row(
             "SELECT count(*) FROM delegated_runs WHERE task_id=?",
             [task],
@@ -94,6 +126,7 @@ impl RunStore {
         for assignment in &plan.assignments {
             let id = uuid::Uuid::new_v4().to_string();
             tx.execute("INSERT INTO delegated_runs(id,task_id,conversation_id,assignment,tmux_name,state) VALUES (?,?,?,?,?,?)", params![id,task,conversation,serde_json::to_string(assignment)?,format!("hive-agent-{id}"),"queued"])?;
+            relay::create_identity(&tx, &id)?;
         }
         tx.commit()?;
         drop(db);
@@ -127,7 +160,7 @@ impl RunStore {
         messages: &[(String, Value)],
     ) -> anyhow::Result<()> {
         let mut db = self.0.lock().unwrap();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         anyhow::ensure!(tx.execute("UPDATE delegated_reviews SET status=?,summary=?,lock_until=0,continue_reviews=CASE WHEN ?='continue' THEN continue_reviews+1 ELSE 0 END WHERE task_id=? AND cursor=?",params![status,summary,status,task,cursor])?==1,"Review was superseded");
         for (destination, payload) in messages {
             let same_task: bool = tx.query_row(
@@ -167,9 +200,10 @@ impl RunStore {
         }
         let replacement = uuid::Uuid::new_v4().to_string();
         let mut db = self.0.lock().unwrap();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         anyhow::ensure!(tx.execute("UPDATE delegated_runs SET state='superseded',metadata=json_set(metadata,'$.replacement_id',?) WHERE id=? AND state!='superseded'",params![replacement,id])?==1,"Assignment already replaced");
         tx.execute("INSERT INTO delegated_runs(id,task_id,conversation_id,assignment,tmux_name,state) VALUES (?,?,?,?,?,'queued')",params![replacement,old.task_id,old.conversation_id,serde_json::to_string(assignment)?,format!("hive-agent-{replacement}")])?;
+        relay::create_identity(&tx, &replacement)?;
         tx.commit()?;
         drop(db);
         self.get(&replacement)
@@ -194,6 +228,8 @@ impl RunStore {
         let mut runs: Vec<Run> = rows.map(|row| {
             let (id, task_id, conversation_id, a, tmux_name, state, m, cursor, runner_path, review) = row?;
             Ok(Run {
+                identity: relay::identity(&db, &id)?,
+                relay: relay::status(&db, &id)?,
                 id,
                 task_id,
                 conversation_id,
@@ -264,7 +300,7 @@ impl RunStore {
     }
     pub fn sync(&self, id: &str, snapshot: &Value) -> anyhow::Result<()> {
         let mut db = self.0.lock().unwrap();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut cursor = 0;
         for event in snapshot["events"].as_array().into_iter().flatten() {
             let seq = event["seq"]
@@ -377,26 +413,83 @@ impl RunStore {
         payload: &Value,
     ) -> anyhow::Result<()> {
         let to = self.get(destination)?;
-        if source != "user" {
-            anyhow::ensure!(
-                self.get(source)?.task_id == to.task_id,
-                "Peer message crosses task boundary"
-            );
+        if source != "user" && self.get(source)?.task_id != to.task_id {
+            return Err(MessageRejected("Peer message crosses task boundary".into()).into());
         }
-        insert_message(&self.0.lock().unwrap(), id, source, destination, payload)
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = insert_message(&tx, id, source, destination, payload);
+        match result {
+            Ok(()) => { tx.commit()?; Ok(()) }
+            Err(error) => {
+                tx.rollback()?;
+                // Preserve evidence even when rejecting a changed delivered ID.
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM delegated_messages WHERE id=?)", [id], |r| r.get(0))?;
+                if exists { relay::incident(&tx, id, "Message ID reused with a different envelope", chrono::Utc::now().timestamp())?; }
+                tx.commit()?;
+                if exists {
+                    return Err(MessageRejected(error.to_string()).into());
+                }
+                Err(error)
+            }
+        }
+    }
+    pub fn has_pending_messages(&self, run: &str) -> anyhow::Result<bool> {
+        Ok(self.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM delegated_messages WHERE destination=? AND delivered=0 AND id NOT IN (SELECT message_id FROM delegated_relay_envelopes WHERE rejected=1))", [run], |row| row.get(0))?)
     }
     pub fn pending_messages(&self, run: &str) -> anyhow::Result<Vec<Value>> {
         let db = self.0.lock().unwrap();
-        let mut stmt=db.prepare("SELECT payload FROM delegated_messages WHERE destination=? AND delivered=0 ORDER BY rowid")?;
+        let mut stmt=db.prepare("SELECT payload FROM delegated_messages WHERE destination=? AND delivered=0 AND id NOT IN (SELECT message_id FROM delegated_relay_envelopes WHERE rejected=1) ORDER BY rowid")?;
         let rows = stmt.query_map([run], |r| r.get::<_, String>(0))?;
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }
-    pub fn message_delivered(&self, id: &str) -> anyhow::Result<()> {
-        self.0
-            .lock()
-            .unwrap()
-            .execute("UPDATE delegated_messages SET delivered=1 WHERE id=?", [id])?;
+    pub fn next_delivery(&self, run: &str) -> anyhow::Result<Option<relay::Delivery>> {
+        self.next_delivery_at(run, chrono::Utc::now().timestamp())
+    }
+    fn next_delivery_at(&self, run: &str, now: i64) -> anyhow::Result<Option<relay::Delivery>> {
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let delivery = relay::next(&tx, run, self.1, now)?;
+        tx.commit()?;
+        Ok(delivery)
+    }
+    pub fn message_delivered(&self, delivery: &relay::Delivery) -> anyhow::Result<()> {
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        relay::delivered(&tx, delivery, chrono::Utc::now().timestamp())?;
+        tx.commit()?;
         Ok(())
+    }
+    pub fn delivery_failed(&self, delivery: &relay::Delivery) -> anyhow::Result<()> {
+        relay::release(&self.0.lock().unwrap(), delivery)
+    }
+    /// Incremental audit: hashes only rows appended since the last verified
+    /// checkpoint and serves the cached validity otherwise.
+    pub fn audit(&self, run: &str) -> anyhow::Result<Value> {
+        self.audit_with(run, false)
+    }
+    /// Full audit from genesis; detects removed or modified old rows.
+    pub fn audit_full(&self, run: &str) -> anyhow::Result<Value> {
+        self.audit_with(run, true)
+    }
+    fn audit_with(&self, run: &str, full: bool) -> anyhow::Result<Value> {
+        self.get(run)?;
+        self.audit_report(run, full)
+    }
+    /// Re-verifies the whole chain and refreshes the checkpoint (startup).
+    pub fn verify_audit_chain(&self) -> anyhow::Result<bool> {
+        Ok(self.audit_report("", true)?["chain_valid"] == true)
+    }
+    fn audit_report(&self, run: &str, full: bool) -> anyhow::Result<Value> {
+        let mut db = self.0.lock().unwrap();
+        // Read the chain and its head from one SQLite snapshot even when a
+        // second coordinator connection is appending audit records; IMMEDIATE
+        // because the verified checkpoint is written in the same transaction.
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let report = relay::audit_report(&tx, run, full)?;
+        tx.commit()?;
+        Ok(report)
     }
 }
 
@@ -480,7 +573,8 @@ mod tests {
             )
             .is_err());
         assert!(s.message("different-id", a, b, &payload).is_err());
-        s.message_delivered("message").unwrap();
+        let delivery = s.next_delivery(b).unwrap().unwrap();
+        s.message_delivered(&delivery).unwrap();
         let reopened = RunStore::new(g.shared_conn()).unwrap();
         reopened.message("message", a, b, &payload).unwrap();
         assert!(reopened.pending_messages(b).unwrap().is_empty());
@@ -648,3 +742,7 @@ mod tests {
         assert!(s.recent_events(&run.id, 0).unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "relay_tests.rs"]
+mod relay_tests;

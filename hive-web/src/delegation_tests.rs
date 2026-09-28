@@ -60,7 +60,8 @@ fn waiting_dependency_with_a_message_to_us_releases_verifier() {
     assert_eq!(ready(&store, &runs[1]), Ok(true));
     // The scheduling exception never consumes the message; launch comes first.
     assert_eq!(store.pending_messages(&runs[1].id).unwrap().len(), 1);
-    store.message_delivered("question").unwrap();
+    let delivery = store.next_delivery(&runs[1].id).unwrap().unwrap();
+    store.message_delivered(&delivery).unwrap();
     assert_eq!(ready(&store, &runs[1]), Ok(false));
 }
 
@@ -251,7 +252,8 @@ with tempfile.TemporaryDirectory() as directory:
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    store.message_delivered("question").unwrap();
+    let delivery = store.next_delivery(&verifier.id).unwrap().unwrap();
+    store.message_delivered(&delivery).unwrap();
     assert!(store.pending_messages(&verifier.id).unwrap().is_empty());
 }
 

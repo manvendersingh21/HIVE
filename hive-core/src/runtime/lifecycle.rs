@@ -1537,8 +1537,10 @@ mod tests {
     fn empty_suite_exit_code() -> i32 {
         static CODE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
         *CODE.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("hive-empty-suite-{}", std::process::id()));
+            // A per-process name is not a unique name: parallel test binaries, and any
+            // process that reuses this pid, would share the directory and its fixture.
+            let dir = std::env::temp_dir()
+                .join(format!("hive-empty-suite-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(dir.join("tests")).unwrap();
             std::fs::write(dir.join("tests/test_api.py"), "# no test cases\n").unwrap();
             let status = std::process::Command::new("python3")
