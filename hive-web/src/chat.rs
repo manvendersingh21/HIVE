@@ -35,6 +35,7 @@ use tracing::{info, warn};
 //    a 30s margin for ancillary tasks (memory retrieval, prompt generation, complexity classification).
 // 4. Automatic retry: `plan_with_retry` grants one automatic retry of the whole plan if
 //    the deadline fires, giving up to ~300s total before a user-facing timeout message.
+//    A permit-wait timeout has already spent that budget, so it is returned without a retry.
 const PLANNING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 const CONTINUATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -54,32 +55,63 @@ pub(crate) async fn bounded_plan<T>(
     plan: impl std::future::Future<Output = anyhow::Result<T>>,
     deadline: std::time::Duration,
 ) -> Result<T, Response> {
+    try_bounded_plan(slots, plan, deadline)
+        .await
+        .map_err(PlanFailure::into_response)
+}
+
+/// Why a bounded plan produced no value. Kept distinct so only a plan that
+/// actually ran out of time is retried; a slot-wait timeout has already spent
+/// the whole-request budget.
+enum PlanFailure {
+    SlotWait,
+    Deadline,
+    Failed(anyhow::Error),
+}
+
+impl IntoResponse for PlanFailure {
+    fn into_response(self) -> Response {
+        match self {
+            PlanFailure::SlotWait => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Planning timed out waiting for an available planner slot. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
+            )
+                .into_response(),
+            PlanFailure::Deadline => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Planning timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
+            )
+                .into_response(),
+            PlanFailure::Failed(e) => {
+                (StatusCode::BAD_GATEWAY, format!("planning failed: {e}")).into_response()
+            }
+        }
+    }
+}
+
+async fn try_bounded_plan<T>(
+    slots: &tokio::sync::Semaphore,
+    plan: impl std::future::Future<Output = anyhow::Result<T>>,
+    deadline: std::time::Duration,
+) -> Result<T, PlanFailure> {
     let wait_budget = deadline * 2;
     let _permit = match tokio::time::timeout(wait_budget, slots.acquire()).await {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => panic!("planner semaphore is closed"),
         Err(_) => {
             warn!("planner semaphore permit wait timed out");
-            return Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                "Planning timed out waiting for an available planner slot. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
-            )
-                .into_response());
+            return Err(PlanFailure::SlotWait);
         }
     };
     match tokio::time::timeout(deadline, plan).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => {
             warn!(error = %e, "planning failed");
-            Err((StatusCode::BAD_GATEWAY, format!("planning failed: {e}")).into_response())
+            Err(PlanFailure::Failed(e))
         }
         Err(_) => {
             warn!("total planning deadline exceeded");
-            Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                "Planning timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
-            )
-                .into_response())
+            Err(PlanFailure::Deadline)
         }
     }
 }
@@ -108,21 +140,21 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    match bounded_plan(slots, make_plan(), deadline).await {
+    match try_bounded_plan(slots, make_plan(), deadline).await {
         Ok(plan) => Ok(plan),
-        Err(response) if response.status() != StatusCode::GATEWAY_TIMEOUT => Err(response),
-        Err(_) => {
+        Err(PlanFailure::Deadline) => {
             warn!("planning deadline exceeded; retrying the whole plan once");
-            match bounded_plan(slots, make_plan(), deadline).await {
+            match try_bounded_plan(slots, make_plan(), deadline).await {
                 Ok(plan) => Ok(plan),
-                Err(response) if response.status() == StatusCode::GATEWAY_TIMEOUT => Err((
+                Err(PlanFailure::Deadline) => Err((
                     StatusCode::GATEWAY_TIMEOUT,
                     "Planning timed out and one automatic retry also timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message in a moment, and if it keeps timing out, try a shorter or simpler request.",
                 )
                     .into_response()),
-                Err(response) => Err(response),
+                Err(failure) => Err(failure.into_response()),
             }
         }
+        Err(failure) => Err(failure.into_response()),
     }
 }
 
@@ -1438,6 +1470,34 @@ mod deadline_tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("No commands were executed"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_planner_slot_wait_timeout_is_returned_without_a_whole_plan_retry() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let _hog1 = slots.clone().acquire_owned().await.unwrap();
+        let _hog2 = slots.clone().acquire_owned().await.unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let response = plan_with_retry_slots(
+            &slots,
+            move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async { anyhow::Ok(()) }
+            },
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        // A whole-plan retry would build a second plan future.
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("available planner slot"), "{text}");
+        assert!(!text.contains("automatic retry"), "{text}");
     }
 
     #[tokio::test]
