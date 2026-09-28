@@ -347,9 +347,15 @@ pub(crate) fn delete_conversation(
         db.execute("DELETE FROM conversations WHERE id=?1", [id])?;
         Ok(Ok(()))
     })();
-    match &result {
-        Ok(Ok(())) => db.execute_batch("COMMIT")?,
-        _ => db.execute_batch("ROLLBACK")?,
+    // Never leave the shared connection inside an open transaction, and never
+    // let a failed ROLLBACK hide the error that caused it.
+    if matches!(result, Ok(Ok(()))) {
+        if let Err(commit) = db.execute_batch("COMMIT") {
+            let _ = db.execute_batch("ROLLBACK");
+            return Err(commit.into());
+        }
+    } else {
+        let _ = db.execute_batch("ROLLBACK");
     }
     result
 }
