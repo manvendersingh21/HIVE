@@ -569,6 +569,151 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
         restarted.j = self.j
         self.assertEqual(restarted.journaled(), adapter.revisions)
 
+    def opencode_session(self, adapter, history, turn, steps):
+        """Serve `history` plus `turn(message_id)` the way OpenCode 1.18 does:
+        GET ...?limit=N returns the newest N messages in chronological order.
+        Each poll reveals the next `steps` messages of the turn; the session is
+        busy until the whole turn is visible."""
+        state = dict(message_id=None, shown=0, timeline=None, pages=[])
+        async def http(method, path, body=None):
+            if path.endswith('/prompt_async'):
+                state['message_id'] = body['messageID']
+                state['timeline'] = turn(body['messageID'])
+            elif path == '/permission':
+                return []
+            elif '/message?limit=' in path:
+                state['shown'] = min(state['shown']+steps, len(state['timeline']))
+                limit = int(path.rsplit('=', 1)[1])
+                page = (history+state['timeline'][:state['shown']])[-limit:]
+                state['pages'].append(page)
+                return page
+            elif path == '/session/status':
+                done = state['shown'] == len(state['timeline'])
+                return {adapter.native: dict(type='idle' if done else 'busy')}
+            else:
+                self.fail(path)
+        adapter.http = AsyncMock(side_effect=http)
+        return state
+
+    @staticmethod
+    def opencode_id(milliseconds, counter):
+        """OpenCode's ascending id: low 48 bits of milliseconds*4096+counter."""
+        return 'msg_'+format((milliseconds*0x1000+counter) & ((1 << 48)-1), '012x')+'Zz09AbCdEfGhIj'
+
+    @staticmethod
+    def opencode_message(ident, role, created, parent=None, finish='stop', parts=(), **extra):
+        info = dict(id=ident, sessionID='ses_native', role=role, time=dict(created=created), **extra)
+        if role == 'assistant':
+            info['time']['completed'] = created+1
+            info.update(parentID=parent, finish=finish, providerID='provider', modelID='big-pickle')
+        return dict(info=info, parts=list(parts))
+
+    def compaction_turn(self, pre_steps=1, post_steps=0, replies_act=True):
+        """The BUG15 recorded shape: the runner prompt, tool rounds, an
+        auto-created compaction user message with its summary, OpenCode's own
+        continue message and the final reply parented to that message."""
+        message = self.opencode_message
+        tool = dict(type='tool', tool='bash', callID='call_pre', state=dict(status='completed', input=dict(command='ls')))
+        text = [dict(type='text', text='summary / done')] if replies_act else [dict(type='reasoning', text='thinking')]
+        def turn(prompt):
+            now = int(time.time()*1000)
+            later = lambda step: (now+step, self.opencode_id(now+step, 0))
+            timeline = [message(prompt, 'user', now, parts=[dict(type='text', text='follow-up')])]
+            timeline += [message(later(1+step)[1], 'assistant', later(1+step)[0], prompt, finish='tool-calls', parts=[tool])
+                         for step in range(pre_steps)]
+            created, compaction = later(1000)
+            timeline.append(message(compaction, 'user', created, parts=[dict(type='compaction', auto=True)]))
+            timeline.append(message(later(1001)[1], 'assistant', later(1001)[0], compaction, summary=True, parts=text))
+            created, resumed = later(1002)
+            timeline.append(message(resumed, 'user', created, parts=[dict(type='text', text='Continue if you have next steps', synthetic=True)]))
+            timeline += [message(later(1003+step)[1], 'assistant', later(1003+step)[0], resumed, finish='tool-calls', parts=[])
+                         for step in range(post_steps)]
+            timeline.append(message(later(5000)[1], 'assistant', later(5000)[0], resumed, parts=text))
+            return timeline
+        return turn
+
+    def older_history(self, count):
+        """Completed messages of earlier turns, already journaled."""
+        base = int(time.time()*1000)-600_000
+        history = []
+        for index in range(0, count, 2):
+            user = self.opencode_id(base+index, 0)
+            history.append(self.opencode_message(user, 'user', base+index, parts=[dict(type='text', text='old')]))
+            history.append(self.opencode_message(self.opencode_id(base+index+1, 0), 'assistant', base+index+1, user,
+                                                 parts=[dict(type='text', text='old reply')]))
+        for message in history:
+            self.j.emit('native', message)
+        return history
+
+    async def test_opencode_turn_ends_on_reply_parented_to_compaction_message(self):
+        adapter = self.opencode()
+        history = self.older_history(20)
+        state = self.opencode_session(adapter, history, self.compaction_turn(), steps=2)
+        with patch.object(runner.asyncio, 'sleep', new=AsyncMock()):
+            await adapter.turn('follow-up')
+        self.assertIsNone(self.j.get('opencode_pending_message'))
+        self.assertEqual(self.j.get('actual_model'), 'provider/big-pickle')
+        # Every message of the turn is journaled once; the old history never again.
+        journaled = [event['info']['id'] for event in self.native_events()]
+        self.assertEqual(journaled, [m['info']['id'] for m in history+state['timeline']])
+
+    async def test_opencode_counts_actions_made_before_compaction(self):
+        # After compaction only reasoning follows; the tool call made under the
+        # runner prompt before compaction still makes the turn verifiable.
+        adapter = self.opencode()
+        self.opencode_session(adapter, [], self.compaction_turn(replies_act=False), steps=1)
+        with patch.object(runner.asyncio, 'sleep', new=AsyncMock()):
+            await adapter.turn('follow-up')
+        self.assertIsNone(self.j.get('opencode_pending_message'))
+        adapter = self.opencode()
+        self.j.set('opencode_pending_message', None)
+        self.opencode_session(adapter, [], self.compaction_turn(pre_steps=0, replies_act=False), steps=1)
+        with patch.object(runner.asyncio, 'sleep', new=AsyncMock()):
+            with self.assertRaisesRegex(RuntimeError, 'turn produced no actions'):
+                await adapter.turn('follow-up')
+
+    async def test_opencode_session_longer_than_page_size(self):
+        # 150 old messages, 120 tool rounds before compaction and 110 after it:
+        # the prompt and the compaction messages leave the newest page long
+        # before the final reply arrives.
+        adapter = self.opencode()
+        history = self.older_history(150)
+        state = self.opencode_session(adapter, history, self.compaction_turn(pre_steps=120, post_steps=110), steps=7)
+        with patch.object(runner.asyncio, 'sleep', new=AsyncMock()):
+            await adapter.turn('follow-up')
+        self.assertIsNone(self.j.get('opencode_pending_message'))
+        final = state['timeline'][-1]['info']['id']
+        self.assertEqual(state['pages'][-1][-1]['info']['id'], final)
+        self.assertTrue(all(len(page) <= 100 for page in state['pages']))
+        self.assertNotIn(state['message_id'], [m['info']['id'] for m in state['pages'][-1]])
+        journaled = [event['info']['id'] for event in self.native_events()]
+        self.assertEqual(journaled, [m['info']['id'] for m in history+state['timeline']])
+
+    async def test_opencode_older_user_messages_never_end_a_new_turn(self):
+        # Idle session whose newest completed reply answers an earlier turn.
+        adapter = self.opencode()
+        history = self.older_history(10)
+        polls = 0
+        class StillWaiting(Exception):
+            pass
+        async def http(method, path, body=None):
+            nonlocal polls
+            if path.endswith('/prompt_async') or path == '/permission':
+                return []
+            if '/message?limit=' in path:
+                polls += 1
+                if polls == 3:
+                    raise StillWaiting
+                return history
+            if path == '/session/status':
+                return {adapter.native: dict(type='idle')}
+            self.fail(path)
+        adapter.http = AsyncMock(side_effect=http)
+        with patch.object(runner.asyncio, 'sleep', new=AsyncMock()):
+            with self.assertRaises(StillWaiting):
+                await adapter.turn('follow-up')
+        self.assertTrue(self.j.get('opencode_pending_message'))
+
     async def test_cursor_omits_model_and_resume_before_they_apply(self):
         self.cursor_script(self.cursor_stream())
         adapter = runner.Cursor()
