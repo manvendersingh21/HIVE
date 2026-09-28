@@ -40,7 +40,7 @@ may still change without a deprecation period.
 
 ### Changed
 
-- HACP is pinned to `3ed7f2b687500ca468054eebd11e8bfb3e2fa060`, with
+- HACP is pinned to `7891da077d469e6308f31cbaa93d838c39cc54e6`, with
   guardian-backed secure envelopes enabled in `hive-core`.
 - HACP is consumed as a commit-pinned Git dependency from its own repository
   rather than vendored into this tree.

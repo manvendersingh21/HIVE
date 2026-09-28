@@ -21,7 +21,7 @@ deserializing a wire object is not a substitute for validation and authorization
 ## Dependency and versions
 
 The root `Cargo.toml` declares `hacp` with an HTTPS Git URL pinned to commit
-`3ed7f2b687500ca468054eebd11e8bfb3e2fa060`. `hive-core` enables HACP's
+`7891da077d469e6308f31cbaa93d838c39cc54e6`. `hive-core` enables HACP's
 `guardian` feature; `hive-adapter` consumes the workspace dependency without
 that feature. The lockfile records the exact source. There is no HACP source
 directory or submodule in HIVE, and a contributor does not need a local protocol
