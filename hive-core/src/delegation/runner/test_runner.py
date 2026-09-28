@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import json
+import sys
 from pathlib import Path
 import tempfile
 import time
@@ -38,6 +39,88 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(observed), 1)
         team = observed[0].split('Team (peer roles, owned paths, status and dependencies): ')[1]
         self.assertEqual(json.loads(team), [peer])
+
+    def acceptance_request(self, checks):
+        self.j.set('assignment', dict(autonomy='yolo'))
+        self.j.emit('acknowledgment', dict(message_id='initial'))
+        self.j.state('completed')
+        return dict(workspace=str(self.workspace), turn_seq=self.j.completed_turn(), checks=checks)
+
+    def test_acceptance_measures_files_and_commands_and_caches_the_receipt(self):
+        (self.workspace/'result.txt').write_text('ready')
+        checks = [dict(kind='file_exists', path='result.txt'),
+                  dict(kind='command', argv=[sys.executable, '-c', "from pathlib import Path; p=Path('count'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); print('verified')"], cwd='.', timeout_seconds=2)]
+        request = self.acceptance_request(checks)
+        result = runner.acceptance(self.j, request)
+        self.assertTrue(all(m['passed'] for m in result['measurements']))
+        self.assertIn('exit=0\nverified', result['measurements'][1]['detail'])
+        self.assertEqual(runner.acceptance(self.j, request), result)
+        self.assertEqual((self.workspace/'count').read_text(), 'x')
+        # Worker-authored metadata cannot substitute a turn identity.
+        self.j.set('acceptance_turn', -123)
+        self.assertEqual(self.j.snapshot()['metadata']['acceptance_turn'], request['turn_seq'])
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            runner.acceptance(self.j, {**request, 'checks': []})
+
+    def test_acceptance_rejects_missing_files_failures_timeout_and_symlink_escape(self):
+        (self.root/'outside').write_text('secret')
+        (self.workspace/'link').symlink_to(self.root/'outside')
+        checks = [dict(kind='file_exists', path=path) for path in ('missing', '../outside', 'link')]
+        checks += [dict(kind='command', argv=[sys.executable, '-c', code], cwd='.', timeout_seconds=1)
+                   for code in ("raise SystemExit(7)", "import time; time.sleep(10)")]
+        measured = runner.acceptance(self.j, self.acceptance_request(checks))['measurements']
+        self.assertTrue(all(not m['passed'] for m in measured))
+        self.assertIn('exit=7', measured[-2]['detail'])
+        self.assertIn('timeout', measured[-1]['detail'])
+
+    def test_acceptance_stale_turns_and_quota_pauses_do_not_run_commands(self):
+        check = dict(kind='command', argv=['should-never-run'], cwd='.', timeout_seconds=1)
+        request = self.acceptance_request([check])
+        for state in ('working', 'paused-quota', 'waiting-for-peer', 'awaiting-approval'):
+            self.j.state(state)
+            with patch.object(runner, 'acceptance_command') as command:
+                self.assertEqual(runner.acceptance(self.j, request), dict(stale=True))
+                command.assert_not_called()
+        self.j.state('completed')
+        with patch.object(runner, 'acceptance_command') as command:
+            self.assertEqual(runner.acceptance(self.j, {**request, 'turn_seq': -1}), dict(stale=True))
+            command.assert_not_called()
+
+    def test_acceptance_discards_measurements_when_a_new_turn_starts(self):
+        check = dict(kind='command', argv=['true'], cwd='.', timeout_seconds=1)
+        request = self.acceptance_request([check])
+        def race(*args):
+            self.j.state('working')
+            return True, 'exit=0'
+        with patch.object(runner, 'acceptance_command', side_effect=race):
+            self.assertEqual(runner.acceptance(self.j, request), dict(stale=True))
+
+    def test_acceptance_waits_for_queued_native_messages(self):
+        request = self.acceptance_request([dict(kind='file_exists', path='result.txt')])
+        self.j.enqueue(dict(id='new-request', text='more work'))
+        self.assertEqual(runner.acceptance(self.j, request), dict(stale=True))
+
+    def test_acceptance_keeps_output_bounded_and_respects_reviewed_policy(self):
+        check = dict(kind='command', argv=[sys.executable, '-c', "print('x'*20000)"], cwd='.', timeout_seconds=2)
+        result = runner.acceptance(self.j, self.acceptance_request([check]))
+        self.assertTrue(result['measurements'][0]['passed'])
+        self.assertLess(len(result['measurements'][0]['detail']), 8300)
+        request = self.acceptance_request([check])
+        self.j.set('assignment', dict(autonomy='reviewed'))
+        with patch.object(runner, 'acceptance_command') as command:
+            result = runner.acceptance(self.j, request)
+            command.assert_not_called()
+        self.assertFalse(result['measurements'][0]['passed'])
+        self.assertIn('authorization', result['measurements'][0]['detail'])
+
+    def test_interrupted_acceptance_fails_closed_without_replaying(self):
+        request = self.acceptance_request([dict(kind='file_exists', path='missing')])
+        runner.acceptance(self.j, request)
+        with self.j.db:
+            self.j.db.execute('UPDATE acceptance SET result=NULL')
+        result = runner.acceptance(self.j, request)
+        self.assertFalse(result['measurements'][0]['passed'])
+        self.assertIn('not replayed', result['measurements'][0]['detail'])
 
     def test_service_panes_drop_hive_variables_from_the_tmux_environment(self):
         tmux_env = 'HIVE_WEB_PASSWORD=secret\nPATH=/bin\nHIVE_WORKER_TOKEN=t\n-HIVE_REMOVED'

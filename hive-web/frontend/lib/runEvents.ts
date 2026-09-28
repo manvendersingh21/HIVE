@@ -451,16 +451,16 @@ export function lastError(events: RunEvent[]): string | undefined {
   return undefined;
 }
 
-export const TERMINAL_STATES = ["completed", "failed", "superseded", "disconnected"];
+export const TERMINAL_STATES = ["completed", "failed", "no_agreement", "superseded", "disconnected"];
 
 export function stateTone(
   state: string,
 ): "attention" | "running" | "queued" | "done" | "bad" | "stale" {
   if (["awaiting-approval", "needs-setup"].includes(state)) return "attention";
-  if (state === "failed") return "bad";
+  if (["failed", "no_agreement"].includes(state)) return "bad";
   // The runner lost contact; nothing it was doing will finish on its own.
   if (state === "disconnected") return "stale";
-  if (["launching", "working", "reviewing", "waiting-for-peer"].includes(state)) return "running";
+  if (["launching", "working", "reviewing", "verifying", "waiting-for-peer"].includes(state)) return "running";
   // A quota pause resumes by itself after the reset, like a queued run starts.
   if (["queued", "paused-quota"].includes(state)) return "queued";
   return "done";

@@ -158,6 +158,7 @@ pub async fn control(
         [
             "launch",
             "snapshot",
+            "acceptance",
             "enqueue",
             "decide",
             "reconcile-inspect",
@@ -167,14 +168,22 @@ pub async fn control(
         "Invalid runner operation"
     );
     uuid::Uuid::parse_str(id)?;
-    ssh(
+    // Current read/check code also understands legacy journals. Keep their
+    // persistent native runner and conversation intact during upgrades.
+    let executable = if matches!(operation, "snapshot" | "acceptance") {
+        let source = format!("__file__ = {}\n{}", serde_json::to_string(runner)?, RUNNER);
+        format!("python3 -c {}", quote(&source))
+    } else {
+        format!("python3 {}", quote(runner))
+    };
+    ssh_timeout(
         worker,
         &format!(
-            "python3 {} {operation} --run-id {} --after {after}",
-            quote(runner),
+            "{executable} {operation} --run-id {} --after {after}",
             quote(id)
         ),
         input,
+        if operation == "acceptance" { 660 } else { 45 },
     )
     .await
 }

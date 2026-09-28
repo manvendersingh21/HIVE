@@ -8,6 +8,96 @@ use hacp::v2::{canon, Contract, ContractLimits, Relationship, Session, Task, Ver
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub fn default_max_rework() -> u8 {
+    2
+}
+
+fn excerpt(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+pub fn limits(max_rework: u8) -> ContractLimits {
+    ContractLimits {
+        max_rounds: 3,
+        max_amendments: 16,
+        max_rework: u64::from(max_rework),
+    }
+}
+
+/// Explicit checks fixed by the coordinator's assignment. Commands use argv,
+/// with a workspace-relative working directory and a bounded runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AcceptanceCheck {
+    FileExists { path: String },
+    Command { argv: Vec<String>, cwd: String, timeout_seconds: u64 },
+}
+
+fn relative_path(path: &str, allow_root: bool) -> bool {
+    (allow_root && path == ".") || (!path.is_empty()
+        && !path.starts_with(['/', '~'])
+        && !path.contains(['\n', '\r', '\0', '\\'])
+        && path.split('/').all(|part| !part.is_empty() && part != "." && part != ".."))
+}
+
+pub fn validate_checks(checks: &[AcceptanceCheck]) -> anyhow::Result<()> {
+    anyhow::ensure!(checks.len() <= 32, "At most 32 acceptance checks");
+    let mut seconds = 0;
+    for check in checks {
+        match check {
+            AcceptanceCheck::FileExists { path } => {
+                anyhow::ensure!(relative_path(path, false), "Acceptance file must be workspace-relative");
+            }
+            AcceptanceCheck::Command { argv, cwd, timeout_seconds } => {
+                anyhow::ensure!(!argv.is_empty() && !argv[0].trim().is_empty()
+                    && argv.len() <= 128 && argv.iter().all(|a| !a.contains('\0')),
+                    "Acceptance command requires a valid argv");
+                anyhow::ensure!(relative_path(cwd, true), "Acceptance cwd must be workspace-relative");
+                anyhow::ensure!((1..=120).contains(timeout_seconds), "Acceptance timeout must be 1–120 seconds");
+                seconds += timeout_seconds;
+            }
+        }
+    }
+    anyhow::ensure!(seconds <= 600, "Acceptance checks may take at most 600 seconds in total");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckMeasurement {
+    pub check: AcceptanceCheck,
+    pub passed: bool,
+    pub detail: String,
+}
+
+/// A runner response is support only when it covers the exact frozen check
+/// list. Missing, substituted or failed checks all fail the attestation gate.
+pub fn corroborate_checks(checks: &[AcceptanceCheck], measured: &[CheckMeasurement]) -> Corroboration {
+    let mut c = Corroboration::default();
+    if checks.is_empty() {
+        c.contradicted.push("No mechanical acceptance checks were specified; worker claims cannot establish completion".into());
+    }
+    if checks.len() != measured.len() {
+        c.contradicted.push("Runner returned an incomplete acceptance check list".into());
+    }
+    for (index, check) in checks.iter().enumerate() {
+        match measured.get(index) {
+            Some(result) if &result.check == check && result.passed => {
+                let name = format!("check {} passed", index + 1);
+                c.backed.push(name.clone());
+                c.requirements_backed.push(name);
+            }
+            result => c.contradicted.push(format!("check {}: {}", index + 1,
+                result.map(|r| excerpt(&r.detail, 512)).unwrap_or("missing measurement"))),
+        }
+    }
+    c
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgreementRecord {
     pub contract: Contract,
@@ -43,11 +133,7 @@ impl AgreementRecord {
             None,
             None,
             vec![],
-            ContractLimits {
-                max_rounds: 3,
-                max_amendments: 16,
-                max_rework: 2,
-            },
+            limits(default_max_rework()),
         )?;
         contract.agree(&proposer, &terms)?;
         Ok(Self {
@@ -121,6 +207,13 @@ pub struct CompletionRecord {
     pub followup: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionAssessment {
+    pub turn_seq: i64,
+    pub record: CompletionRecord,
+    pub measurements: Vec<CheckMeasurement>,
+}
+
 impl Default for CompletionRecord {
     fn default() -> Self {
         Self {
@@ -135,6 +228,13 @@ impl Default for CompletionRecord {
 impl CompletionRecord {
     /// Apply independently measured evidence through the existing attestation gate.
     pub fn assess(&mut self, evidence: impl Into<String>, corroboration: &Corroboration) {
+        self.assess_with_limits(evidence, corroboration, &limits(default_max_rework()));
+    }
+
+    pub fn assess_with_limits(&mut self, evidence: impl Into<String>, corroboration: &Corroboration, limits: &ContractLimits) {
+        if self.verdict == CompletionVerdict::NoAgreement {
+            return;
+        }
         let evidence = evidence.into();
         self.evidence.push(evidence.clone());
         match attest::gate(&Verdict::Accept, corroboration) {
@@ -142,11 +242,12 @@ impl CompletionRecord {
                 self.verdict = CompletionVerdict::Accept;
                 self.followup = None;
             }
-            Err(error) if self.rework_rounds < 2 => {
+            Err(error) if u64::from(self.rework_rounds) < limits.max_rework => {
                 self.rework_rounds += 1;
                 self.verdict = CompletionVerdict::Rework;
                 self.followup = Some(format!(
-                    "Acceptance checks failed: {error}. Evidence: {evidence}"
+                    "Acceptance checks failed: {}. Evidence (excerpt): {}",
+                    excerpt(&error.to_string(), 4000), excerpt(&evidence, 8000)
                 ));
             }
             Err(_) => {
@@ -160,6 +261,101 @@ impl CompletionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_exact_complete_measurement_list_can_pass() {
+        let required = AcceptanceCheck::FileExists { path: "result.txt".into() };
+        let measured = CheckMeasurement { check: required.clone(), passed: true, detail: "file exists".into() };
+        let check = |checks: &[AcceptanceCheck], measured: &[CheckMeasurement]| attest::gate(&Verdict::Accept, &corroborate_checks(checks, measured)).is_ok();
+        assert!(check(&[required.clone()], &[measured.clone()]));
+        assert!(!check(&[], &[]));
+        assert!(!check(&[required.clone()], &[]));
+        assert!(!check(&[required.clone()], &[measured.clone(), measured.clone()]));
+        assert!(!check(&[AcceptanceCheck::FileExists { path: "other.txt".into() }], &[measured.clone()]));
+        assert!(!check(&[required], &[CheckMeasurement { passed: false, ..measured }]));
+    }
+
+    #[test]
+    fn checks_reject_traversal_empty_commands_and_unbounded_time() {
+        for path in ["../file", "/file", "link/../file", "~/file", "a\\b", ""] {
+            assert!(validate_checks(&[AcceptanceCheck::FileExists { path: path.into() }]).is_err());
+        }
+        let command = |argv: Vec<String>, cwd: &str, timeout_seconds| AcceptanceCheck::Command { argv, cwd: cwd.into(), timeout_seconds };
+        assert!(validate_checks(&[command(vec!["cargo".into(), "test".into()], ".", 120)]).is_ok());
+        assert!(validate_checks(&[command(vec![], ".", 1)]).is_err());
+        assert!(validate_checks(&[command(vec!["true".into()], "../outside", 1)]).is_err());
+        assert!(validate_checks(&[command(vec!["true".into()], ".", 121)]).is_err());
+        assert!(validate_checks(&vec![command(vec!["true".into()], ".", 120); 6]).is_err());
+    }
+
+    #[test]
+    fn rework_uses_the_hacp_limit_and_no_agreement_is_terminal() {
+        let failed = Corroboration { contradicted: vec!["missing".into()], ..Default::default() };
+        for bound in [0, 1, 2] {
+            let mut record = CompletionRecord::default();
+            for _ in 0..=bound {
+                record.assess_with_limits("measured", &failed, &limits(bound));
+            }
+            assert_eq!(record.verdict, CompletionVerdict::NoAgreement);
+            assert_eq!(record.rework_rounds, bound);
+            let terminal = record.clone();
+            record.assess("claim repaired", &Corroboration { backed: vec!["file".into()], ..Default::default() });
+            assert_eq!(record, terminal);
+        }
+    }
+
+    #[test]
+    fn feedback_is_bounded_but_full_unicode_evidence_is_retained() {
+        let evidence = "évidence ".repeat(4000);
+        let failed = Corroboration { contradicted: vec!["échec ".repeat(4000)], ..Default::default() };
+        let mut record = CompletionRecord::default();
+        record.assess(&evidence, &failed);
+        assert_eq!(record.evidence, vec![evidence]);
+        assert!(record.followup.unwrap().len() < 13000);
+    }
+
+    #[test]
+    fn runner_control_measures_real_artifacts_before_attestation_accepts() {
+        // Exercise the actual CLI in a throwaway journal. No native agent,
+        // service, HOME override, SSH or live Hive state is involved.
+        let script = r#"
+import contextlib, importlib.util, io, json, pathlib, sys, tempfile, uuid
+spec = importlib.util.spec_from_file_location('runner', sys.argv[1])
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+with tempfile.TemporaryDirectory(prefix='hive-acceptance-') as tmp:
+    root = pathlib.Path(tmp)
+    runner.BASE = root/'runs'
+    ident = str(uuid.uuid4())
+    journal = runner.Journal(runner.BASE/ident)
+    journal.quiet = True
+    journal.set('assignment', {'autonomy':'yolo'})
+    journal.emit('acknowledgment', {'message_id':'initial'})
+    journal.state('completed')
+    request = {'turn_seq':journal.completed_turn(), 'workspace':str(root), 'checks':[
+        {'kind':'command', 'argv':[sys.executable,'-c',"from pathlib import Path; Path('result.txt').write_text('ready'); print('checked')"], 'cwd':'.', 'timeout_seconds':2},
+        {'kind':'file_exists','path':'result.txt'}]}
+    journal.db.close()
+    sys.argv = ['runner.py','acceptance','--run-id',ident]
+    sys.stdin = io.StringIO(json.dumps(request))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        runner.main()
+    response = json.loads(out.getvalue())
+    print(json.dumps({'checks':request['checks'], 'response':response}))
+"#;
+        let result = std::process::Command::new("python3")
+            .args(["-c", script, concat!(env!("CARGO_MANIFEST_DIR"), "/src/delegation/runner/runner.py")])
+            .output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        let result: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let checks: Vec<AcceptanceCheck> = serde_json::from_value(result["checks"].clone()).unwrap();
+        let measured: Vec<CheckMeasurement> = serde_json::from_value(result["response"]["measurements"].clone()).unwrap();
+        assert!(measured[0].detail.contains("exit=0\nchecked"));
+        let mut record = CompletionRecord::default();
+        record.assess(result.to_string(), &corroborate_checks(&checks, &measured));
+        assert_eq!(record.verdict, CompletionVerdict::Accept);
+    }
 
     #[test]
     fn agreement_freezes_and_amendment_needs_both_sides() {

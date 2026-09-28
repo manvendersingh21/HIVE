@@ -15,6 +15,7 @@ import {
 } from "../lib/runEvents";
 import { Markdown } from "../lib/markdown";
 import { visible } from "../lib/poll";
+import type { Agreement } from "./Coordination";
 
 export type Approval = {
   id: string;
@@ -41,6 +42,7 @@ export type Run = {
     workspace: string;
     dependencies?: string[];
     acceptance_criteria?: string[];
+    max_rework?: number;
   };
   metadata?: {
     error?: string;
@@ -49,6 +51,11 @@ export type Run = {
     quota?: Quota | null;
   };
   review?: { status?: string; summary?: string } | null;
+  contracts?: Agreement[];
+  completion?: {
+    record: { verdict: "accept" | "rework" | "no_agreement"; rework_rounds: number; evidence: string[] };
+    measurements: { passed: boolean; detail: string }[];
+  } | null;
   identity?: { public_key: string; fingerprint: string };
   relay?: {
     mode: string;
@@ -64,6 +71,8 @@ const STATE_LABELS: Record<string, string> = {
   "needs-setup": "Needs setup",
   "waiting-for-peer": "Waiting for peer",
   "paused-quota": "Paused: quota",
+  "verifying": "Checking acceptance",
+  "no_agreement": "No agreement",
 };
 // With its run, a quota pause names the agent and when its quota resets.
 export function StateChip({ state, run }: { state: string; run?: Run }) {
@@ -544,7 +553,7 @@ export function RunComposer({ run, refresh }: { run: Run; refresh: () => Promise
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const closed = run.state === "superseded";
+  const closed = run.state === "superseded" || run.state === "no_agreement";
   async function submit(e: FormEvent) {
     e.preventDefault();
     const draft = text;

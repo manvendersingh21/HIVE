@@ -565,11 +565,15 @@ fn idle(
     run: &Run,
     unacknowledged: &Unacknowledged,
 ) -> anyhow::Result<bool> {
+    if run.state == "no_agreement" {
+        return Ok(true);
+    }
     if run.state == "disconnected" && run.metadata["reason"] == SESSION_ENDED {
         return Ok(true);
     }
     let delivered = unacknowledged.lock().unwrap();
     Ok(run.state == "completed"
+        && run.completion.as_ref().is_some_and(|c| c.record.verdict == delegation::coordination::CompletionVerdict::Accept)
         && store.pending_decisions(&run.id)?.is_empty()
         && !store.has_pending_messages(&run.id)?
         && delivered.get(&run.id).is_none_or(|ids| ids.is_empty()))
@@ -639,7 +643,7 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
         }) {
             let from_dependency = |message: &&Value| message["source"] == dependency.id;
             completed |= dependency.state == "completed";
-            failed |= dependency.state == "failed";
+            failed |= dependency.state == "failed" || dependency.state == "no_agreement";
             waiting_for_us |= dependency.state == "waiting-for-peer"
                 && messages.iter().any(|message| from_dependency(&message));
             waiting_for_us |= dependency.state == "paused-quota"
@@ -662,8 +666,8 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
 }
 
 /// States in which a launched run's tmux session must still exist.
-const LIVE_STATES: [&str; 5] =
-    ["working", "awaiting-approval", "waiting-for-peer", "reviewing", "paused-quota"];
+const LIVE_STATES: [&str; 6] =
+    ["working", "awaiting-approval", "waiting-for-peer", "reviewing", "verifying", "paused-quota"];
 
 /// Whether the run's tmux session exists. `None` when the device couldn't be
 /// asked: an unreachable machine says nothing about the session.
@@ -839,6 +843,7 @@ async fn sync_run(
     }
 
     sync_peer_snapshot(store, run, runs, &mut snapshot)?;
+    verify_completion(store, &worker, runner, &run.id).await?;
     // The journal's report is authoritative, so a message it acknowledged in
     // this snapshot no longer needs a run that keeps syncing for it.
     acknowledge(unacknowledged, &run.id, &snapshot);
@@ -917,6 +922,34 @@ async fn sync_run(
             }
         }
     }
+    Ok(())
+}
+
+/// Only the coordinator invokes these checks, using the assignment saved at
+/// planning time. A paused or peer-waiting run has no final result to assess.
+async fn verify_completion(
+    store: &RunStore,
+    worker: &hive_common::protocol::WorkerInfo,
+    runner: &str,
+    id: &str,
+) -> anyhow::Result<()> {
+    let run = store.get(id)?;
+    if run.state != "verifying" || store.has_pending_messages(id)? {
+        return Ok(());
+    }
+    let turn_seq = run.metadata["acceptance_turn"].as_i64()
+        .ok_or_else(|| anyhow::anyhow!("Completed snapshot lacks acceptance turn identity"))?;
+    let input = json!({"turn_seq":turn_seq,"workspace":run.assignment.workspace,"checks":run.assignment.acceptance_checks});
+    let raw = transport::control(worker, runner, "acceptance", id, 0, Some(&input)).await?;
+    let response: Value = serde_json::from_str(&raw)?;
+    // A new native turn or quota pause raced measurement. Its next settled
+    // snapshot will be checked; stale evidence cannot consume a rework round.
+    if response["stale"] == true {
+        return Ok(());
+    }
+    anyhow::ensure!(response["turn_seq"].as_i64() == Some(turn_seq), "Acceptance response refers to another turn");
+    let measurements: Vec<delegation::coordination::CheckMeasurement> = serde_json::from_value(response["measurements"].clone())?;
+    store.assess_completion(id, turn_seq, &measurements)?;
     Ok(())
 }
 
@@ -1238,7 +1271,7 @@ mod tests {
     }
     fn run_with_events(h: &AgentHandle, count: i64) -> String {
         let store = store(h).unwrap();
-        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"codex","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"codex","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"],"acceptance_checks":[{"kind":"file_exists","path":"result.txt"}]}]})).unwrap();
         let id = store.create("task", "chat", &plan).unwrap().remove(0).id;
         let events: Vec<Value> = (1..=count)
             .map(|seq| json!({"id":format!("e{seq}"),"seq":seq,"kind":"native","payload":{"seq":seq}}))
@@ -1322,10 +1355,12 @@ mod tests {
         let graph = hive_core::memory::graph::KnowledgeGraph::open(&path).unwrap();
         let store = RunStore::new(graph.shared_conn()).unwrap();
         let unacknowledged = Unacknowledged::default();
-        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"claude","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"claude","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"],"acceptance_checks":[{"kind":"file_exists","path":"result.txt"}]}]})).unwrap();
         let id = store.create("task", "chat", &plan).unwrap().remove(0).id;
         assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
         store.state(&id, "completed", "").unwrap();
+        assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
+        accept_test_turn(&store, &id, 0);
         // Nothing queued and nothing delivered: the journal cannot change, so
         // the SSH round trip and remote runner process are skipped.
         assert!(idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
@@ -1346,7 +1381,7 @@ mod tests {
         let store = store(&h).unwrap();
         let unacknowledged = Unacknowledged::default();
         let id = run_with_events(&h, 0);
-        store.state(&id, "completed", "").unwrap();
+        accept_test_turn(&store, &id, 0);
         let wake = |message: &str| {
             store
                 .message(message, "user", &id, &json!({"id":message,"text":"verify"}))
@@ -1382,7 +1417,7 @@ mod tests {
         assert!(!idle_now());
         // Syncing the acknowledgment and the later state retires it, and the
         // optimization for truly idle completed runs applies again.
-        let snapshot = json!({"metadata":{"state":"completed"},"approvals":[],"events":[
+        let snapshot = json!({"metadata":{"state":"completed","acceptance_turn":3},"approvals":[],"events":[
             {"id":"ack-1","seq":1,"kind":"acknowledgment","payload":{"message_id":"first"}},
             {"id":"state-1","seq":2,"kind":"state","payload":{"state":"working"}},
             {"id":"ack-2","seq":3,"kind":"acknowledgment","payload":{"message_id":"second"}},
@@ -1390,7 +1425,17 @@ mod tests {
         store.sync(&id, &snapshot).unwrap();
         acknowledge(&unacknowledged, &id, &snapshot);
         assert_eq!(store.events(&id, 0).unwrap().len(), 4);
+        assert!(!idle_now(), "the new turn still needs independent acceptance");
+        accept_test_turn(&store, &id, 3);
         assert!(idle_now());
+    }
+
+    fn accept_test_turn(store: &RunStore, id: &str, turn_seq: i64) {
+        store.sync(id, &json!({"metadata":{"state":"completed","acceptance_turn":turn_seq},"events":[],"approvals":[]})).unwrap();
+        let checks = store.get(id).unwrap().assignment.acceptance_checks.into_iter().map(|check|
+            delegation::coordination::CheckMeasurement { check, passed: true, detail: "fixture measurement: file exists".into() }
+        ).collect::<Vec<_>>();
+        store.assess_completion(id, turn_seq, &checks).unwrap();
     }
 
     #[test]

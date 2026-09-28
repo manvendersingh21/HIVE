@@ -5,6 +5,7 @@ import { api } from "../../lib/api";
 import { TERMINAL_STATES } from "../../lib/runEvents";
 import { TeamPanel } from "../../components/TeamPanel";
 import { RelayAudit } from "../../components/RelayAudit";
+import { Coordination } from "../../components/Coordination";
 import { Shell } from "../../components/Nav";
 import { usePoll } from "../../lib/poll";
 import {
@@ -103,6 +104,7 @@ export default function SessionPage() {
                 select={setId}
                 live={live}
               />
+              <Coordination run={run} siblings={siblings} onSelect={setId} />
               <RelayAudit key={run.id} run={run} live={live} />
               <div className="card">
                 <h3>Details</h3>
