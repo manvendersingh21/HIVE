@@ -187,7 +187,7 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             anyhow::bail!("Unknown device: {}", a.device);
         }
         anyhow::ensure!(
-            ["claude", "codex", "agy", "opencode"].contains(&a.agent.as_str()),
+            ["claude", "codex", "agy", "opencode", "grok"].contains(&a.agent.as_str()),
             "Unknown agent: {}",
             a.agent
         );
@@ -328,7 +328,7 @@ pub fn validate_explicit(
     let mut placements = Vec::new();
     for worker in &targets(agent) {
         let pattern = format!(
-            r"(?i)\b(claude|codex|agy|opencode)(?:\s+agent)?\s+on\s+{}(?:\s+(?:using|with)\s+(?:the\s+)?model\s+([[:alnum:]][[:alnum:]_.:/@\[\]-]*[[:alnum:]_\]])|(?:$|\.(?:\s|$)|[^[:alnum:]_.-]))",
+            r"(?i)\b(claude|codex|agy|opencode|grok)(?:\s+agent)?\s+on\s+{}(?:\s+(?:using|with)\s+(?:the\s+)?model\s+([[:alnum:]][[:alnum:]_.:/@\[\]-]*[[:alnum:]_\]])|(?:$|\.(?:\s|$)|[^[:alnum:]_.-]))",
             regex::escape(&worker.name)
         );
         for captures in regex::Regex::new(&pattern)?.captures_iter(request) {
@@ -433,7 +433,7 @@ pub async fn plan(
         "required":["name","host"],"properties":{"name":{"type":"string"},"host":{"type":"string"}}}},
     "assignments":{"type":"array","items":{"type":"object","additionalProperties":false,
     "required":["key","device","agent","model","workspace","objective","dependencies","acceptance_criteria","required_capabilities"],"properties":{
-        "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode"]},
+        "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode","grok"]},
         "model":{"type":["string","null"]},"workspace":{"type":"string"},"objective":{"type":"string"},
         "dependencies":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},
         "required_capabilities":{"type":"array","items":{"type":"string"}}
@@ -873,6 +873,31 @@ mod tests {
         assert!(validate_explicit(slash, &oc, &agent).is_ok());
         oc.assignments[0].model = Some("zai-coding-plan/glm-5.2".into());
         assert!(validate_explicit(slash, &oc, &agent).is_err());
+    }
+    #[test]
+    fn grok_assignments_validate_and_honour_explicit_placements() {
+        let agent = agent();
+        let mut p = plan();
+        p.assignments[0].agent = "grok".into();
+        assert!(validate(&p, &agent).is_ok());
+        assert!(validate_explicit("Use grok on air", &p, &agent).is_ok());
+        assert!(validate_explicit("Use grok on air", &plan(), &agent).is_err());
+        let mut named = p.clone();
+        named.assignments[0].model = Some("grok-4.7".into());
+        assert!(validate_explicit(
+            "Delegate exactly one assignment to the grok agent on air using model grok-4.7",
+            &named,
+            &agent
+        )
+        .is_ok());
+        assert!(validate_explicit(
+            "Delegate exactly one assignment to the grok agent on air using model grok-4.7",
+            &p,
+            &agent
+        )
+        .is_err());
+        p.assignments[0].device = "nowhere".into();
+        assert_eq!(validate(&p, &agent).unwrap_err().to_string(), "Unknown device: nowhere");
     }
     #[test]
     fn missing_agent_and_unverified_model_report_exact_device() {

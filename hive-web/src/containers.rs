@@ -18,7 +18,7 @@ fn bad(message: impl ToString) -> Response {
 }
 
 /// What an agent in a container needs, and which of it is there.
-const CHECK: &str = r#"for t in python3 tmux node claude codex opencode; do command -v "$t" >/dev/null 2>&1 && echo "have=$t"; done
+const CHECK: &str = r#"for t in python3 tmux node claude codex opencode grok; do command -v "$t" >/dev/null 2>&1 && echo "have=$t"; done
 python3 -c 'import sys; print("python_ok=%d" % (sys.version_info >= (3, 10)))' 2>/dev/null
 exit 0"#;
 
@@ -34,7 +34,7 @@ async fn check(worker: &hive_common::protocol::WorkerInfo) -> Value {
             if have.contains(&"python3") && !out.contains("python_ok=1") {
                 missing.push("python3 ≥ 3.10");
             }
-            let agents: Vec<&str> = ["claude", "codex", "opencode"]
+            let agents: Vec<&str> = ["claude", "codex", "opencode", "grok"]
                 .into_iter()
                 .filter(|a| have.contains(a))
                 .collect();

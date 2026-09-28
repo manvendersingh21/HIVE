@@ -1,11 +1,13 @@
 """Native interface contracts; no providers or model processes are started.
 
-Fixtures follow AGY headless/hooks documentation and OpenCode 1.18.29 /doc.
+Fixtures follow AGY headless/hooks documentation, OpenCode 1.18.29 /doc and
+Grok 1.0.41 streaming-json session updates.
 """
 import asyncio
 import contextlib
 import io
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -257,6 +259,64 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
                 await adapter.turn('implement')
         permission.assert_not_called()
         self.assertEqual(adapter.http.call_args.args, ('POST', '/permission/per_opaque/reply', {'reply': 'reject'}))
+
+    def grok_script(self, events, exit_code=0, stderr=''):
+        """A fake `grok` CLI: logs argv, prints canned NDJSON session updates."""
+        script = self.root/'grok'
+        log = shlex.quote(str(self.root/'grok-args.log'))
+        parts = ['#!/bin/sh', '{ IFS=$(printf \'\\037\'); printf \'%s\\n\' "$*"; } >> '+log]
+        for event in events:
+            parts.append('printf \'%s\\n\' '+shlex.quote(runner.encode(event)))
+        if stderr:
+            parts.append('printf \'%s\\n\' '+shlex.quote(stderr)+' >&2')
+        parts.append('exit '+str(exit_code))
+        script.write_text('\n'.join(parts)+'\n')
+        script.chmod(0o755)
+
+    def grok_args(self):
+        return [line.split('\x1f') for line in (self.root/'grok-args.log').read_text().splitlines()]
+
+    async def test_grok_per_turn_arguments_resume_and_native_events(self):
+        end = dict(type='end', stopReason='end_turn', sessionId='ses-native', modelUsage={'grok-4.7': {}})
+        self.grok_script([dict(type='available_commands', tools=[]), dict(type='text', data='ok'), end])
+        adapter = runner.Grok()
+        assignment = dict(self.assignment, agent='grok', autonomy='yolo', model='grok-4.7')
+        with patch.object(runner, 'executable', return_value=str(self.root/'grok')):
+            await adapter.connect(assignment, self.j)
+            await adapter.turn('first prompt')
+            await adapter.turn('follow-up')
+        turns = self.grok_args()
+        self.assertEqual(turns[0], ['-p', 'first prompt', '--output-format', 'streaming-json',
+                                    '--cwd', str(self.workspace), '--always-approve', '-m', 'grok-4.7'])
+        self.assertNotIn('-r', turns[0])
+        self.assertEqual(turns[1][:2], ['-p', 'follow-up'])
+        self.assertEqual(turns[1][-2:], ['-r', 'ses-native'])
+        self.assertEqual(self.j.get('native_conversation_id'), 'ses-native')
+        self.assertEqual(self.j.get('actual_model'), 'grok-4.7')
+        emitted = [json.loads(row['payload']) for row in self.j.db.execute("SELECT payload FROM events WHERE kind='native'")]
+        self.assertEqual(emitted, [dict(type='available_commands', tools=[]), dict(type='text', data='ok'), end]*2)
+
+    async def test_grok_failures_raise_with_error_text(self):
+        adapter = runner.Grok()
+        assignment = dict(self.assignment, agent='grok', autonomy='yolo')
+        with patch.object(runner, 'executable', return_value=str(self.root/'grok')):
+            await adapter.connect(assignment, self.j)
+            self.grok_script([dict(type='error', message='unknown model id')], exit_code=1, stderr='Error: unknown model id')
+            with self.assertRaisesRegex(RuntimeError, 'unknown model id'):
+                await adapter.turn('work')
+            self.grok_script([dict(type='end', stopReason='max_tokens', sessionId='ses-native')])
+            with self.assertRaisesRegex(RuntimeError, 'max_tokens'):
+                await adapter.turn('work')
+            self.grok_script([dict(type='text', data='partial')])
+            with self.assertRaisesRegex(RuntimeError, 'without a terminal event'):
+                await adapter.turn('work')
+
+    async def test_grok_requires_yolo_autonomy_for_setup(self):
+        adapter = runner.Grok()
+        for autonomy in ('ask', None):
+            with self.subTest(autonomy=autonomy):
+                with self.assertRaisesRegex(RuntimeError, 'no approval bridge'):
+                    await adapter.connect(dict(self.assignment, agent='grok', autonomy=autonomy), self.j)
 
     def elicitation(self, tool, args):
         return dict(serverName='hive', threadId='native-thread', mode='form',

@@ -350,6 +350,104 @@ test.describe("opencode events", () => {
   });
 });
 
+test.describe("grok streaming events", () => {
+  const grok = (value: Record<string, unknown>) => ev("native", value);
+  const toolCall = (extra: Record<string, unknown> = {}) =>
+    grok({ type: "tool_call", toolCallId: "call-1", title: "run_terminal_command", kind: "execute", toolName: "run_terminal_command", rawInput: { command: "printf OK" }, content: [], locations: [], ...extra });
+  const toolUpdate = (extra: Record<string, unknown> = {}) =>
+    grok({ type: "tool_call_update", toolCallId: "call-1", status: "completed", content: [], rawOutput: null, locations: [], ...extra });
+
+  test("text and thought deltas accumulate into one entry each", () => {
+    const entries = transcript([
+      grok({ type: "thought", data: "Check " }),
+      grok({ type: "thought", data: "the file." }),
+      grok({ type: "text", data: "All " }),
+      grok({ type: "text", data: "done." }),
+      grok({ type: "end", stopReason: "end_turn", sessionId: "ses-1" }),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "reasoning", text: "Check the file." }),
+      expect.objectContaining({ type: "agent", text: "All done." }),
+    ]);
+  });
+
+  test("text bursts around a tool call stay separate entries", () => {
+    const entries = transcript([
+      grok({ type: "text", data: "First" }),
+      toolCall(),
+      toolUpdate({ rawOutput: { type: "Bash", output_for_prompt: "OK\n", exit_code: 0 } }),
+      grok({ type: "text", data: "Then" }),
+      grok({ type: "end", stopReason: "end_turn", sessionId: "ses-1" }),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "agent", text: "First" }),
+      expect.objectContaining({ type: "command", command: "printf OK", output: "OK\n", exitCode: 0, status: "completed" }),
+      expect.objectContaining({ type: "agent", text: "Then" }),
+    ]);
+  });
+
+  test("a failed command marks the entry failed with its exit code", () => {
+    const entries = transcript([
+      toolCall(),
+      toolUpdate({ status: "completed", rawOutput: { type: "Bash", output_for_prompt: "boom\n", exit_code: 2 } }),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "command", command: "printf OK", output: "boom\n", exitCode: 2, status: "failed" }),
+    ]);
+  });
+
+  test("file writes render as diffs from the update, not JSON blobs", () => {
+    const entries = transcript([
+      grok({
+        type: "tool_call",
+        toolCallId: "call-w",
+        title: "write",
+        kind: "write",
+        toolName: "write",
+        rawInput: { file_path: "/ws/note.txt", content: "BANANA\n" },
+        content: [],
+        locations: [],
+      }),
+      grok({
+        type: "tool_call_update",
+        toolCallId: "call-w",
+        status: "completed",
+        content: [{ type: "diff", path: "/ws/note.txt", oldText: "", newText: "BANANA\n" }],
+        rawOutput: null,
+        locations: [],
+      }),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "files", changes: [{ path: "/ws/note.txt", kind: "edit", diff: "-\n+BANANA" }] }),
+    ]);
+  });
+
+  test("other tools show name, input and output", () => {
+    const entries = transcript([
+      grok({ type: "tool_call", toolCallId: "call-t", title: "read_file", kind: "read", toolName: "read_file", rawInput: { file_path: "/ws/a.py" }, content: [], locations: [] }),
+      grok({ type: "tool_call_update", toolCallId: "call-t", status: "completed", content: [], rawOutput: { type: "Read", tool_output_for_prompt: "x = 1" }, locations: [] }),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "tool", name: "read_file", input: '{\n  "file_path": "/ws/a.py"\n}' }),
+    ]);
+    expect(entries[0]).toMatchObject({ status: "completed", output: "x = 1" });
+  });
+
+  test("error events and non-end_turn stops become errors; bookkeeping stays hidden", () => {
+    const entries = transcript([
+      grok({ type: "available_commands", tools: [], commands: [] }),
+      grok({ type: "usage", usage: {} }),
+      grok({ type: "error", message: "Couldn't set model 'nope': unknown model id" }),
+      grok({ type: "end", stopReason: "max_tokens", sessionId: "ses-1" }),
+      grok({ type: "end", stopReason: "end_turn", sessionId: "ses-1" }),
+    ]);
+    expect(entries).toEqual([
+      expect.objectContaining({ type: "error", text: "Couldn't set model 'nope': unknown model id" }),
+      expect.objectContaining({ type: "error", text: "Grok turn stopped: max_tokens" }),
+    ]);
+  });
+});
+
 test.describe("helpers", () => {
   test("errorText unwraps serialized errors and keeps plain text", () => {
     expect(errorText(JSON.stringify({ error: { message: "limit" } }))).toBe("limit");

@@ -20,7 +20,7 @@ import time
 import uuid
 
 VERSION = 1
-AGENTS = ('claude', 'codex', 'opencode', 'agy')
+AGENTS = ('claude', 'codex', 'opencode', 'agy', 'grok')
 BASE = Path.home() / '.hive' / 'runs'
 
 
@@ -95,6 +95,27 @@ def probe():
                 record['controls'] = ['pre-tool-hook', 'persistent-stream']
                 # The hook capability is verified independently before rollout.
                 record['runtime_ready'] = '--input-format' in capture([path, '--help'], include_stderr=True)[1]
+            elif name == 'grok':
+                record['controls'] = ['always-approve', 'persistent-session']
+                # Headless turns need every documented flag; a build that lost
+                # one cannot run delegated work.
+                help_text = capture([path, '--help'], include_stderr=True)[1]
+                record['runtime_ready'] = all(flag in help_text for flag in (
+                    '--single', '--output-format', 'streaming-json', '--cwd',
+                    '--always-approve', '--resume', '--model'))
+                # Cheap local check: cached credentials exist. Never read or
+                # retain their contents; an unproven login stays 'unknown'.
+                try:
+                    auth = json.loads((Path.home()/'.grok/auth.json').read_text())
+                    if any(isinstance(entry, dict) and entry.get('key') for entry in auth.values()):
+                        record['authentication'] = 'authenticated'
+                except (OSError, ValueError, AttributeError):
+                    pass
+                if record['runtime_ready']:
+                    code, output = capture([path, 'models'], timeout=15)
+                    if code == 0:
+                        record['models'] = [line.split('*', 1)[1].split()[0]
+                                            for line in output.splitlines() if '*' in line]
             else:
                 record['controls'] = ['native-approval', 'persistent-session']
                 record['runtime_ready'] = capture([path, 'serve', '--help'])[0] == 0
@@ -730,6 +751,90 @@ class Agy(JsonProcess):
                 return
 
 
+class Grok:
+    """One `grok -p` process per turn; NDJSON session updates are native events.
+
+    Grok has no approval bridge, so only yolo autonomy can start a turn.
+    """
+
+    def command(self, prompt):
+        args = [executable('grok'), '-p', prompt, '--output-format', 'streaming-json',
+                '--cwd', self.a['workspace'], '--always-approve']
+        if self.a.get('model'):
+            args += ['-m', self.a['model']]
+        resume = self.j.get('native_conversation_id')
+        if resume:
+            args += ['-r', resume]
+        return args
+
+    async def connect(self, assignment, journal):
+        self.a, self.j = assignment, journal
+        if assignment.get('autonomy') != 'yolo':
+            raise RuntimeError('Grok has no approval bridge yet; delegated Grok assignments require yolo autonomy')
+
+    async def turn(self, prompt):
+        self.proc = await asyncio.create_subprocess_exec(*self.command(prompt), cwd=self.a['workspace'],
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=4*1024*1024)
+        errors, end = [], None
+
+        async def drain_stderr():
+            while True:
+                line = await self.proc.stderr.readline()
+                if not line:
+                    return
+                text = line.decode('utf-8', 'replace').strip()
+                if text:
+                    errors.append(text)
+        drained = asyncio.create_task(drain_stderr())
+        try:
+            while True:
+                raw = await self.proc.stdout.readline()
+                if not raw:
+                    break
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                self.j.emit('native', event)
+                kind = event.get('type')
+                if kind == 'error':
+                    errors.append(str(event.get('message', encode(event))))
+                elif kind == 'end':
+                    end = event
+                    if event.get('sessionId'):
+                        self.j.set('native_conversation_id', event['sessionId'])
+                    usage = event.get('modelUsage') or {}
+                    if usage and not self.j.get('actual_model'):
+                        self.j.set('actual_model', next(iter(usage)))
+            code = await self.proc.wait()
+            await drained
+            if errors:
+                raise RuntimeError('Grok '+('exited '+str(code)+': ' if code else '')+errors[-1][:2000])
+            if code != 0:
+                raise RuntimeError('Grok exited '+str(code)+' without an error message')
+            if end is None:
+                raise RuntimeError('Grok stream ended without a terminal event')
+            if end.get('stopReason') != 'end_turn':
+                raise RuntimeError('Grok turn stopped with '+str(end.get('stopReason'))+': '+encode(end)[:2000])
+        finally:
+            if self.proc.returncode is None:
+                self.proc.kill()
+                await self.proc.wait()
+            try:
+                await drained
+            except Exception:
+                pass
+
+    async def close(self):
+        if getattr(self, 'proc', None) is not None and self.proc.returncode is None:
+            self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 5)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+                await self.proc.wait()
+
+
 class OpenCode:
     async def http(self, method, path, body=None):
         import urllib.request
@@ -1019,7 +1124,7 @@ async def run(assignment, journal):
     journal.set('assignment', assignment)
     journal.set('pid', os.getpid())
     journal.state('working')
-    adapter = {'codex': Codex, 'claude': Claude, 'agy': Agy, 'opencode': OpenCode}[assignment['agent']]()
+    adapter = {'codex': Codex, 'claude': Claude, 'agy': Agy, 'opencode': OpenCode, 'grok': Grok}[assignment['agent']]()
     try:
         await adapter.connect(assignment, journal)
         peers = assignment.get('peers', [])

@@ -71,6 +71,7 @@ pub const PROBED_TOOLS: &[&str] = &[
     "codex",
     "opencode",
     "agy",
+    "grok",
     "ollama",
     "git",
     "tmux",

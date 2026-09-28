@@ -283,6 +283,87 @@ function opencode(seq: number, p: any): Entry[] {
   });
 }
 
+// Grok headless (`--output-format streaming-json`) streams NDJSON session
+// updates. Agent text and thoughts arrive as deltas; tool runs arrive as a
+// `tool_call` followed by `tool_call_update`s that carry the output.
+const GROK_EVENT_TYPES = new Set([
+  "available_commands",
+  "thought",
+  "text",
+  "usage",
+  "tool_call",
+  "tool_call_update",
+  "end",
+  "error",
+]);
+
+const isGrok = (p: any) => typeof p?.type === "string" && GROK_EVENT_TYPES.has(p.type);
+
+const grokDiff = (oldText: unknown, newText: unknown) => {
+  const strip = (value: string) => (value.endsWith("\n") ? value.slice(0, -1) : value);
+  return `${lines(strip(str(oldText)), "-")}\n${lines(strip(str(newText)), "+")}`.replace(/^\n/, "");
+};
+
+function grokEvent(out: Entry[], seq: number, p: any): Entry[] {
+  switch (p.type) {
+    case "tool_call": {
+      const id = str(p.toolCallId);
+      const input = p.rawInput || {};
+      // File edits render as diffs from their update, not as JSON blobs.
+      if (["write", "edit"].includes(str(p.kind)) || ["write", "search_replace"].includes(str(p.toolName)))
+        return [];
+      if (str(input.command))
+        return [{ type: "command", seq, toolId: id, command: str(input.command), status: "started" }];
+      return [
+        {
+          type: "tool",
+          seq,
+          toolId: id,
+          name: str(p.toolName || p.title),
+          input: Object.keys(input).length ? JSON.stringify(input, null, 2) : undefined,
+          status: "started",
+        },
+      ];
+    }
+    case "tool_call_update": {
+      const id = str(p.toolCallId);
+      const raw = p.rawOutput || {};
+      const output = str(raw.output_for_prompt ?? raw.tool_output_for_prompt);
+      const use = out.findLast((x) => "toolId" in x && x.toolId === id);
+      if (use && use.type === "command") {
+        if (output) use.output = output;
+        if (raw.exit_code != null) use.exitCode = raw.exit_code;
+        use.status = raw.exit_code != null && raw.exit_code !== 0 ? "failed" : str(p.status) || use.status;
+        return [];
+      }
+      if (use && use.type === "tool") {
+        if (p.status) use.status = str(p.status);
+        if (output) use.output = output;
+        return [];
+      }
+      const diffs: any[] = Array.isArray(p.content) ? p.content.filter((c: any) => c?.type === "diff") : [];
+      if (diffs.length)
+        return [
+          {
+            type: "files",
+            seq,
+            toolId: id,
+            changes: diffs.map((d: any) => ({ path: str(d.path), kind: "edit", diff: grokDiff(d.oldText, d.newText) })),
+          },
+        ];
+      return [];
+    }
+    case "error":
+      return [{ type: "error", seq, text: errorText(p.message || p) }];
+    case "end":
+      return p.stopReason && p.stopReason !== "end_turn"
+        ? [{ type: "error", seq, text: `Grok turn stopped: ${str(p.stopReason)}` }]
+        : [];
+    default:
+      return [];
+  }
+}
+
 export function transcript(events: RunEvent[]): Entry[] {
   const out: Entry[] = [];
   const push = (entry: Entry) => {
@@ -300,8 +381,33 @@ export function transcript(events: RunEvent[]): Entry[] {
     }
     out.push(entry);
   };
+  // Grok streams agent text and thoughts as deltas; consecutive deltas join
+  // into one entry, flushed by any other entry or the stream's end.
+  let grokText: Extract<Entry, { type: "agent" }> | null = null;
+  let grokThought: Extract<Entry, { type: "reasoning" }> | null = null;
+  const flushGrok = () => {
+    if (grokThought) push(grokThought);
+    if (grokText) push(grokText);
+    grokThought = grokText = null;
+  };
   for (const e of events) {
     const p = e.payload || {};
+    if (e.kind === "native" && isGrok(p)) {
+      if (p.type === "text" && str(p.data)) {
+        if (!grokText) grokText = { type: "agent", seq: e.seq, text: "" };
+        grokText.text += str(p.data);
+        continue;
+      }
+      if (p.type === "thought" && str(p.data)) {
+        if (!grokThought) grokThought = { type: "reasoning", seq: e.seq, text: "" };
+        grokThought.text += str(p.data);
+        continue;
+      }
+      flushGrok();
+      grokEvent(out, e.seq, p).forEach(push);
+      continue;
+    }
+    flushGrok();
     switch (e.kind) {
       case "state":
         // Consecutive repeats ("working", "working") add nothing.
@@ -334,6 +440,7 @@ export function transcript(events: RunEvent[]): Entry[] {
         break;
     }
   }
+  flushGrok();
   return out;
 }
 
