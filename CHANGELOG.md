@@ -151,3 +151,13 @@ may still change without a deprecation period.
 - Autonomous device and model scheduling is not implemented; the supervisor
   authors and verifies tasks.
 - Fine-tuning data collection and export are not implemented.
+
+### Secure peer relay
+
+- Attest delegated peer messages with coordinator-held Ed25519 identities,
+  canonical envelopes, sequence checks, and configurable rolling rate budgets.
+- Quarantine integrity failures and show incidents and held-message reasons on
+  both runs; expose an append-only hash-chained audit API and session panel.
+- Label the guarantee “Relay-attested (HACP Secure degraded mode)”; document
+  database custody, trust boundaries, retries, migration and HACP API compatibility
+  in `docs/HACP-RELAY.md`.
