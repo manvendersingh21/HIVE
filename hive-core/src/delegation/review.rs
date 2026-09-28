@@ -333,6 +333,11 @@ mod tests {
             runner_path: None,
             review: serde_json::Value::Null,
             contracts: Vec::new(),
+            identity: crate::delegation::relay::PublicIdentity {
+                public_key: String::new(),
+                fingerprint: "fp".to_string(),
+            },
+            relay: serde_json::Value::Null,
         }
     }
 
