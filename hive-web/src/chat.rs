@@ -6,7 +6,7 @@
 //! user's decisions. The plan is held server-side between the two calls so the
 //! browser cannot hand back a *different* command than the one it was shown.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Path, Query, State},
@@ -833,9 +833,17 @@ struct PersistedMasterAgent {
     zai_api_key: Option<String>,
 }
 
-/// Write the state file: serialize, write a sibling temp file created with
-/// 0600 (so the key is never world-readable, even for the moments before
-/// the rename), sync, then atomically rename over the destination. The
+/// Serializes the read-modify-write in `save_master_agent_selection`.
+/// POSTs to the settings API can run concurrently on different Tokio
+/// workers; two interleaved saves would read the same state and one update
+/// (provider or key) would be lost. Poisoning only means a saver panicked
+/// midway — the next save still takes the lock and rewrites the file.
+static MASTER_AGENT_SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write the state file: serialize, write a uniquely-named sibling temp
+/// file created fresh with 0600 (`create_new` — a leftover temp from an
+/// earlier crash can never be written through, so its looser permissions
+/// are irrelevant), sync, then atomically rename over the destination. The
 /// chmod-on-destination afterwards repairs a looser mode left by an older
 /// version; the mode-on-create closes the umask window.
 fn write_master_agent_state(
@@ -846,27 +854,39 @@ fn write_master_agent_state(
         std::fs::create_dir_all(parent)?;
     }
     let contents = serde_json::to_string_pretty(state)?;
-    let temp = path.with_extension("json.tmp");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("master-agent.json");
+    // Unique per attempt: concurrent savers (or a stale temp from a crashed
+    // one) can never collide on the temp path, which would make the rename
+    // race or clobber another writer's bytes.
+    let temp = path.with_file_name(format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     let write = || -> anyhow::Result<()> {
         #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let mut file = std::fs::OpenOptions::new()
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
-                .open(&temp)?;
-            file.write_all(contents.as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&temp, path)?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+                .open(&temp)?
+        };
         #[cfg(not(unix))]
+        let mut file =
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        use std::io::Write as _;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        #[cfg(unix)]
         {
-            std::fs::write(&temp, &contents)?;
-            std::fs::rename(&temp, path)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
         Ok(())
     };
@@ -884,6 +904,12 @@ fn save_master_agent_selection(provider: &str, api_key: Option<&str>) -> anyhow:
             "HOME is not set and {MASTER_AGENT_FILE_ENV} is unset; cannot persist master-agent selection"
         )
     })?;
+
+    // The whole read-modify-write is serialized: merge-on-save reads what is
+    // on disk, so two concurrent saves must not interleave.
+    let _serialized = MASTER_AGENT_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // Merge with whatever is already on disk so switching to `local` (no
     // key) doesn't discard a previously entered Z.ai key. An empty key is
@@ -1567,5 +1593,51 @@ mod master_agent_state_tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&static_dir).ok();
+    }
+
+    #[test]
+    fn concurrent_saves_never_lose_the_key_or_leave_temp_files() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        save_master_agent_selection("zai", Some("keeper-key")).unwrap();
+
+        // Eight threads interleaving provider switches and key-carrying
+        // saves: without the save lock one update is lost or the temp-file
+        // renames collide (ENOOENT/clobber); with it every save observes
+        // the previous one's result.
+        let threads: Vec<_> = (0..8usize)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    for round in 0..25usize {
+                        let provider = if (i + round) % 2 == 0 { "local" } else { "zai" };
+                        let key = if (i + round) % 3 == 0 { None } else { Some("keeper-key") };
+                        save_master_agent_selection(provider, key).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let state = load_master_agent_state().expect("final file must parse");
+        assert_eq!(
+            state.zai_api_key.as_deref(),
+            Some("keeper-key"),
+            "merge-on-save must never lose the stored key"
+        );
+        assert!(state.provider == "local" || state.provider == "zai");
+        #[cfg(unix)]
+        assert_private(&file);
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
