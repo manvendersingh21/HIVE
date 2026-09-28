@@ -191,7 +191,7 @@ export default function SessionsPage() {
                       <strong>
                         {run!.assignment.agent} on {run!.assignment.device}
                       </strong>
-                      <StateChip state={run!.state} />
+                      <StateChip state={run!.state} run={run!} />
                     </div>
                     <p className="clamp">{run!.assignment.objective}</p>
                     <span className="muted small mono">{run!.assignment.workspace}</span>

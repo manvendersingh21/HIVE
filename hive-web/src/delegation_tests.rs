@@ -254,3 +254,52 @@ with tempfile.TemporaryDirectory() as directory:
     store.message_delivered("question").unwrap();
     assert!(store.pending_messages(&verifier.id).unwrap().is_empty());
 }
+
+fn paused_with(to: &Run, kind: &str, text: &str) -> Value {
+    let mut snapshot = snapshot("paused-quota");
+    snapshot["metadata"]["quota"] = json!({"agent":"codex","resets_at":1_790_003_600,"message":"You've hit your usage limit."});
+    snapshot["events"] = json!([{
+        "id":"handoff", "seq":1, "kind":"peer",
+        "payload":{"to":to.id,"kind":kind,"text":text}
+    }]);
+    snapshot
+}
+
+#[test]
+fn paused_quota_dependency_keeps_dependents_queued_and_is_not_failed() {
+    let (store, runs) = fixture();
+    sync(&store, &runs[0], &mut snapshot("paused-quota")).unwrap();
+    assert_eq!(store.get(&runs[0].id).unwrap().state, "paused-quota");
+    assert_eq!(ready(&store, &runs[1]), Ok(false));
+    // A progress message that hands nothing over does not release it either.
+    sync(&store, &runs[0], &mut paused_with(&runs[1], "deployment", "Paused on quota; I will push a branch later")).unwrap();
+    assert_eq!(ready(&store, &runs[1]), Ok(false));
+    assert_eq!(store.get(&runs[1].id).unwrap().state, "queued");
+}
+
+#[test]
+fn paused_quota_dependency_that_handed_off_a_branch_or_commit_releases_dependents() {
+    for text in [
+        "Implementation is on branch fix/usage-limit-pause, ready to verify",
+        "Committed 3f9c2ab0 with the parser; verify it",
+    ] {
+        let (store, runs) = fixture();
+        sync(&store, &runs[0], &mut paused_with(&runs[1], "deployment", text)).unwrap();
+        assert_eq!(ready(&store, &runs[1]), Ok(true), "{text}");
+    }
+}
+
+#[test]
+fn a_handoff_from_a_paused_run_cannot_bypass_another_prerequisite() {
+    let (store, mut runs) = fixture();
+    sync(&store, &runs[0], &mut paused_with(&runs[1], "deployment", "branch: fix/x")).unwrap();
+    runs = store.list().unwrap();
+    let mut other = runs[0].clone();
+    other.id = "other".into();
+    other.assignment.key = "other".into();
+    other.state = "paused-quota".into();
+    runs[1].assignment.dependencies.push("other".into());
+    runs.push(other);
+    let messages = store.pending_messages(&runs[1].id).unwrap();
+    assert_eq!(dependency_ready(&runs, &runs[1], &messages), Ok(false));
+}

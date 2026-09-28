@@ -226,6 +226,51 @@ fn select_opencode_model(agent: &MasterAgent, device: &str) -> anyhow::Result<Op
     Ok(models.into_iter().find(|m| !reasoning_family(m)))
 }
 
+/// When an exhausted provider quota recorded for a placement resets, if it is
+/// still in the future. Runners record the latest usage snapshot (percent and
+/// reset) from native rate-limit events; see `usage` in the runner journal.
+pub fn quota_exhausted_until(attrs: &Value, now: i64) -> Option<i64> {
+    let usage = &attrs["usage"];
+    let resets_at = usage["resets_at"].as_f64()? as i64;
+    let exhausted =
+        usage["exhausted"] == true || usage["used_percent"].as_f64().is_some_and(|p| p >= 100.0);
+    (exhausted && resets_at > now).then_some(resets_at)
+}
+
+pub fn quota_note(resets_at: i64) -> String {
+    let time = chrono::DateTime::from_timestamp(resets_at, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| resets_at.to_string());
+    format!("quota exhausted until {time}")
+}
+
+/// Whether a peer message hands work over by naming a branch or a commit:
+/// "branch: main", "branch `main`", "on branch fix/usage-limit", "commit
+/// 3f9c2ab". The bare words ("I'll push a branch soon") are not a handoff.
+pub fn names_handoff(text: &str) -> bool {
+    let branch = regex::Regex::new(
+        r#"(?i)\bbranch(?:\s+name)?(?:\s*[:=]\s*[`'"]?[[:alnum:]][\w./-]*|\s+(?:is\s+)?[`'"][\w./-]+[`'"]|\s+(?:is\s+)?[[:alnum:]][\w.-]*[/._-][\w./-]*[[:alnum:]])"#,
+    )
+    .expect("static pattern");
+    let commit = regex::Regex::new(r"(?i)\b(?:commit(?:ted)?|sha|head)\b[^.\n]{0,40}")
+        .expect("static pattern");
+    let hash = regex::Regex::new(r"(?i)\b[0-9a-f]{7,40}\b").expect("static pattern");
+    branch.is_match(text)
+        || commit.find_iter(text).any(|m| {
+            hash.find_iter(m.as_str())
+                .any(|h| h.as_str().chars().any(|c| c.is_ascii_digit()))
+        })
+}
+
+/// The reset of the exhausted quota of an assignment's (device, agent), if any.
+pub fn placement_quota(agent: &MasterAgent, assignment: &Assignment) -> anyhow::Result<Option<i64>> {
+    let record = agent.memory.graph.entity(&entity_id(
+        "device-agent",
+        &format!("{}/{}", assignment.device, assignment.agent),
+    ))?;
+    Ok(record.and_then(|r| quota_exhausted_until(&r.attrs, chrono::Utc::now().timestamp())))
+}
+
 /// OpenCode's own default can be a reasoning model that never calls tools,
 /// so a null model is filled with a verified tool-capable model before the
 /// plan is validated. Null for other agents stays a native-default choice.
@@ -292,6 +337,14 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             anyhow::bail!(
                 "{}: no verified OpenCode model is available; connect a model provider on that device, name a verified model explicitly, or use another agent",
                 a.device
+            );
+        }
+        if let Some(until) = placement_quota(agent, a)? {
+            anyhow::bail!(
+                "{}: {} {}; choose another device or agent until it resets",
+                a.device,
+                a.agent,
+                quota_note(until)
             );
         }
         let machine = agent
@@ -470,42 +523,139 @@ fn validate_coordinator(request: &str, plan: &DelegationPlan, agent: &MasterAgen
     Ok(())
 }
 
+/// `chars` with parenthesized and quoted spans blanked out, one space per
+/// character, so a placement merely mentioned there never binds. An opener
+/// without its closer, or an apostrophe inside a word, stays literal.
+fn mask_asides(chars: &[char]) -> Vec<char> {
+    let mut out = chars.to_vec();
+    let mut i = 0;
+    while i < chars.len() {
+        let after = i + 1..chars.len();
+        let end = match chars[i] {
+            '(' => {
+                let mut depth = 0;
+                (i..chars.len()).find(|&j| {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+            }
+            '"' | '`' => after.clone().find(|&j| chars[j] == chars[i]),
+            '“' => after.clone().find(|&j| chars[j] == '”'),
+            '‘' => after.clone().find(|&j| chars[j] == '’'),
+            '\'' if i == 0 || !chars[i - 1].is_alphanumeric() => after.clone().find(|&j| {
+                chars[j] == '\'' && chars.get(j + 1).is_none_or(|n| !n.is_alphanumeric())
+            }),
+            _ => None,
+        };
+        match end {
+            Some(end) => {
+                out[i..=end].fill(' ');
+                i = end + 1;
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
+
+/// The request's sentences as (masked, original) pairs. A sentence ends at a
+/// newline or at `.`, `!`, `?` or `;` before whitespace, so device names and
+/// model ids such as `air.example` or `gpt-5.2` stay whole.
+fn sentences(request: &str) -> Vec<(String, String)> {
+    let original: Vec<char> = request.chars().collect();
+    let masked = mask_asides(&original);
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 0..masked.len() {
+        let boundary = masked[i] == '\n'
+            || (matches!(masked[i], '.' | '!' | '?' | ';')
+                && masked.get(i + 1).is_none_or(|n| n.is_whitespace()));
+        if boundary || i + 1 == masked.len() {
+            let text: String = masked[start..=i].iter().collect();
+            if !text.trim().is_empty() {
+                out.push((text, original[start..=i].iter().collect::<String>().trim().to_string()));
+            }
+            start = i + 1;
+        }
+    }
+    out
+}
+
+/// Whether a placement mention assigns work rather than merely naming it:
+/// "Assignment 1: codex on air", "assignments: codex on air and …", an
+/// imperative such as "use codex on air" a few words before it, or the
+/// placement acting, as in "codex on air implements …". Negated imperatives
+/// ("don't use codex on air") never bind.
+fn binds(before: &str, after: &str) -> bool {
+    const NUMBERS: &str = r"#?(?:\d+|one|two|three|four|five|six|seven|eight)";
+    let labelled = regex::Regex::new(&format!(
+        r"(?i)(?:\bassignment\s*{NUMBERS}\s*[:\-–—]\s*(?:the\s+)?$|\bassignments?\s*:)"
+    ))
+    .expect("static pattern");
+    let directive = regex::Regex::new(
+        r"(?i)\b(?:(don'?t|don’t|do\s+not|never|avoid|not)\s+)?(?:use|run|delegate|assign|put|place|start|launch|schedule|dispatch|spawn)\b(?:\s+\S+){0,6}\s*$",
+    )
+    .expect("static pattern");
+    let acts = regex::Regex::new(
+        r"(?i)^[\s,]*(?:implements?|reviews?|verif(?:y|ies)|tests?|builds?|writes?|handles?|owns?|fixes|does|should|will|must|shall|takes?)\b",
+    )
+    .expect("static pattern");
+    labelled.is_match(before)
+        || acts.is_match(after)
+        || directive.captures(before).is_some_and(|c| c.get(1).is_none())
+}
+
 pub fn validate_explicit(
     request: &str,
     plan: &DelegationPlan,
     agent: &MasterAgent,
 ) -> anyhow::Result<()> {
+    let sentences = sentences(request);
     let mut placements = Vec::new();
     for worker in &targets(agent) {
-        let pattern = format!(
+        let pattern = regex::Regex::new(&format!(
             r"(?i)\b(claude|codex|agy|opencode|cursor)(?:\s+agent)?\s+on\s+{}(?:\s+(?:using|with)\s+(?:the\s+)?model\s+([[:alnum:]][[:alnum:]_.:/@\[\]-]*[[:alnum:]_\]])|(?:$|\.(?:\s|$)|[^[:alnum:]_.-]))",
             regex::escape(&worker.name)
-        );
-        for captures in regex::Regex::new(&pattern)?.captures_iter(request) {
-            let selected = captures[1].to_ascii_lowercase();
-            let model = captures.get(2).map(|m| m.as_str().to_string());
-            let matches = |a: &Assignment| {
-                a.device == worker.name
-                    && a.agent == selected
-                    && model.as_ref().is_none_or(|m| a.model.as_ref() == Some(m))
-            };
-            anyhow::ensure!(
-                plan.assignments.iter().any(matches),
-                "Explicit placement requires {} on {}{}",
-                selected,
-                worker.name,
-                model
-                    .as_ref()
-                    .map(|m| format!(" using model {m}"))
-                    .unwrap_or_default()
-            );
-            placements.push((worker.name.clone(), selected, model));
+        ))?;
+        for (masked, original) in &sentences {
+            for captures in pattern.captures_iter(masked) {
+                let whole = captures.get(0).expect("whole match");
+                if !binds(&masked[..whole.start()], &masked[whole.end()..]) {
+                    continue;
+                }
+                let selected = captures[1].to_ascii_lowercase();
+                let model = captures.get(2).map(|m| m.as_str().to_string());
+                let matches = |a: &Assignment| {
+                    a.device == worker.name
+                        && a.agent == selected
+                        && model.as_ref().is_none_or(|m| a.model.as_ref() == Some(m))
+                };
+                anyhow::ensure!(
+                    plan.assignments.iter().any(matches),
+                    "Explicit placement requires {} on {}{}, as requested in: \"{}\"",
+                    selected,
+                    worker.name,
+                    model
+                        .as_ref()
+                        .map(|m| format!(" using model {m}"))
+                        .unwrap_or_default(),
+                    original
+                );
+                placements.push((worker.name.clone(), selected, model));
+            }
         }
     }
     let count = regex::Regex::new(
         r"(?i)\bexactly\s+(\d+|one|two|three|four|five|six|seven|eight)\s+(?:[[:alpha:]-]+\s+)?assignments?\b",
     )?;
-    if let Some(captures) = count.captures(request) {
+    if let Some((captures, sentence)) = sentences
+        .iter()
+        .find_map(|(masked, original)| count.captures(masked).map(|c| (c, original)))
+    {
         let words = [
             "one", "two", "three", "four", "five", "six", "seven", "eight",
         ];
@@ -516,7 +666,7 @@ pub fn validate_explicit(
         };
         anyhow::ensure!(
             plan.assignments.len() == expected,
-            "Request requires exactly {expected} assignments, plan has {}",
+            "Request requires exactly {expected} assignments, plan has {}, as requested in: \"{sentence}\"",
             plan.assignments.len()
         );
         if !placements.is_empty() {
@@ -566,6 +716,7 @@ pub async fn plan(
         A null opencode model is filled from the device's verified models (the configured default first); a plan with no verified opencode model is rejected instead of guessing. \
         For other agents use null model when no model identifiers were verified; native default is resolved before execution. \
         Missing authentication, runtime or software is reported by Hive on that exact device; do not silently substitute explicit choices. \
+        An agent inventory record with quota \"quota exhausted until <time>\" has used up its provider quota: plans placing new work on that device and agent are rejected until then, so choose another agent or device. \
         Prefer dedicated devices for ordinary work. Laptops/light hosts and login nodes only receive short light work. \
         GPU/shared scheduler work requires a scheduler allocation; never launch sustained work directly on login nodes. \
         Ordinary CLI coding tasks need required_capabilities=[]: Claude/Codex provider inference does NOT require local-inference on the worker. \
@@ -1022,6 +1173,128 @@ mod tests {
         changed.assignments[0].agent = "codex".into();
         assert!(validate_explicit("Use Codex on air", &changed, &agent).is_ok());
         assert!(validate_explicit("Use Claude on air", &changed, &agent).is_err());
+    }
+    #[test]
+    fn only_assignment_phrasing_binds_a_placement() {
+        let agent = agent();
+        // The plan has claude on air; each binding mention of codex on air
+        // must therefore be rejected, and each non-binding one ignored.
+        let p = plan();
+        for binding in [
+            "Assignment 1: codex on air.",
+            "Assignment 2 - codex on air using model gpt-5.2",
+            "Assignment #3: the codex on air",
+            "codex on air implements the parser.",
+            "Fix the parser; codex on air should review it.",
+            "Two assignments: claude on air and codex on air.",
+            "Please use codex on air for this.",
+            "Delegate the migration to the codex agent on air.",
+        ] {
+            assert!(validate_explicit(binding, &p, &agent).is_err(), "{binding}");
+        }
+        for mention in [
+            "Fix the flaky test (codex on air failed last time).",
+            "Fix the flaky test (see the earlier run (codex on air) for context).",
+            "The log said \"codex on air hit its usage limit\"; retry it.",
+            "The log said “codex on air hit its usage limit”.",
+            "Reproduce the `codex on air` failure locally.",
+            "Investigate why 'codex on air' paused.",
+            "Previously codex on air hit its usage limit.",
+            "Don't use codex on air until its quota resets.",
+            "Assignment 1: fix the parser that codex on air broke.",
+        ] {
+            assert!(validate_explicit(mention, &p, &agent).is_ok(), "{mention}");
+        }
+        // A real placement still binds next to an aside that mentions another.
+        let aside = "Use claude on air (codex on air is out of quota).";
+        assert!(validate_explicit(aside, &p, &agent).is_ok());
+        let unmatched = "Use codex on air (claude on air did the last run).";
+        assert!(validate_explicit(unmatched, &p, &agent).is_err());
+        // An unbalanced opener or an in-word apostrophe never hides a placement.
+        assert!(validate_explicit("It's simple (really: use codex on air.", &p, &agent).is_err());
+    }
+    #[test]
+    fn explicit_rejections_quote_the_sentence_that_required_them() {
+        let agent = agent();
+        let p = plan();
+        let request = "Refactor the parser (claude on air did the last one). Assignment 1: codex on air implements it.";
+        let err = validate_explicit(request, &p, &agent).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Explicit placement requires codex on air, as requested in: \"Assignment 1: codex on air implements it.\""
+        );
+        let mut two = p.clone();
+        let mut second = two.assignments[0].clone();
+        second.key = "b".into();
+        two.assignments.push(second);
+        let err = validate_explicit("Keep it small.\nDo this in exactly one assignment please.", &two, &agent)
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with("as requested in: \"Do this in exactly one assignment please.\""), "{err}");
+        // A count inside quotes or parentheses is not a requirement.
+        assert!(validate_explicit("Last time (exactly one assignment) was too few.", &two, &agent).is_ok());
+    }
+    #[test]
+    fn exhausted_quota_rejects_new_assignments_until_it_resets() {
+        let agent = agent();
+        let p = plan();
+        let now = chrono::Utc::now().timestamp();
+        let record = |usage: Value| {
+            inventory::project(&agent.memory.graph, "air", &[json!({"agent":"claude","executable":"/claude",
+                "runtime_ready":true,"authentication":"authenticated","usage":usage})]).unwrap();
+        };
+        record(json!({"agent":"claude","used_percent":100,"resets_at":now+3600,"exhausted":true}));
+        let err = validate(&p, &agent).unwrap_err().to_string();
+        let until = chrono::DateTime::from_timestamp(now + 3600, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(err.contains(&format!("air: claude quota exhausted until {until}")), "{err}");
+        let described = inventory::describe(&agent.memory.graph).unwrap();
+        assert!(described.contains(&format!("\"quota\": \"quota exhausted until {until}\"")), "{described}");
+        // Other agents on the device, a reset quota and partial usage are fine.
+        let mut codex = p.clone();
+        codex.assignments[0].agent = "codex".into();
+        assert!(validate(&codex, &agent).is_ok());
+        record(json!({"agent":"claude","used_percent":100,"resets_at":now-1,"exhausted":true}));
+        assert!(validate(&p, &agent).is_ok());
+        record(json!({"agent":"claude","used_percent":82,"resets_at":now+3600,"exhausted":false}));
+        assert!(validate(&p, &agent).is_ok());
+        assert!(!inventory::describe(&agent.memory.graph).unwrap().contains("\"quota\""));
+    }
+    #[test]
+    fn handoff_messages_name_a_branch_or_commit() {
+        for handoff in [
+            "Pushed branch fix/usage-limit-pause",
+            "Work is on branch: main",
+            "branch `main` has the parser",
+            "branch name is 'feature_x'",
+            "Committed 3f9c2ab0 with the interface",
+            "HEAD is at 1a2b3c4d5e6f",
+            "commit: 0123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(names_handoff(handoff), "{handoff}");
+        }
+        for chatter in [
+            "I'll push a branch soon",
+            "Which branch should I use?",
+            "I will commit once tests pass",
+            "commit message defaced by the linter",
+            "Quota paused; resuming at 3pm",
+        ] {
+            assert!(!names_handoff(chatter), "{chatter}");
+        }
+    }
+    #[test]
+    fn quota_snapshots_are_exhausted_only_until_their_reset() {
+        let now = 1_790_000_000;
+        let usage = |v: Value| json!({ "usage": v });
+        assert_eq!(quota_exhausted_until(&usage(json!({"used_percent":100,"resets_at":now+5})), now), Some(now + 5));
+        assert_eq!(quota_exhausted_until(&usage(json!({"exhausted":true,"used_percent":40,"resets_at":now+5})), now), Some(now + 5));
+        assert_eq!(quota_exhausted_until(&usage(json!({"used_percent":99,"resets_at":now+5})), now), None);
+        assert_eq!(quota_exhausted_until(&usage(json!({"used_percent":100,"resets_at":now})), now), None);
+        assert_eq!(quota_exhausted_until(&usage(json!({"used_percent":100})), now), None);
+        assert_eq!(quota_exhausted_until(&json!({}), now), None);
+        assert_eq!(quota_note(1_790_000_000), "quota exhausted until 2026-09-21T14:13:20Z");
     }
     #[test]
     fn cursor_assignments_validate_and_honour_explicit_placements() {

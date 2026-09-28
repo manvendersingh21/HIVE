@@ -58,6 +58,29 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- A run that hits its provider usage limit is paused, not failed. The Codex
+  adapter records each `account/rateLimits/updated` snapshot (percent used and
+  reset time of the most used window) and turns a `usageLimitExceeded` turn
+  error into the new `paused-quota` state with `quota` metadata (`agent`,
+  `resets_at`, `message`). Other agents pause the same way when their error
+  names a usage limit and a reset time ("usage limit reached|<epoch>", "try
+  again at 3:05 PM", "in 2 hours"); a limit with no known reset still fails.
+  The runner delivers nothing while paused and, a minute after the reset,
+  sends a continue turn in the same native conversation.
+- A dependency paused on quota no longer fails its dependents: they stay
+  queued until it completes, or start as soon as it sends them a peer message
+  naming a branch or commit.
+- The placement inventory keeps the latest usage snapshot per device and
+  agent. An exhausted one is described to the planner as "quota exhausted
+  until <time>", plans placing new work on it are rejected until the reset,
+  and queued runs on it wait instead of launching into the same limit.
+- The web UI shows "Paused: <agent> quota resets at <local time>" on the state
+  chip and as a banner on the session page.
+- Explicit placements bind only when phrased as assignments ("Assignment 1:
+  codex on air", "assignments: …", "use codex on air", "codex on air
+  implements …"). Mentions in parentheses or quotes, narrative mentions and
+  negated ones ("don't use codex on air") no longer become requirements, and a
+  rejection quotes the sentence that required it.
 - The master-agent provider chosen in the settings UI now survives restarts
   even when `hive.toml` sets `single_provider` (BUG13). The persisted selection
   overrides the `single_provider` default whenever that provider is still

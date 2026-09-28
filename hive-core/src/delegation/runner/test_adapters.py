@@ -12,6 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 import uuid
@@ -640,6 +641,86 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
         adapter.notifications.put_nowait(dict(method='turn/completed', params={'turn': {'status': 'completed'}}))
         await adapter.turn('peer work')
         adapter.send.assert_awaited_once_with(dict(id='approval-id', result=dict(action='accept', content={})))
+
+    def codex(self):
+        adapter = runner.Codex()
+        adapter.j, adapter.a, adapter.native, adapter.items = self.j, self.assignment, 'native-thread', {}
+        adapter.rpc, adapter.send, adapter.notifications = AsyncMock(), AsyncMock(), asyncio.Queue()
+        return adapter
+
+    # Shapes follow `codex app-server generate-json-schema` (codex-cli 0.155):
+    # AccountRateLimitsUpdatedNotification, ErrorNotification, TurnCompletedNotification.
+    @staticmethod
+    def rate_limits(primary, secondary=None, reached=None):
+        limits = dict(limitId='codex', limitName=None, planType='plus', credits=None,
+                      rateLimitReachedType=reached, primary=primary, secondary=secondary)
+        return dict(method='account/rateLimits/updated', params=dict(rateLimits=limits))
+
+    USAGE_ERROR = dict(message="You've hit your usage limit. Upgrade to Pro or try again later.",
+                       codexErrorInfo='usageLimitExceeded', additionalDetails=None)
+
+    async def test_codex_usage_limit_with_reset_pauses_instead_of_failing(self):
+        adapter = self.codex()
+        resets_at = int(time.time()) + 3600
+        for event in (
+                self.rate_limits(dict(usedPercent=82, windowDurationMins=300, resetsAt=resets_at-600),
+                                 dict(usedPercent=40, windowDurationMins=10080, resetsAt=resets_at+86400)),
+                self.rate_limits(dict(usedPercent=100, windowDurationMins=300, resetsAt=resets_at), None,
+                                 reached='rate_limit_reached'),
+                dict(method='error', params=dict(error=self.USAGE_ERROR, threadId='native-thread', turnId='turn-1', willRetry=False)),
+                dict(method='turn/completed', params=dict(threadId='native-thread', turn=dict(
+                    id='turn-1', items=[], status='failed', error=self.USAGE_ERROR)))):
+            adapter.notifications.put_nowait(event)
+        with self.assertRaises(runner.QuotaPaused) as raised:
+            await adapter.turn('work')
+        self.assertEqual((raised.exception.agent, raised.exception.resets_at), ('codex', resets_at))
+        usage = self.j.get('usage')
+        self.assertEqual((usage['used_percent'], usage['resets_at'], usage['exhausted']), (100, resets_at, True))
+        # The sparse second update kept the weekly window from the first.
+        self.assertEqual(usage['windows']['secondary']['used_percent'], 40)
+
+    async def test_codex_usage_limit_error_before_a_bare_failed_turn_still_pauses(self):
+        adapter = self.codex()
+        resets_at = int(time.time()) + 1800
+        adapter.notifications.put_nowait(self.rate_limits(dict(usedPercent=100, windowDurationMins=300, resetsAt=resets_at)))
+        adapter.notifications.put_nowait(dict(method='error', params=dict(error=self.USAGE_ERROR, threadId='native-thread', turnId='t', willRetry=False)))
+        adapter.notifications.put_nowait(dict(method='turn/completed', params=dict(threadId='native-thread', turn=dict(id='t', items=[], status='failed', error=None))))
+        with self.assertRaises(runner.QuotaPaused) as raised:
+            await adapter.turn('work')
+        self.assertEqual(raised.exception.resets_at, resets_at)
+
+    async def test_codex_usage_limit_without_any_reset_time_stays_a_failure(self):
+        adapter = self.codex()
+        adapter.notifications.put_nowait(dict(method='turn/completed', params=dict(threadId='native-thread', turn=dict(
+            id='t', items=[], status='failed', error=self.USAGE_ERROR))))
+        with self.assertRaises(RuntimeError) as raised:
+            await adapter.turn('work')
+        self.assertNotIsInstance(raised.exception, runner.QuotaPaused)
+
+    async def test_codex_other_turn_failures_and_retried_limits_are_not_quota_pauses(self):
+        resets_at = int(time.time()) + 600
+        other = dict(message='stream disconnected', codexErrorInfo='internalServerError')
+        for events in (
+                [dict(method='turn/completed', params=dict(threadId='native-thread', turn=dict(id='t', items=[], status='failed', error=other)))],
+                [self.rate_limits(dict(usedPercent=100, resetsAt=resets_at)),
+                 dict(method='error', params=dict(error=self.USAGE_ERROR, threadId='native-thread', turnId='t', willRetry=True)),
+                 dict(method='turn/completed', params=dict(threadId='native-thread', turn=dict(id='t', items=[], status='interrupted', error=None)))]):
+            with self.subTest(events=events[-1]):
+                adapter = self.codex()
+                for event in events:
+                    adapter.notifications.put_nowait(event)
+                with self.assertRaises(RuntimeError) as raised:
+                    await adapter.turn('work')
+                self.assertNotIsInstance(raised.exception, runner.QuotaPaused)
+
+    async def test_codex_rate_limit_updates_record_usage_during_a_successful_turn(self):
+        adapter = self.codex()
+        adapter.notifications.put_nowait(self.rate_limits(dict(usedPercent=37, windowDurationMins=300, resetsAt=1790000000)))
+        adapter.notifications.put_nowait(dict(method='turn/completed', params=dict(threadId='native-thread', turn=dict(id='t', items=[], status='completed', error=None))))
+        await adapter.turn('work')
+        usage = self.j.get('usage')
+        self.assertEqual((usage['agent'], usage['used_percent'], usage['resets_at'], usage['exhausted']),
+                         ('codex', 37, 1790000000, False))
 
     async def test_codex_start_and_resume_keep_untrusted_and_same_mcp(self):
         for native in (None, 'native-existing'):
