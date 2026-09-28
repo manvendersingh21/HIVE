@@ -376,6 +376,8 @@ impl RunStore {
         }
         let mut metadata = snapshot["metadata"].clone();
         metadata["approvals"] = snapshot["approvals"].clone();
+        // Coordinator-observed contact time, never trusted from a worker.
+        metadata["last_seen"] = json!(chrono::Utc::now().to_rfc3339());
         let state = metadata["state"]
             .as_str()
             .unwrap_or("disconnected")

@@ -867,6 +867,33 @@ pub fn set_autonomy(mode: Autonomy) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Public, allowlisted run profile. Never serialize runner metadata or events.
+pub fn team_profile(run: &store::Run) -> Value {
+    json!({
+        "agent_id": run.id, "key": run.assignment.key, "role": run.assignment.key,
+        "agent": run.assignment.agent, "model": run.assignment.model,
+        "device": run.assignment.device, "owned_paths": run.assignment.owned_paths,
+        "current_task": run.assignment.objective, "status": run.state,
+        "dependencies": run.assignment.dependencies,
+        "last_seen": run.metadata["last_seen"],
+        "relay_fingerprint": run.identity.fingerprint,
+    })
+}
+
+/// Stable prompt projection: heartbeat changes must not start agent turns.
+/// Keep `id` for the existing peer tools and omit objectives and private context.
+pub fn team_view(run: &store::Run, runs: &[store::Run]) -> Value {
+    let mut peers: Vec<_> = runs.iter()
+        .filter(|p| p.task_id == run.task_id && p.id != run.id && p.state != "superseded")
+        .map(|p| json!({"id": p.id, "key": p.assignment.key, "role": p.assignment.key,
+            "agent": p.assignment.agent, "device": p.assignment.device,
+            "owned_paths": p.assignment.owned_paths, "status": p.state,
+            "dependencies": p.assignment.dependencies}))
+        .collect();
+    peers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    json!(peers)
+}
+
 pub fn remote_assignment(
     run: &store::Run,
     peers: &[store::Run],
@@ -877,7 +904,7 @@ pub fn remote_assignment(
     value["id"] = json!(run.id);
     value["task_id"] = json!(run.task_id);
     value["executable"] = json!(executable);
-    value["peers"] = json!(peers.iter().filter(|p| p.id != run.id).map(|p| json!({"id":p.id,"key":p.assignment.key,"device":p.assignment.device,"agent":p.assignment.agent})).collect::<Vec<_>>());
+    value["peers"] = team_view(run, peers);
     value
 }
 
