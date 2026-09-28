@@ -52,6 +52,21 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- Run journals no longer store one event per streamed token. The Cursor adapter
+  joins contiguous `thinking` deltas and contiguous assistant text into one
+  event per block, flushed by any other event (tool call, tool result, result)
+  and at turn end; tool calls and results stay individual events. AGY response
+  `text_delta` step updates are joined the same way. OpenCode no longer
+  re-journals the whole message history every turn, nor a streaming message on
+  every poll: an unfinished message is journaled again only when a part starts
+  or changes status. A recorded Cursor run shrinks from 5,443 to 403 native
+  events. The native conversation id is written only when it changes, not on
+  every stream line.
+- Cursor runs record the `--model` value actually passed (or `auto`) as the
+  actual model and invocation evidence, never the init event's display name
+  (e.g. "GPT-5.2 Medium"), which `--model` rejects. A rejected model's
+  "Available models: ..." list is saved as the run's available models, and
+  display names stored by earlier runs are dropped when the run loads.
 - The master-agent provider selection and any Z.ai key entered in the
   settings UI are now persisted robustly: `~/.hive/master-agent.json`
   (relocatable via `HIVE_MASTER_AGENT_FILE`) is written atomically with
