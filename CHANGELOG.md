@@ -58,6 +58,18 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- NVIDIA planning no longer fails wholesale with "NVIDIA request deadline
+  exceeded": the first attempt gets ~80s of the 120s deadline (so a healthy but
+  slow generation still completes on the first try), and a hung first attempt is
+  cut off with the remainder left for its retry (only on connect errors or 5xx).
+  The overall deadline remains the hard cap.
+- Planning failures in the delegation chat path are logged with `warn!`
+  including the conversation ID and the error, and the planner is bounded by
+  a semaphore (max 2 concurrent calls) so simultaneous chats cannot overload
+  the model endpoint.
+- A chat message whose planning deadline fires is retried once automatically;
+  if the retry also times out, the user sees an actionable message (no
+  commands were executed; resend the message) instead of a bare timeout.
 - A run that hits its provider usage limit is paused, not failed. The Codex
   adapter records each `account/rateLimits/updated` snapshot (percent used and
   reset time of the most used window) and turns a `usageLimitExceeded` turn
