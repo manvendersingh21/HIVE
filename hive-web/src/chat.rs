@@ -241,6 +241,163 @@ pub async fn get_chat(State(h): State<AgentHandle>, Path(id): Path<String>) -> R
     }
 }
 
+/// Delegated-run states that still own a live agent session. A chat with any
+/// of these cannot be deleted: the run would keep working with nowhere to
+/// report, and its approvals would point at a conversation that is gone.
+pub(crate) const LIVE_RUN_STATES: [&str; 6] = [
+    "queued",
+    "launching",
+    "working",
+    "waiting-for-peer",
+    "awaiting-approval",
+    "paused-quota",
+];
+
+/// What stopped a chat deletion, if anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeleteRefusal {
+    NotFound,
+    LiveRuns(i64),
+    ActiveTurn,
+}
+
+/// Delete one conversation and everything that exists only because of it, in
+/// a single IMMEDIATE transaction on the shared memory connection:
+///
+/// - web chat turns, messages, and the conversation row;
+/// - RAG memory rows (`rag_chunks`, `rag_indexed`) for that conversation;
+/// - finished delegated runs of that conversation, with their events,
+///   decisions, and the task-scoped contracts/reviews no other run uses.
+///
+/// Relay state is deliberately left alone. The audit chain is append-only
+/// (triggers refuse DELETE), and the envelopes, messages, keys and incidents
+/// it references stay so the chain remains verifiable after the chat is gone.
+pub(crate) fn delete_conversation(
+    agent: &MasterAgent,
+    id: &str,
+) -> anyhow::Result<Result<(), DeleteRefusal>> {
+    let conn = agent.memory.graph.shared_conn();
+    let db = conn.lock().unwrap();
+    db.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> anyhow::Result<Result<(), DeleteRefusal>> {
+        let exists: i64 = db.query_row(
+            "SELECT count(*) FROM conversations WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(Err(DeleteRefusal::NotFound));
+        }
+        let table = |name: &str| -> anyhow::Result<bool> {
+            let n: i64 = db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        };
+        let has_runs = table("delegated_runs")?;
+        if has_runs {
+            let live_list = LIVE_RUN_STATES
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let live: i64 = db.query_row(
+                &format!(
+                    "SELECT count(*) FROM delegated_runs WHERE conversation_id=?1 AND state IN ({live_list})"
+                ),
+                [id],
+                |r| r.get(0),
+            )?;
+            if live > 0 {
+                return Ok(Err(DeleteRefusal::LiveRuns(live)));
+            }
+        }
+        if table("web_chat_turns")? {
+            let active: i64 = db.query_row(
+                "SELECT count(*) FROM web_chat_turns WHERE conversation_id=?1 AND status IN ('planning','executing','awaiting_approval')",
+                [id],
+                |r| r.get(0),
+            )?;
+            if active > 0 {
+                return Ok(Err(DeleteRefusal::ActiveTurn));
+            }
+            db.execute("DELETE FROM web_chat_turns WHERE conversation_id=?1", [id])?;
+        }
+        if has_runs {
+            let runs = "SELECT id FROM delegated_runs WHERE conversation_id=?1";
+            let tasks = "SELECT task_id FROM delegated_runs WHERE conversation_id=?1 \
+                         AND task_id NOT IN (SELECT task_id FROM delegated_runs WHERE conversation_id!=?1)";
+            db.execute(&format!("DELETE FROM delegated_events WHERE run_id IN ({runs})"), [id])?;
+            db.execute(&format!("DELETE FROM delegated_decisions WHERE run_id IN ({runs})"), [id])?;
+            for scoped in ["delegated_contracts", "delegated_reviews"] {
+                if table(scoped)? {
+                    db.execute(&format!("DELETE FROM {scoped} WHERE task_id IN ({tasks})"), [id])?;
+                }
+            }
+            db.execute("DELETE FROM delegated_runs WHERE conversation_id=?1", [id])?;
+        }
+        for memory in ["rag_chunks", "rag_indexed"] {
+            if table(memory)? {
+                db.execute(&format!("DELETE FROM {memory} WHERE conversation_id=?1"), [id])?;
+            }
+        }
+        db.execute("DELETE FROM messages WHERE conversation_id=?1", [id])?;
+        db.execute("DELETE FROM conversations WHERE id=?1", [id])?;
+        Ok(Ok(()))
+    })();
+    match &result {
+        Ok(Ok(())) => db.execute_batch("COMMIT")?,
+        _ => db.execute_batch("ROLLBACK")?,
+    }
+    result
+}
+
+/// `DELETE /api/chats/{id}` — 204 when deleted, 404 for an unknown chat, 409
+/// while a delegated run or a chat request of that conversation is still live.
+pub async fn delete_chat(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
+    if let Err(r) = h.store() {
+        return r;
+    }
+    let agent = match h.require() {
+        Ok(a) => a.clone(),
+        Err(r) => return r,
+    };
+    // Make sure the delegation tables exist, so the live-run check can never
+    // be skipped just because no run was ever created on this host.
+    if let Err(e) = crate::delegation::store(&h) {
+        return storage_error(e);
+    }
+    let outcome = {
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || delete_conversation(&agent, &id)).await
+    };
+    match outcome {
+        Ok(Ok(Ok(()))) => {
+            info!(conversation_id = %id, "chat deleted");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(Err(DeleteRefusal::NotFound))) => storage_error(ChatError::NotFound.into()),
+        Ok(Ok(Err(DeleteRefusal::LiveRuns(n)))) => (
+            StatusCode::CONFLICT,
+            format!(
+                "This chat still has {n} delegated run{} in progress. Stop or finish {} before deleting the chat.",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "it" } else { "them" },
+            ),
+        )
+            .into_response(),
+        Ok(Ok(Err(DeleteRefusal::ActiveTurn))) => (
+            StatusCode::CONFLICT,
+            "This chat has a request running or awaiting approval. Wait for it to finish before deleting the chat.",
+        )
+            .into_response(),
+        Ok(Err(e)) => storage_error(e),
+        Err(e) => storage_error(anyhow::anyhow!("chat deletion task failed: {e}")),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ChatRequest {
     #[serde(default)]

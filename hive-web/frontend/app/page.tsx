@@ -59,6 +59,12 @@ export default function AgentPage() {
   // Refresh failures clear on the next good refresh; `error` reports actions.
   const [loadError, setLoadError] = useState("");
   const [capable, setCapable] = useState(true);
+  // The chat whose inline delete confirmation is open, and how it is going.
+  const [deleting, setDeleting] = useState<{
+    id: string;
+    pending: boolean;
+    error?: string;
+  }>();
   // A chat runs one turn at a time. A message sent meanwhile waits here and
   // goes out when the turn finishes.
   const [queued, setQueued] = useState<{ chat: string; text: string }>();
@@ -221,6 +227,31 @@ export default function AgentPage() {
     setQueued(undefined);
     void submit(queued.text);
   }, [queued, active, busy, loading, messages]);
+  async function removeChat(id: string) {
+    setDeleting({ id, pending: true });
+    try {
+      await api(`/api/chats/${encodeURIComponent(id)}`, { method: "DELETE" });
+      setChats((current) => current.filter((c) => c.id !== id));
+      setDeleting(undefined);
+      if (activeRef.current === id) {
+        activeRef.current = undefined;
+        setActive(undefined);
+        setMessages([]);
+        setRuns([]);
+        setLoadError("");
+        setLoading(false);
+        if (queued?.chat === id) unqueue();
+      }
+      // A deep link to a deleted chat would reopen a 404 on refresh.
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("chat") === id) {
+        url.searchParams.delete("chat");
+        window.history.replaceState(null, "", url);
+      }
+    } catch (e) {
+      setDeleting({ id, pending: false, error: (e as Error).message });
+    }
+  }
   async function approve(runId: string, stepId: number, allowed: boolean) {
     setBusy(true);
     setError("");
@@ -277,17 +308,62 @@ export default function AgentPage() {
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search chats"
           />
-          {chats.map((chat) => (
-            <button
-              disabled={busy}
-              className={`chat-item ${chat.id === active ? "selected" : ""}`}
-              key={chat.id}
-              onClick={() => void open(chat.id)}
-            >
-              <strong>{chat.title || "New chat"}</strong>
-              <small>{chat.updated_at}</small>
-            </button>
-          ))}
+          {chats.map((chat) => {
+            const title = chat.title || "New chat";
+            const confirming = deleting?.id === chat.id;
+            return (
+              <div
+                className={`chat-row ${chat.id === active ? "selected" : ""}`}
+                data-chat-id={chat.id}
+                key={chat.id}
+              >
+                <div className="chat-row-main">
+                  <button
+                    disabled={busy}
+                    className={`chat-item ${chat.id === active ? "selected" : ""}`}
+                    onClick={() => void open(chat.id)}
+                  >
+                    <strong>{title}</strong>
+                    <small>{chat.updated_at}</small>
+                  </button>
+                  {!confirming && (
+                    <button
+                      className="chat-delete"
+                      aria-label="Delete chat"
+                      title={`Delete “${title}”`}
+                      disabled={busy || !!deleting?.pending}
+                      onClick={() => setDeleting({ id: chat.id, pending: false })}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+                {confirming && (
+                  <div className="chat-confirm" role="group" aria-label="Confirm delete chat">
+                    <span className="grow">Delete this chat?</span>
+                    <button
+                      className="danger"
+                      disabled={deleting.pending}
+                      onClick={() => void removeChat(chat.id)}
+                    >
+                      {deleting.pending ? "Deleting…" : "Delete"}
+                    </button>
+                    <button
+                      disabled={deleting.pending}
+                      onClick={() => setDeleting(undefined)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+                {confirming && deleting.error && (
+                  <small role="alert" className="error chat-delete-error">
+                    {deleting.error}
+                  </small>
+                )}
+              </div>
+            );
+          })}
           {chats.length >= offset + 50 && (
             <button onClick={() => void loadChats(query, offset + 50)}>
               Load more
