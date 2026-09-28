@@ -40,8 +40,14 @@ may still change without a deprecation period.
 
 ### Changed
 
-- HACP is pinned to `7891da077d469e6308f31cbaa93d838c39cc54e6`, with
-  guardian-backed secure envelopes enabled in `hive-core`.
+- HACP is pinned to `3d008d4719e0dcf0ba4057650831ab4696495923`, with
+  guardian-backed secure envelopes enabled in `hive-core`. This pin adopts
+  HACP's V3/V4/V7 fixes: bilateral delegation contracts are formed under a
+  per-run capability grant (the deployment charters the supervisor, which
+  grants the worker) with a matching escalation path, and contracts set
+  `max_rework = 2`. A rework verdict beyond that bound ends the run as
+  `Rejected` with a "rework budget exhausted" reason, even when
+  `--max-rework` allows more attempts.
 - HACP is consumed as a commit-pinned Git dependency from its own repository
   rather than vendored into this tree.
 - Placement restrictions are enforced during plan validation: assignments
@@ -52,6 +58,49 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- NVIDIA planning no longer fails wholesale with "NVIDIA request deadline
+  exceeded": the first attempt gets ~80s of the 120s deadline (so a healthy but
+  slow generation still completes on the first try), and a hung first attempt is
+  cut off with the remainder left for its retry (only on connect errors or 5xx).
+  The overall deadline remains the hard cap.
+- Planning failures in the delegation chat path are logged with `warn!`
+  including the conversation ID and the error, and the planner is bounded by
+  a semaphore (max 2 concurrent calls) so simultaneous chats cannot overload
+  the model endpoint.
+- A chat message whose planning deadline fires is retried once automatically;
+  if the retry also times out, the user sees an actionable message (no
+  commands were executed; resend the message) instead of a bare timeout.
+- A run that hits its provider usage limit is paused, not failed. The Codex
+  adapter records each `account/rateLimits/updated` snapshot (percent used and
+  reset time of the most used window) and turns a `usageLimitExceeded` turn
+  error into the new `paused-quota` state with `quota` metadata (`agent`,
+  `resets_at`, `message`). Other agents pause the same way when their error
+  names a usage limit and a reset time ("usage limit reached|<epoch>", "try
+  again at 3:05 PM", "in 2 hours"); a limit with no known reset still fails.
+  The runner delivers nothing while paused and, a minute after the reset,
+  sends a continue turn in the same native conversation.
+- A dependency paused on quota no longer fails its dependents: they stay
+  queued until it completes, or start as soon as it sends them a peer message
+  naming a branch or commit.
+- The placement inventory keeps the latest usage snapshot per device and
+  agent. An exhausted one is described to the planner as "quota exhausted
+  until <time>", plans placing new work on it are rejected until the reset,
+  and queued runs on it wait instead of launching into the same limit.
+- The web UI shows "Paused: <agent> quota resets at <local time>" on the state
+  chip and as a banner on the session page.
+- Explicit placements bind only when phrased as assignments ("Assignment 1:
+  codex on air", "assignments: …", "use codex on air", "codex on air
+  implements …"). Mentions in parentheses or quotes, narrative mentions and
+  negated ones ("don't use codex on air") no longer become requirements, and a
+  rejection quotes the sentence that required it.
+- The master-agent provider chosen in the settings UI now survives restarts
+  even when `hive.toml` sets `single_provider` (BUG13). The persisted selection
+  overrides the `single_provider` default whenever that provider is still
+  configured; a persisted provider that is no longer usable falls back to the
+  `hive.toml` default. Key precedence is unchanged (env/config keys win over
+  the persisted key). Startup now logs the selected provider and why
+  (`persisted choice`, `config default`, or `fallback`), never any key. See
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#master-agent-settings-persistence).
 - Run journals no longer store one event per streamed token. The Cursor adapter
   joins contiguous `thinking` deltas and contiguous assistant text into one
   event per block, flushed by any other event (tool call, tool result, result)
@@ -70,8 +119,10 @@ may still change without a deprecation period.
 - The master-agent provider selection and any Z.ai key entered in the
   settings UI are now persisted robustly: `~/.hive/master-agent.json`
   (relocatable via `HIVE_MASTER_AGENT_FILE`) is written atomically with
-  `0600` permissions, re-applied at startup below env/`hive.toml`
-  precedence, and never echoed by the API or logs. A corrupt state file is
+  `0600` permissions, and re-applied at startup: the Z.ai key only fills a
+  router that has none from env/`hive.toml`, and the provider selection
+  overrides the `hive.toml` `single_provider` default (see the BUG13 entry
+  above). The key is never echoed by the API or logs. A corrupt state file is
   ignored instead of affecting startup. See
   [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - Peer dependency deadlocks: a queued verifier can start when its implementer

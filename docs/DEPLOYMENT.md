@@ -48,10 +48,20 @@ persisted in `~/.hive/master-agent.json` so it survives restarts; set
 
 - **Permissions**: the file is written atomically (temp file + rename) with
   mode `0600` — it holds an API key, so only the service user may read it.
-- **Precedence**: the environment and `hive.toml` always win over the file.
-  A key resolved from `[llm.zai]`/`Z_AI` is never replaced by the persisted
-  one, and an explicit `single_provider` in `hive.toml` beats the persisted
-  provider selection.
+- **Provider precedence**: the persisted selection is the operator's latest
+  explicit choice, so it overrides `single_provider` in `hive.toml` as long as
+  that provider is still configured (e.g. a persisted `nvidia` still needs
+  `NVIDIA_API_KEY_FLASH`; `zai` needs a key). If the persisted provider is
+  unknown or no longer configured, it is ignored and the `hive.toml`
+  `single_provider` default applies; with no `single_provider` either, legacy
+  routing falls back to the local model. `single_provider` is therefore the
+  default for a fresh install, not an override of the UI selection.
+- **Key precedence**: unchanged — the environment and `hive.toml` win over the
+  file. A key resolved from `[llm.zai]`/`Z_AI` is never replaced by the
+  persisted one; the persisted key only fills a router that has none.
+- **Startup log**: one `info` line, `master-agent provider selected`, reports
+  the chosen `provider` and a `reason` of `persisted choice`, `config default`,
+  or `fallback` (plus the configured default). No keys are logged.
 - **Key handling**: the key is never echoed by the settings API (it reports
   `configured: true/false` only), never logged, and never placed in a prompt.
 - **Corrupt files**: unreadable or corrupt state is ignored at startup (the

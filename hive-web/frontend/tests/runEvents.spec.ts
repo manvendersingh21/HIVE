@@ -8,6 +8,7 @@ import {
   describeAction,
   errorText,
   lastError,
+  pausedLabel,
   stateTone,
   transcript,
 } from "../lib/runEvents";
@@ -410,6 +411,7 @@ test.describe("helpers", () => {
         "reviewing",
         "waiting-for-peer",
         "queued",
+        "paused-quota",
         "completed",
         "superseded",
       ].map((s) => [s, stateTone(s)]),
@@ -424,6 +426,7 @@ test.describe("helpers", () => {
       reviewing: "running",
       "waiting-for-peer": "running",
       queued: "queued",
+      "paused-quota": "queued",
       completed: "done",
       superseded: "done",
     });
@@ -431,7 +434,22 @@ test.describe("helpers", () => {
 
   test("terminal states stop live polling", () => {
     expect([...TERMINAL_STATES].sort()).toEqual(["completed", "disconnected", "failed", "superseded"]);
-    for (const live of ["working", "awaiting-approval", "queued", "launching"]) expect(TERMINAL_STATES).not.toContain(live);
+    for (const live of ["working", "awaiting-approval", "queued", "launching", "paused-quota"]) expect(TERMINAL_STATES).not.toContain(live);
+  });
+
+  test("a quota pause names the agent and its reset in local time", () => {
+    const now = new Date(2026, 8, 28, 14, 0).getTime();
+    const soon = new Date(2026, 8, 28, 15, 5).getTime() / 1000;
+    const time = new Date(soon * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    expect(pausedLabel({ agent: "codex", resets_at: soon }, "claude", now)).toBe(`Paused: codex quota resets at ${time}`);
+    // The run's agent stands in when the pause does not name one.
+    expect(pausedLabel({ resets_at: soon }, "claude", now)).toBe(`Paused: claude quota resets at ${time}`);
+    const later = new Date(2026, 8, 30, 9, 0).getTime() / 1000;
+    expect(pausedLabel({ agent: "codex", resets_at: later }, "codex", now)).toContain("Paused: codex quota resets at ");
+    expect(pausedLabel({ agent: "codex", resets_at: later }, "codex", now)).toContain(
+      new Date(later * 1000).toLocaleString([], { weekday: "short" }),
+    );
+    expect(pausedLabel(undefined, "codex", now)).toBe("Paused: codex quota");
   });
 });
 

@@ -21,7 +21,7 @@ deserializing a wire object is not a substitute for validation and authorization
 ## Dependency and versions
 
 The root `Cargo.toml` declares `hacp` with an HTTPS Git URL pinned to commit
-`7891da077d469e6308f31cbaa93d838c39cc54e6`. `hive-core` enables HACP's
+`3d008d4719e0dcf0ba4057650831ab4696495923`. `hive-core` enables HACP's
 `guardian` feature; `hive-adapter` consumes the workspace dependency without
 that feature. The lockfile records the exact source. There is no HACP source
 directory or submodule in HIVE, and a contributor does not need a local protocol
@@ -33,7 +33,10 @@ versions do not identify the wire version, and these two wire protocols are not
 compatible.
 
 - `hive-core/src/collab` and `hive-adapter` use the legacy 1.1 APIs.
-- `hive-core/src/runtime` and `hive collab` use the v2 bilateral APIs.
+- `hive-core/src/runtime` and `hive collab` use the v2 bilateral APIs. Each
+  run forms its delegation contract under a per-run capability grant (the
+  deployment charters the supervisor, which grants the worker) and caps
+  `max_rework` at 2; a further rework verdict ends the run as `Rejected`.
 
 This is Git distribution; no crates.io publication is implied.
 

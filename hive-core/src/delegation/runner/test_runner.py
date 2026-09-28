@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import runner
@@ -259,6 +260,88 @@ class RunnerTests(unittest.TestCase):
             self.assertIsNone(runner.policy('Bash', {'command':command}, self.workspace), command)
         for command in ("bash -lc 'sudo true'", "bash -c 'rm -rf .'", "bash -lc 'ls > ../outside'", "bash -c 'nl -ba /etc/passwd'"):
             self.assertIsNotNone(runner.policy('Bash', {'command':command}, self.workspace), command)
+
+    def test_usage_limit_messages_yield_their_reset_time(self):
+        import datetime
+        now = datetime.datetime(2026, 9, 28, 14, 0).timestamp()
+        at = lambda h, m, days=0: int((datetime.datetime(2026, 9, 28, h, m) + datetime.timedelta(days=days)).timestamp())
+        for message, expected in (
+                ('Claude AI usage limit reached|1790000000', 1790000000),
+                ("You've hit your usage limit. Try again in 2 hours 5 minutes.", int(now)+7500),
+                ('Usage limit reached, try again in 37m', int(now)+2220),
+                ("You've hit your usage limit. Try again at 3:05 PM.", at(15, 5)),
+                ('5-hour limit reached ∙ resets 9am', at(9, 0, days=1)),
+                ('Quota exceeded until 16:30', at(16, 30)),
+                ('usage limit reached', None)):
+            with self.subTest(message=message):
+                self.assertEqual(runner.reset_from_message(message, now), expected)
+
+    def test_only_usage_limit_failures_with_a_future_reset_pause(self):
+        now = 1_790_000_000
+        pause = runner.quota_pause('claude', 'Claude AI usage limit reached|1790003600', None, now)
+        self.assertEqual((pause.agent, pause.resets_at), ('claude', 1790003600))
+        # The recorded usage supplies the reset when the message has none.
+        pause = runner.quota_pause('cursor', "You've hit your usage limit", {'resets_at': now+60}, now)
+        self.assertEqual(pause.resets_at, now+60)
+        for message, usage in (('usage limit reached', None), ('usage limit reached', {'resets_at': now-1}),
+                               ('Tests failed in 3 minutes', None), ('Native agent disconnected', {'resets_at': now+60})):
+            with self.subTest(message=message):
+                self.assertIsNone(runner.quota_pause('codex', message, usage, now))
+
+    def test_paused_quota_run_resumes_with_a_continue_turn_after_the_reset(self):
+        prompts = []
+        resets_at = int(time.time()) + 1
+
+        class Adapter:
+            async def connect(self, assignment, journal):
+                journal.set('native_conversation_id', 'native')
+
+            async def turn(self, prompt):
+                prompts.append(prompt)
+                if len(prompts) == 1:
+                    raise runner.QuotaPaused('codex', resets_at, "You've hit your usage limit.")
+
+        assignment = dict(id='521e337d-cf82-4df4-b2f4-8641f7c1e533', agent='codex', workspace=str(self.workspace), peers=[])
+
+        async def exercise():
+            task = asyncio.create_task(runner.run(assignment, self.j))
+            states = []
+            for _ in range(400):
+                state = self.j.get('state')
+                if not states or states[-1] != state:
+                    states.append(state)
+                if state == 'completed':
+                    break
+                await asyncio.sleep(.02)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            return states
+
+        with patch.object(runner, 'Codex', Adapter), patch.object(runner, 'QUOTA_GRACE', 0), patch.object(runner, 'QUOTA_POLL', .02):
+            states = asyncio.run(exercise())
+        self.assertIn('paused-quota', states)
+        self.assertLess(states.index('paused-quota'), states.index('completed'))
+        self.assertNotIn('failed', states)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn('usage limit has reset', prompts[1])
+        self.assertIsNone(self.j.get('quota'))
+        kinds = [e['kind'] for e in self.j.snapshot()['events']]
+        self.assertLess(kinds.index('quota-paused'), kinds.index('quota-resumed'))
+        paused = next(e['payload'] for e in self.j.snapshot()['events'] if e['kind'] == 'quota-paused')
+        self.assertEqual((paused['agent'], paused['resets_at']), ('codex', resets_at))
+        self.assertEqual(self.j.get('usage')['exhausted'], True)
+        # The paused turn was acknowledged, so recovery never sees it as uncertain.
+        self.assertEqual({r[0] for r in self.j.db.execute('SELECT state FROM inbox')}, {'acknowledged'})
+
+    def test_no_turn_is_delivered_before_the_reset(self):
+        self.j.set('quota', dict(agent='codex', resets_at=1000, message='limit'))
+        with patch.object(runner, 'QUOTA_GRACE', 60):
+            self.assertTrue(runner.resume_after_quota(self.j, now=1059))
+            self.assertEqual(self.j.db.execute('SELECT count(*) FROM inbox').fetchone()[0], 0)
+            self.assertFalse(runner.resume_after_quota(self.j, now=1060))
+        self.assertEqual(self.j.db.execute("SELECT count(*) FROM inbox WHERE id LIKE 'quota-resume-%'").fetchone()[0], 1)
+        self.assertFalse(runner.resume_after_quota(self.j, now=2000))
 
 
 if __name__ == '__main__':

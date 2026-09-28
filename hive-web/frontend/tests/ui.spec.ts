@@ -928,6 +928,33 @@ test("failed session explains why and queued session names what it waits for", a
   await expect(waiting).toContainText("codex on worker-a");
   await expect(waiting.locator("[data-state=failed]")).toBeVisible();
 });
+test("a quota-paused session says when its agent's quota resets, and so does its dependent", async ({ page }) => {
+  const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+  const time = new Date(resetsAt * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const label = `Paused: codex quota resets at ${time}`;
+  const paused = {
+    ...run,
+    state: "paused-quota",
+    metadata: { quota: { agent: "codex", resets_at: resetsAt, message: "You've hit your usage limit." } },
+  };
+  const queued = {
+    ...run,
+    id: "run-2",
+    state: "queued",
+    assignment: { ...run.assignment, key: "consumer", device: "worker-b", dependencies: ["codex-a"] },
+  };
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [paused, queued] }));
+  await page.route("**/api/runs/*/events*", (route) => route.fulfill({ json: [] }));
+  await page.goto("/session/?run=run-1");
+  await expect(page.locator(".bar [data-state=paused-quota]")).toHaveText(label);
+  await expect(page.getByTestId("quota-paused")).toContainText(label);
+  await expect(page.getByTestId("quota-paused")).toContainText("continues this conversation automatically");
+  // A pause is not a failure.
+  await expect(page.locator(".banner.bad")).toHaveCount(0);
+  await page.goto("/session/?run=run-2");
+  const waiting = page.locator(".banner", { hasText: "Waiting to start" });
+  await expect(waiting.locator("[data-state=paused-quota]")).toHaveText(label);
+});
 test("sessions page separates agent sessions by attention from terminals", async ({ page }) => {
   await page.route("**/api/sessions", (route) =>
     route.fulfill({

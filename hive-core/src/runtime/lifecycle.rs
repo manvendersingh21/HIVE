@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 
 use hacp::v2::contract::{ContractLimits, Relationship, Submission, Task, Verdict};
 use hacp::v2::{
-    canon, kinds, Artifact, Check, Contract, ContractError, ContractState, Envelope, Session,
-    Verification,
+    canon, kinds, Artifact, CapabilityGrant, Check, Contract, ContractError, ContractState, Envelope,
+    GrantLedger, OrgChart, ScopeElement, Session, Verification,
 };
 use serde_json::{json, Value};
 
@@ -73,10 +73,55 @@ const WORKER_FEATURES: &[&str] = &["delegation", "artifact-digest", "observer-ev
 
 /// Negotiation bounds (§7.4). Small on purpose: silence must not consent, and an
 /// unbounded loop between two agents that disagree is the deadlock the bound exists for.
+/// `max_rework` is finite so a verifier that keeps asking for repairs ends the contract
+/// as `Rejected` instead of looping; HIVE's own `RunConfig::max_rework` may stop sooner.
 const LIMITS: ContractLimits = ContractLimits {
     max_rounds: 3,
     max_amendments: 2,
+    max_rework: 2,
 };
+
+/// Validity window of the per-run delegation grants. Only formation checks it.
+const GRANT_VALIDITY_DAYS: i64 = 7;
+
+/// The authority a delegation contract is formed under (§8): the supervisor is the
+/// root of a one-level org chart, chartered by the deployment, and grants the worker.
+fn delegation_authority(
+    session_id: &str,
+    supervisor: &str,
+    worker: &str,
+    at: &str,
+) -> anyhow::Result<(OrgChart, GrantLedger, String)> {
+    let mut org = OrgChart::default();
+    org.parent_of.insert(worker.to_string(), supervisor.to_string());
+    let until = (chrono::DateTime::parse_from_rfc3339(at)? + chrono::Duration::days(GRANT_VALIDITY_DAYS))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let grant_id = |role: &str| format!("g-{}", &canon::digest_canonical(&format!("{session_id}-{role}"))[..24]);
+    let scopes = vec![ScopeElement { name: "delegation".into(), delegable: true }];
+    let charter_id = grant_id("charter");
+    let mut ledger = GrantLedger::default();
+    ledger.issue(
+        CapabilityGrant::charter(&charter_id, CapabilityGrant::DEPLOYMENT_CHARTERER, supervisor,
+            scopes.clone(), at, &until)?,
+        at,
+    )?;
+    let delegation_id = grant_id("delegation");
+    ledger.issue(
+        CapabilityGrant {
+            grant_id: delegation_id.clone(),
+            grantor: supervisor.to_string(),
+            grantee: worker.to_string(),
+            scopes,
+            valid_from: at.to_string(),
+            valid_until: until,
+            parent: Some(charter_id),
+            peer: None,
+        },
+        at,
+    )?;
+    Ok((org, ledger, delegation_id))
+}
 
 /// Everything accumulated as the run proceeds, so that a stop at any stage still
 /// produces a complete report rather than a bare error.
@@ -385,6 +430,8 @@ async fn drive(
     if let Err(e) = validate_terms(&terms) { fail!(Stage::Authoring, "{e}"); }
 
     // -- §7.3: propose ------------------------------------------------------
+    let formed_at = canon::canonical_now();
+    let (org, ledger, grant_id) = delegation_authority(session_id, a_urn, b_urn, &formed_at)?;
     let mut contract = Contract::propose(
         &session,
         contract_id,
@@ -394,6 +441,10 @@ async fn drive(
             owner: b_urn.to_string(),
         },
         Relationship::Delegation,
+        Some(grant_id),
+        Some(&org),
+        Some(&ledger),
+        Some(&formed_at),
         // §8.3: a delegation must declare where a dispute goes. Here that is the
         // supervising agent — one link, because this run has no deeper org yet.
         vec![a_urn.to_string()],
@@ -913,6 +964,14 @@ async fn drive(
         ContractState::Settled => RunOutcome::Settled {
             verdict: "accept".into(),
         },
+        ContractState::Rejected if matches!(verdict, Verdict::Rework { .. }) => {
+            let mut reasons = reasons;
+            reasons.insert(0, format!(
+                "rework budget exhausted: HACP allows {} rework verdict(s) and the verifier requested another ({})",
+                contract.limits.max_rework,
+                contract.rework_scope.clone().unwrap_or_default()));
+            RunOutcome::Rejected { reasons }
+        }
         ContractState::Rejected => RunOutcome::Rejected { reasons },
         state => RunOutcome::Failed {
             stage: Stage::Settlement,
@@ -2040,9 +2099,43 @@ mod tests {
             contract.rework_scope.as_deref(),
             Some("rewrite the status line")
         );
+        assert!(contract.grant_id.as_deref().is_some_and(|g| g.starts_with("g-")));
+        assert_eq!(contract.limits.max_rework, 2);
+        assert_eq!(contract.reworks, 1);
         let transcript = std::fs::read_to_string(r.transcript.unwrap()).unwrap();
         assert!(!transcript.contains(kinds::SESSION_CLOSE));
         assert_eq!(r.calls.len(), 4, "no implicit extra model spending");
+    }
+
+    #[tokio::test]
+    async fn exhausted_hacp_rework_budget_rejects_the_run() {
+        let s = Scratch::new("rework-exhausted");
+        let mut cfg = durable_config(s.join("run"));
+        cfg.max_rework = 3;
+        let rework = write("verdict.json", &json!({
+            "verdict": "rework", "checks": [{"name": "content", "passed": false, "detail": "revise it"}],
+            "reasons": ["rewrite the status line"],
+        }).to_string());
+        let host = FakeAgent::new(vec![
+            write("delegation-terms.json", &terms("status.txt")),
+            write("accept.json", &json!({"accepted": true}).to_string()),
+            write("status.txt", CONTENT), rework.clone(),
+            write("status.txt", CONTENT), rework.clone(),
+            write("status.txt", CONTENT), rework,
+        ]);
+        let r = run_bilateral(&host, &cfg).await.unwrap();
+        let reasons = match &r.outcome {
+            RunOutcome::Rejected { reasons } => reasons,
+            other => panic!("exhausted rework must reject, not loop or settle: {other:?}"),
+        };
+        assert!(reasons[0].contains("rework budget exhausted"), "{reasons:?}");
+        assert!(reasons[0].contains("allows 2 rework"), "{reasons:?}");
+        assert!(reasons.iter().any(|r| r == "rewrite the status line"), "{reasons:?}");
+        assert_eq!(r.outcome.exit_code(), 1);
+        assert_eq!(r.calls.len(), 8, "the fourth attempt HIVE allows is never spent");
+        assert!(!s.join("run/rework-state.json").exists());
+        let transcript = std::fs::read_to_string(r.transcript.unwrap()).unwrap();
+        assert!(transcript.contains(kinds::SESSION_CLOSE));
     }
 
     #[tokio::test]
@@ -2102,6 +2195,10 @@ mod tests {
                 owner: b.into(),
             },
             Relationship::Collaboration,
+            None,
+            None,
+            None,
+            None,
             vec![],
             LIMITS,
         )

@@ -130,7 +130,7 @@ export default function SessionPage() {
                       <span>
                         {s.assignment.agent} on {s.assignment.device}
                       </span>
-                      <StateChip state={s.state} />
+                      <StateChip state={s.state} run={s} />
                     </Link>
                   ))}
                 </div>

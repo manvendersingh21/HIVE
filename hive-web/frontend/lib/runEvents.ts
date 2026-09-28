@@ -461,6 +461,21 @@ export function stateTone(
   // The runner lost contact; nothing it was doing will finish on its own.
   if (state === "disconnected") return "stale";
   if (["launching", "working", "reviewing", "waiting-for-peer"].includes(state)) return "running";
-  if (state === "queued") return "queued";
+  // A quota pause resumes by itself after the reset, like a queued run starts.
+  if (["queued", "paused-quota"].includes(state)) return "queued";
   return "done";
+}
+
+export type Quota = { agent?: string; resets_at?: number; message?: string };
+
+// "Paused: codex quota resets at 3:05 PM" in the viewer's own time zone; a
+// reset beyond the next day also names the day.
+export function pausedLabel(quota: Quota | undefined, agent: string, now = Date.now()): string {
+  const who = quota?.agent || agent;
+  if (!quota?.resets_at) return `Paused: ${who} quota`;
+  const reset = new Date(quota.resets_at * 1000);
+  const time = reset.getTime() - now < 24 * 3600 * 1000
+    ? reset.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : reset.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  return `Paused: ${who} quota resets at ${time}`;
 }

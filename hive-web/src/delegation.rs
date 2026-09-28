@@ -31,27 +31,82 @@ fn error(e: anyhow::Error) -> Response {
     (StatusCode::BAD_REQUEST, e.to_string()).into_response()
 }
 
+/// Overall deadline for one delegation planning attempt. A deadline failure
+/// is retried once by [`crate::chat::plan_with_retry`]. The planner-slot
+/// wait is bounded by the whole-request budget (PLANNING_DEADLINE + retry),
+/// and NVIDIA's own overall deadline (120s by default) fits inside this budget.
+const PLANNING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
+
 pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
-    let result=async {
-        let agent=h.agent.as_ref().unwrap();
-        let history=h.history.as_ref().unwrap();
-        let context=history.context(&turn)?;
-        let plan=tokio::time::timeout(std::time::Duration::from_secs(240),delegation::plan(agent,&turn.user_input,&context.join("\n"))).await??;
-        let reply=start_plan(agent,&store(&h)?,&turn.id,&turn.conversation_id,&plan).await?;
-        // A detached run owns its own state. Finishing the receipt keeps this
-        // conversation's composer available while the real agents work.
-        history.finish(&turn.id,"completed",&plan.summary,Some(&reply))?;
-        Ok::<_,anyhow::Error>(reply)
-    }.await;
-    match result {
-        Ok(reply) => Json(reply).into_response(),
+    process_with_deadline_slots(h, turn, PLANNING_DEADLINE, &crate::chat::PLANNER_SLOTS).await
+}
+
+pub(crate) async fn process_with_deadline_slots(
+    h: AgentHandle,
+    turn: SavedTurn,
+    deadline: std::time::Duration,
+    slots: &tokio::sync::Semaphore,
+) -> Response {
+    let agent = match h.agent.as_ref() {
+        Some(a) => a,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "No agent configured").into_response(),
+    };
+    let history = match h.history.as_ref() {
+        Some(hist) => hist,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "No chat store configured").into_response(),
+    };
+    let context = match history.context(&turn) {
+        Ok(c) => c,
         Err(e) => {
-            if let Some(history) = &h.history {
-                let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
-            }
-            error(e)
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation context lookup failed");
+            let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
+            return error(e);
         }
+    };
+    let context_text = context.join("\n");
+    let plan = match crate::chat::plan_with_retry_slots(
+        slots,
+        || delegation::plan(agent, &turn.user_input, &context_text),
+        deadline,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(response) => {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&body).to_string();
+            // Every planning failure is recorded with the conversation it
+            // belongs to, so a lost plan is traceable from the logs alone.
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, status = %status, error = %text, "delegation planning failed");
+            let _ = history.finish(&turn.id, "failed", &text, None);
+            return (status, text).into_response();
+        }
+    };
+    let store = match store(&h) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation store lookup failed");
+            let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
+            return error(e);
+        }
+    };
+    let reply = match start_plan(agent, &store, &turn.id, &turn.conversation_id, &plan).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation plan startup failed");
+            let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
+            return error(e);
+        }
+    };
+    // A detached run owns its own state. Finishing the receipt keeps this
+    // conversation's composer available while the real agents work.
+    if let Err(e) = history.finish(&turn.id, "completed", &plan.summary, Some(&reply)) {
+        return error(e);
     }
+    Json(reply).into_response()
 }
 
 /// How long Hive gives one container to be created, image build included.
@@ -477,6 +532,10 @@ fn apply_runtime_evidence(attrs: &mut Value, metadata: &Value) -> bool {
     if metadata["available_models"].is_array() {
         attrs["models"] = metadata["available_models"].clone();
     }
+    // The latest provider usage the run saw is the placement's usage snapshot.
+    if metadata["usage"].is_object() {
+        attrs["usage"] = metadata["usage"].clone();
+    }
     *attrs != before
 }
 
@@ -550,6 +609,10 @@ const SESSION_ENDED: &str = "The agent's session has ended, so this run can't co
 /// asking its queued verifier a question could wait forever for its own finish.
 /// Each prerequisite is checked independently; a message cannot bypass another
 /// working or failed prerequisite. `messages` is the dependent's durable inbox.
+///
+/// A dependency paused on its provider quota has not failed: it resumes by
+/// itself after the reset, so its dependents stay queued. If it already handed
+/// its work over, a message naming a branch or commit, they start now.
 fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool, String> {
     let mut ready = true;
     for key in &run.assignment.dependencies {
@@ -559,10 +622,18 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
         for dependency in runs.iter().filter(|r| {
             r.task_id == run.task_id && &r.assignment.key == key && r.state != "superseded"
         }) {
+            let from_dependency = |message: &&Value| message["source"] == dependency.id;
             completed |= dependency.state == "completed";
             failed |= dependency.state == "failed";
             waiting_for_us |= dependency.state == "waiting-for-peer"
-                && messages.iter().any(|message| message["source"] == dependency.id);
+                && messages.iter().any(|message| from_dependency(&message));
+            waiting_for_us |= dependency.state == "paused-quota"
+                && messages
+                    .iter()
+                    .filter(from_dependency)
+                    .any(|message| {
+                        delegation::names_handoff(message["text"].as_str().unwrap_or(""))
+                    });
         }
         if completed {
             continue;
@@ -576,7 +647,8 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
 }
 
 /// States in which a launched run's tmux session must still exist.
-const LIVE_STATES: [&str; 4] = ["working", "awaiting-approval", "waiting-for-peer", "reviewing"];
+const LIVE_STATES: [&str; 5] =
+    ["working", "awaiting-approval", "waiting-for-peer", "reviewing", "paused-quota"];
 
 /// Whether the run's tmux session exists. `None` when the device couldn't be
 /// asked: an unreachable machine says nothing about the session.
@@ -636,6 +708,19 @@ async fn sync_run(
                 store.state(&run.id, "failed", &reason)?;
                 return Ok(());
             }
+        }
+        // Launching now would only pause at once; the run starts after the reset.
+        if let Some(until) = delegation::placement_quota(agent, &run.assignment)? {
+            let reason = format!(
+                "{}: {} {}",
+                run.assignment.device,
+                run.assignment.agent,
+                delegation::quota_note(until)
+            );
+            if run.metadata["reason"] != reason.as_str() {
+                store.state(&run.id, "queued", &reason)?;
+            }
+            return Ok(());
         }
         let record = agent
             .memory
@@ -796,7 +881,10 @@ async fn sync_run(
     // own catalog is recorded even when that first call failed, so the user
     // can explicitly pick another listed model.
     let metadata = &snapshot["metadata"];
-    if !metadata["invocation"].is_null() || metadata["available_models"].is_array() {
+    if !metadata["invocation"].is_null()
+        || metadata["available_models"].is_array()
+        || metadata["usage"].is_object()
+    {
         let id = hive_core::memory::graph::entity_id(
             "device-agent",
             &format!("{}/{}", run.assignment.device, run.assignment.agent),
@@ -937,6 +1025,44 @@ mod tests {
             history: None,
             master_name: "master".into(),
         }
+    }
+
+    fn handle_with_history() -> AgentHandle {
+        let agent = std::sync::Arc::new(hive_core::agent::MasterAgent::new(
+            hive_core::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            hive_core::workers::WorkerPool::new(vec![]),
+            hive_core::skills::SkillRegistry::new(),
+            hive_core::memory::MemorySystem::new(),
+        ));
+        AgentHandle::enabled(agent, "master".into()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn planning_deadline_failure_preserves_504_status() {
+        let h = handle_with_history();
+        let history = h.history.as_ref().unwrap();
+        let chat = history.create(None).unwrap();
+        let start_turn = history.begin(&chat.id, "req-1", "test prompt").unwrap();
+        let turn = match start_turn {
+            hive_core::memory::chats::StartTurn::New(t) => t,
+            _ => unreachable!(),
+        };
+        let slots = tokio::sync::Semaphore::new(2);
+        let response = process_with_deadline_slots(
+            h.clone(),
+            turn.clone(),
+            std::time::Duration::from_millis(20),
+            &slots,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Planning timed out"), "{text}");
+        assert!(text.contains("retry also timed out"), "{text}");
+
+        let saved = history.turn(&turn.id).unwrap().unwrap();
+        assert_eq!(saved.status, "failed");
     }
     #[tokio::test]
     async fn relay_audit_api_contains_only_public_evidence() {
@@ -1100,6 +1226,22 @@ mod tests {
         assert_eq!(attrs["invocation"]["model"], "zai/glm-5.2");
         assert!(!apply_runtime_evidence(&mut attrs, &json!({"invocation":null})));
         assert_eq!(attrs["invocation"]["model"], "zai/glm-5.2");
+    }
+
+    #[test]
+    fn placement_inventory_records_the_latest_usage_snapshot() {
+        let mut attrs = json!({"models":["gpt-5.5"],"invocation":null});
+        let first = json!({"usage":{"agent":"codex","used_percent":82,"resets_at":1_790_000_000,"exhausted":false}});
+        assert!(apply_runtime_evidence(&mut attrs, &first));
+        assert_eq!(attrs["usage"]["used_percent"], 82);
+        let exhausted = json!({"usage":{"agent":"codex","used_percent":100,"resets_at":1_790_003_600,"exhausted":true}});
+        assert!(apply_runtime_evidence(&mut attrs, &exhausted));
+        assert_eq!((attrs["usage"]["used_percent"].as_i64(), attrs["usage"]["resets_at"].as_i64()), (Some(100), Some(1_790_003_600)));
+        assert_eq!(delegation::quota_exhausted_until(&attrs, 1_790_000_000), Some(1_790_003_600));
+        // A snapshot without usage keeps the last one.
+        assert!(!apply_runtime_evidence(&mut attrs, &json!({"invocation":null})));
+        assert_eq!(attrs["usage"]["exhausted"], true);
+        assert_eq!(attrs["models"], json!(["gpt-5.5"]));
     }
 
     #[test]
