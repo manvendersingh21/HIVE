@@ -468,7 +468,7 @@ pub fn start(h: AgentHandle) {
                     }
                     for runs in tasks.values() {
                         if let Err(error) = delegation::review::task(agent, &store, runs).await {
-                            tracing::warn!(error=%error,"coordinator review incomplete");
+                            tracing::warn!(task_id=%runs[0].task_id,error=%error,"coordinator review incomplete");
                         }
                     }
                 }
