@@ -239,6 +239,18 @@ impl LlmRouter {
         self.zai.read().unwrap().is_some()
     }
 
+    /// Install a Z.AI client built from a key persisted in the master-agent
+    /// state file (`~/.hive/master-agent.json`) when — and only when — no
+    /// client was configured from `hive.toml`/`Z_AI` at startup: env/config
+    /// keys always take precedence over the persisted one. This only makes
+    /// the key available; it never changes the selected provider.
+    pub fn seed_zai_key_if_unconfigured(&self, api_key: String) {
+        let mut zai = self.zai.write().unwrap();
+        if zai.is_none() {
+            *zai = Some(Arc::new(ZaiClient::with_key(api_key)));
+        }
+    }
+
     /// Whether NVIDIA is configured, i.e. `NVIDIA_API_KEY_FLASH` is set.
     pub fn nvidia_configured(&self) -> bool {
         nvidia_key_configured()
@@ -459,7 +471,7 @@ fn extract_json(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hive_common::config::{LlmConfig, LocalLlmConfig, NvidiaConfig};
+    use hive_common::config::{CloudLlmConfig, LlmConfig, LocalLlmConfig, NvidiaConfig};
 
     fn base_config() -> LlmConfig {
         LlmConfig {
@@ -520,6 +532,31 @@ mod tests {
         let router = LlmRouter::from_config(&base_config());
         let err = router.set_provider(AiProvider::Claude, None).unwrap_err();
         assert!(err.to_string().contains("cannot be selected"), "{err}");
+    }
+
+    // Env/config precedence for the persisted key: a key resolved from
+    // `hive.toml`/`Z_AI` at startup is never replaced by the one stored in
+    // the master-agent state file, and an unconfigured router adopts the
+    // persisted key exactly once.
+    #[test]
+    fn persisted_zai_key_never_replaces_a_configured_one() {
+        let mut cfg = base_config();
+        cfg.zai = Some(CloudLlmConfig {
+            api_key: Some("config-key".into()),
+            model: "glm-test".into(),
+            ..CloudLlmConfig::default()
+        });
+        let router = LlmRouter::from_config(&cfg);
+        assert!(router.zai_configured());
+        router.seed_zai_key_if_unconfigured("file-key".into());
+        let zai = router.zai.read().unwrap().clone().unwrap();
+        assert_eq!(zai.api_key(), "config-key");
+
+        let bare = LlmRouter::from_config(&base_config());
+        bare.seed_zai_key_if_unconfigured("file-key".into());
+        bare.seed_zai_key_if_unconfigured("later-key".into());
+        let zai = bare.zai.read().unwrap().clone().unwrap();
+        assert_eq!(zai.api_key(), "file-key");
     }
 
     // The core "turn off local qwen" invariant: once Z.AI is the sole

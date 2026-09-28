@@ -218,22 +218,221 @@ fn parse_probe(name: &str, host: &str, tags: Vec<String>, raw: &str) -> MachineF
     facts
 }
 
-/// Probe the master itself.
-pub async fn probe_local(name: &str) -> MachineFacts {
-    let output = tokio::process::Command::new("sh")
+static CACHED_LOGIN_PATH: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+const PATH_SENTINEL: &str = "__HIVE_PATH__=";
+
+/// Query a login shell with explicit shell, home directory, and fallback PATH.
+/// Runs with `.env_clear()` and explicit environment variables so process-wide
+/// environment variables are never mutated or leaked.
+pub async fn query_login_path_with(
+    shell: &std::path::Path,
+    home: &std::path::Path,
+    fallback: &str,
+) -> (String, bool) {
+    let mut std_cmd = std::process::Command::new(shell);
+    std_cmd
+        .env_clear()
+        .env("HOME", home)
+        .env("SHELL", shell)
+        .env("PATH", fallback)
+        .args(["-lic", "printf '\\n__HIVE_PATH__=%s\\n' \"$PATH\""]);
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        std_cmd.pre_exec(|| {
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.kill_on_drop(true);
+
+    match tokio::time::timeout(std::time::Duration::from_secs(3), cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some((_, val)) = text.rsplit_once(PATH_SENTINEL) {
+                let s = val.lines().next().unwrap_or("").trim().to_string();
+                if s.is_empty() {
+                    (fallback.to_string(), false)
+                } else {
+                    (s, true)
+                }
+            } else {
+                (fallback.to_string(), false)
+            }
+        }
+        _ => (fallback.to_string(), false),
+    }
+}
+
+pub fn query_login_path_sync_with(
+    shell: &std::path::Path,
+    home: &std::path::Path,
+    fallback: &str,
+) -> (String, bool) {
+    let mut std_cmd = std::process::Command::new(shell);
+    std_cmd
+        .env_clear()
+        .env("HOME", home)
+        .env("SHELL", shell)
+        .env("PATH", fallback)
+        .args(["-lic", "printf '\\n__HIVE_PATH__=%s\\n' \"$PATH\""]);
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        std_cmd.pre_exec(|| {
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+
+    match std_cmd.output() {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some((_, val)) = text.rsplit_once(PATH_SENTINEL) {
+                let s = val.lines().next().unwrap_or("").trim().to_string();
+                if s.is_empty() {
+                    (fallback.to_string(), false)
+                } else {
+                    (s, true)
+                }
+            } else {
+                (fallback.to_string(), false)
+            }
+        }
+        _ => (fallback.to_string(), false),
+    }
+}
+
+fn system_shell_env() -> (std::path::PathBuf, std::path::PathBuf, String) {
+    let shell = std::env::var_os("SHELL")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::PathBuf::from("/bin/sh"));
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let fallback =
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    (shell, home, fallback)
+}
+
+/// Resolve PATH from a specific login shell and HOME directory without mutating process environment.
+pub async fn resolve_login_path_with(
+    shell: &std::path::Path,
+    home: &std::path::Path,
+    fallback: &str,
+) -> String {
+    query_login_path_with(shell, home, fallback).await.0
+}
+
+/// Synchronously retrieve the cached login PATH, or resolve it if not yet cached.
+pub fn login_path() -> String {
+    if let Ok(guard) = CACHED_LOGIN_PATH.read() {
+        if let Some(ref path) = *guard {
+            return path.clone();
+        }
+    }
+    let (shell, home, fallback) = system_shell_env();
+    let (path, success) = query_login_path_sync_with(&shell, &home, &fallback);
+    if success {
+        if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
+            *guard = Some(path.clone());
+        }
+    }
+    path
+}
+
+/// Resolve PATH from the user's login shell once and cache it.
+pub async fn resolve_login_path() -> String {
+    if let Ok(guard) = CACHED_LOGIN_PATH.read() {
+        if let Some(ref path) = *guard {
+            return path.clone();
+        }
+    }
+    let (shell, home, fallback) = system_shell_env();
+    let (resolved, success) = query_login_path_with(&shell, &home, &fallback).await;
+    if success {
+        if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
+            *guard = Some(resolved.clone());
+        }
+    }
+    resolved
+}
+
+#[cfg(test)]
+pub async fn reset_cached_login_path() {
+    if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
+        *guard = None;
+    }
+}
+
+/// Command to run the local probe through a specific PATH environment.
+pub fn local_probe_command_with_path(path: &str) -> tokio::process::Command {
+    let mut std_cmd = std::process::Command::new("sh");
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        std_cmd.pre_exec(|| {
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.env("PATH", path)
         .arg("-c")
         .arg(probe_script())
-        .output()
-        .await;
+        .kill_on_drop(true);
+    cmd
+}
+
+/// Command to run the local probe through the user's login shell environment.
+pub async fn local_probe_command() -> tokio::process::Command {
+    let path = resolve_login_path().await;
+    local_probe_command_with_path(&path)
+}
+
+/// Shell command to run the remote probe through a login shell over SSH.
+pub fn remote_probe_command() -> String {
+    format!("bash -lc {}", shell_quote(&probe_script()))
+}
+
+/// Probe the master with explicit shell, home directory, and fallback PATH.
+pub async fn probe_local_with(
+    name: &str,
+    shell: &std::path::Path,
+    home: &std::path::Path,
+    fallback: &str,
+) -> MachineFacts {
+    let path = resolve_login_path_with(shell, home, fallback).await;
+    let mut cmd = local_probe_command_with_path(&path);
+    let output = tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await;
 
     match output {
-        Ok(out) => parse_probe(
+        Ok(Ok(out)) if out.status.success() => parse_probe(
             name,
             "local",
             vec!["master".to_string()],
             &String::from_utf8_lossy(&out.stdout),
         ),
-        Err(e) => {
+        Ok(Ok(out)) => {
+            warn!(status = ?out.status, "local machine probe failed");
+            MachineFacts {
+                name: name.to_string(),
+                host: "local".into(),
+                reachable: false,
+                ..Default::default()
+            }
+        }
+        Ok(Err(e)) => {
             warn!(error = %e, "local machine probe failed");
             MachineFacts {
                 name: name.to_string(),
@@ -242,7 +441,22 @@ pub async fn probe_local(name: &str) -> MachineFacts {
                 ..Default::default()
             }
         }
+        Err(_) => {
+            warn!("local machine probe timed out");
+            MachineFacts {
+                name: name.to_string(),
+                host: "local".into(),
+                reachable: false,
+                ..Default::default()
+            }
+        }
     }
+}
+
+/// Probe the master itself.
+pub async fn probe_local(name: &str) -> MachineFacts {
+    let (shell, home, fallback) = system_shell_env();
+    probe_local_with(name, &shell, &home, &fallback).await
 }
 
 /// Probe a worker over SSH. An unreachable worker still produces facts — with
@@ -267,7 +481,7 @@ pub async fn probe_remote(name: &str, ssh_target: &str, tags: Vec<String>) -> Ma
         // A login shell, so PATH additions like ~/.local/bin are visible — the
         // same reason session launches use `bash -lc`.
         worker
-            .run(&format!("bash -lc {}", shell_quote(&probe_script())))
+            .run(&remote_probe_command())
             .await
     };
 
@@ -861,7 +1075,6 @@ mod tests {
         assert!(text.contains("ubuntu-24.04"));
         assert!(text.contains("agentic-cli"));
     }
-}
     #[test]
     fn every_supported_agent_cli_is_discoverable_as_a_capability() {
         for cli in crate::runtime::cli::KNOWN {
@@ -888,3 +1101,13 @@ mod tests {
         }
         assert!(probe_script().contains(MAC_MEMORY_AWK));
     }
+
+    #[test]
+    fn remote_probe_uses_login_shell() {
+        assert!(remote_probe_command().starts_with("bash -lc "));
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod memory_tests;

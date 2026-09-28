@@ -53,9 +53,10 @@ may still change without a deprecation period.
 ### Fixed
 
 - NVIDIA planning no longer fails wholesale with "NVIDIA request deadline
-  exceeded": each HTTP attempt now gets a per-attempt timeout (a fraction of
-  the overall deadline), so a hung first attempt is cut off and its retries
-  still run inside the overall deadline, which remains the hard cap.
+  exceeded": the first attempt gets ~80s of the 120s deadline (so a healthy but
+  slow generation still completes on the first try), and a hung first attempt is
+  cut off with the remainder left for its retry (only on connect errors or 5xx).
+  The overall deadline remains the hard cap.
 - Planning failures in the delegation chat path are logged with `warn!`
   including the conversation ID and the error, and the planner is bounded by
   a semaphore (max 2 concurrent calls) so simultaneous chats cannot overload
@@ -63,11 +64,28 @@ may still change without a deprecation period.
 - A chat message whose planning deadline fires is retried once automatically;
   if the retry also times out, the user sees an actionable message (no
   commands were executed; resend the message) instead of a bare timeout.
+- The master-agent provider selection and any Z.ai key entered in the
+  settings UI are now persisted robustly: `~/.hive/master-agent.json`
+  (relocatable via `HIVE_MASTER_AGENT_FILE`) is written atomically with
+  `0600` permissions, re-applied at startup below env/`hive.toml`
+  precedence, and never echoed by the API or logs. A corrupt state file is
+  ignored instead of affecting startup. See
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- Peer dependency deadlocks: a queued verifier can start when its implementer
+  is waiting for a peer with a pending message addressed to that verifier.
+  Other working or failed prerequisites still block launch. Plans can declare
+  `peer_dependencies` for required replies or agreements; validation rejects
+  peers queued directly or transitively behind their asker. Waiting runs explain
+  when a requested peer is queued behind them, across repeated sync cycles.
 - `config/workers.toml` is no longer tracked. It describes a specific fleet,
   including real hostnames and SSH account names; copy
   `config/workers.example.toml` instead.
 - The mock planning response in `scripts/check-nvidia.py` omitted the
   `target_machine` field that plan validation requires, failing CI on every run.
+- Local machine probe in `machines.rs`, delegation launch in `hive-core/src/delegation/transport.rs local_shell`,
+  and session launch in `hive-web/src/sessions.rs` now resolve and inherit the user's login-shell PATH
+  (with timeout and caching) with close-on-exec fd isolation, so tools added via shell profiles
+  (e.g. `~/.cargo/bin`, `~/.opencode/bin`, `~/.local/bin`) are discovered and executable without hardcoding or fd leakage.
 
 ### Known limitations
 

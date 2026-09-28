@@ -98,7 +98,7 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
         WorkersConfig::from_project_root(root).unwrap_or(WorkersConfig { workers: vec![] });
 
     let llm = LlmRouter::from_config(&config.llm);
-    chat::apply_persisted_master_agent(&llm);
+    chat::apply_persisted_master_agent(&llm, &config.llm);
 
     // History remains readable even when the configured inference server is down.
     if llm.uses_local_startup() && !llm.local_available().await {

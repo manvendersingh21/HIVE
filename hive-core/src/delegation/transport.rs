@@ -102,10 +102,21 @@ fn remote_shell(worker: &WorkerInfo, command: &str) -> Command {
 const LOCAL_ENV: [&str; 6] = ["HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR"];
 
 pub fn local_shell(command: &str) -> Command {
-    let mut cmd = Command::new("/bin/sh");
+    let mut std_cmd = std::process::Command::new("/bin/sh");
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        std_cmd.pre_exec(|| {
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    let mut cmd = Command::from(std_cmd);
     cmd.env_clear()
         .envs(LOCAL_ENV.iter().filter_map(|k| Some((*k, std::env::var_os(k)?))))
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("PATH", crate::memory::machines::login_path())
         .arg("-c")
         .arg(format!("{}; {command}", crate::workers::ssh::REMOTE_PATH));
     if let Some(home) = std::env::var_os("HOME") {
@@ -230,5 +241,14 @@ mod tests {
         let err = ssh(&coordinator(), "echo nope >&2; exit 3", None).await.unwrap_err();
         assert_eq!(err.to_string(), "mac-mini: nope\n");
         assert!(ssh_timeout(&coordinator(), "sleep 5", None, 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn coordinator_commands_use_login_shell_path() {
+        let expected = crate::memory::machines::login_path();
+        let out = ssh(&coordinator(), "printf '%s' \"$PATH\"", None)
+            .await
+            .unwrap();
+        assert!(out.contains(&expected));
     }
 }
