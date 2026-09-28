@@ -1,35 +1,15 @@
-//! Tests for machines memory module and local/remote probe commands.
+//! Behavioural tests for local machine probe and login shell PATH resolution.
 
 use super::*;
 
-#[test]
-fn test_local_and_remote_probe_commands_use_login_shell() {
-    let cmd = local_probe_command();
-    let program = cmd.as_std().get_program().to_string_lossy();
-    assert!(
-        program.contains("bash") || program.contains("sh"),
-        "local probe program should be a shell: {program}"
-    );
-    let args: Vec<String> = cmd
-        .as_std()
-        .get_args()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    assert!(
-        args.iter().any(|arg| arg == "-l" || arg == "-lc" || arg.contains("-l")),
-        "local probe must run with login shell flag (-l): {args:?}"
-    );
-    let remote_cmd = remote_probe_command();
-    assert!(
-        remote_cmd.contains("bash -lc") || remote_cmd.contains("bash -l -c"),
-        "remote probe must use login shell: {remote_cmd}"
-    );
-}
-
 #[tokio::test]
 #[cfg(unix)]
-async fn test_local_probe_reports_tools_from_login_shell_profile() {
+async fn local_probe_reports_tools_from_login_shell_profile() {
     use std::os::unix::fs::PermissionsExt;
+
+    // Mutex to avoid concurrency interference with environment variables and cache
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _lock = TEST_LOCK.lock().await;
 
     struct TempDir {
         path: std::path::PathBuf,
@@ -51,19 +31,38 @@ async fn test_local_probe_reports_tools_from_login_shell_profile() {
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir { path }
     };
+
     let bin_dir = temp_dir.path.join("bin");
     std::fs::create_dir_all(&bin_dir).expect("bin dir");
 
+    // Stub cargo binary (probed tool)
     let stub_cargo = bin_dir.join("cargo");
     std::fs::write(&stub_cargo, "#!/bin/sh\necho cargo 1.80.0\n").expect("write stub");
     std::fs::set_permissions(&stub_cargo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-    let profile_content = format!("export PATH=\"{}:$PATH\"\n", bin_dir.display());
-    std::fs::write(temp_dir.path.join(".profile"), &profile_content).expect("write .profile");
-    std::fs::write(temp_dir.path.join(".bash_profile"), &profile_content).expect("write .bash_profile");
+    // Fake shell profile that adds the stub bin directory to PATH
+    let profile = temp_dir.path.join(".profile");
+    std::fs::write(
+        &profile,
+        format!("export PATH=\"{}:$PATH\"\n", bin_dir.display()),
+    )
+    .expect("profile");
+
+    // Fake SHELL script that sources ~/.profile when run as a login shell
+    let fake_shell = temp_dir.path.join("fake_shell.sh");
+    let fake_shell_content = r#"#!/bin/sh
+if [ -f "$HOME/.profile" ]; then
+    . "$HOME/.profile"
+fi
+exec /bin/sh "$@"
+"#;
+    std::fs::write(&fake_shell, fake_shell_content).expect("fake shell");
+    std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
 
     struct EnvGuard {
         home: Option<std::ffi::OsString>,
+        shell: Option<std::ffi::OsString>,
         path: Option<std::ffi::OsString>,
     }
     impl Drop for EnvGuard {
@@ -72,6 +71,11 @@ async fn test_local_probe_reports_tools_from_login_shell_profile() {
                 std::env::set_var("HOME", h);
             } else {
                 std::env::remove_var("HOME");
+            }
+            if let Some(ref s) = self.shell {
+                std::env::set_var("SHELL", s);
+            } else {
+                std::env::remove_var("SHELL");
             }
             if let Some(ref p) = self.path {
                 std::env::set_var("PATH", p);
@@ -83,27 +87,33 @@ async fn test_local_probe_reports_tools_from_login_shell_profile() {
 
     let _guard = EnvGuard {
         home: std::env::var_os("HOME"),
+        shell: std::env::var_os("SHELL"),
         path: std::env::var_os("PATH"),
     };
 
     std::env::set_var("HOME", &temp_dir.path);
+    std::env::set_var("SHELL", &fake_shell);
     std::env::set_var("PATH", "/usr/bin:/bin");
+
+    reset_cached_login_path().await;
 
     let facts = probe_local("test-master").await;
 
+    reset_cached_login_path().await;
+
     assert!(
         facts.reachable,
-        "probe must succeed with fake HOME"
+        "probe must succeed with fake login shell and HOME"
     );
     assert!(
         facts.tools.contains(&"cargo".to_string()),
-        "probe must report cargo added to PATH by login shell profile, got tools: {:?}",
+        "probe must report stub tool found on login shell PATH: {:?}",
         facts.tools
     );
 }
 
 #[tokio::test]
 #[cfg(not(unix))]
-async fn test_local_probe_reports_tools_from_login_shell_profile() {
+async fn local_probe_reports_tools_from_login_shell_profile() {
     // Cleanly skipped on non-unix platforms
 }

@@ -148,7 +148,7 @@ pub async fn create_on(
     match kind.launch_command() {
         Some(program) => command.push_str(&format!(
             " {shell} -lc {}",
-            quote(&format!("{}; export PATH=\"$HOME/.cargo/bin:$PATH\"; {program}; exec {shell} -l", hive_core::workers::ssh::REMOTE_PATH))
+            quote(&format!("{program}; exec {shell} -l"))
         )),
         None => command.push_str(&format!(" {shell} -l")),
     }
@@ -266,13 +266,13 @@ pub async fn create(name: &str, kind: Kind, working_dir: Option<&str>) -> anyhow
     if let Some(dir) = working_dir {
         cmd.args(["-c", dir]);
     }
-    // Login shell so ~/.local/bin and ~/.cargo/bin (claude, codex) are on PATH. Without `-l`
-    // the tools resolve only for interactive logins, not for what we spawn.
+    let login_path = hive_core::memory::machines::resolve_login_path().await;
+    cmd.env("PATH", &login_path);
     match kind.launch_command() {
         Some(program) => cmd.args([
             "bash",
             "-lc",
-            &format!("{}; export PATH=\"$HOME/.cargo/bin:$PATH\"; {program}; exec bash -l", hive_core::workers::ssh::REMOTE_PATH),
+            &format!("export PATH={}; {program}; exec bash -l", quote(&login_path)),
         ]),
         None => cmd.args(["bash", "-l"]),
     };

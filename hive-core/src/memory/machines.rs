@@ -218,12 +218,68 @@ fn parse_probe(name: &str, host: &str, tags: Vec<String>, raw: &str) -> MachineF
     facts
 }
 
-/// Command to run the local probe through the user's login shell.
-pub fn local_probe_command() -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("bash");
-    // A login shell, so PATH additions like ~/.cargo/bin and ~/.local/bin are
-    // visible from shell profiles — matching remote probe and session launches.
-    cmd.args(["-l", "-c", &probe_script()]);
+static CACHED_LOGIN_PATH: tokio::sync::RwLock<Option<String>> = tokio::sync::RwLock::const_new(None);
+
+/// Query the user's login shell once to resolve PATH additions from shell profiles.
+async fn query_login_path() -> String {
+    let fallback = || {
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string())
+    };
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let shell = if shell.trim().is_empty() {
+        "/bin/sh".to_string()
+    } else {
+        shell
+    };
+
+    let mut cmd = tokio::process::Command::new(&shell);
+    cmd.args(["-lic", "printf %s \"$PATH\""])
+        .kill_on_drop(true);
+
+    match tokio::time::timeout(std::time::Duration::from_secs(3), cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() {
+                fallback()
+            } else {
+                s
+            }
+        }
+        _ => fallback(),
+    }
+}
+
+/// Resolve PATH from the user's login shell once and cache it.
+pub async fn resolve_login_path() -> String {
+    {
+        let guard = CACHED_LOGIN_PATH.read().await;
+        if let Some(ref path) = *guard {
+            return path.clone();
+        }
+    }
+    let mut guard = CACHED_LOGIN_PATH.write().await;
+    if let Some(ref path) = *guard {
+        return path.clone();
+    }
+    let resolved = query_login_path().await;
+    *guard = Some(resolved.clone());
+    resolved
+}
+
+#[cfg(test)]
+pub async fn reset_cached_login_path() {
+    let mut guard = CACHED_LOGIN_PATH.write().await;
+    *guard = None;
+}
+
+/// Command to run the local probe through the user's login shell environment.
+pub async fn local_probe_command() -> tokio::process::Command {
+    let path = resolve_login_path().await;
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.env("PATH", path)
+        .arg("-c")
+        .arg(probe_script())
+        .kill_on_drop(true);
     cmd
 }
 
@@ -234,19 +290,36 @@ pub fn remote_probe_command() -> String {
 
 /// Probe the master itself.
 pub async fn probe_local(name: &str) -> MachineFacts {
-    let output = local_probe_command()
-        .output()
-        .await;
+    let mut cmd = local_probe_command().await;
+    let output = tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await;
 
     match output {
-        Ok(out) => parse_probe(
+        Ok(Ok(out)) if out.status.success() => parse_probe(
             name,
             "local",
             vec!["master".to_string()],
             &String::from_utf8_lossy(&out.stdout),
         ),
-        Err(e) => {
+        Ok(Ok(out)) => {
+            warn!(status = ?out.status, "local machine probe failed");
+            MachineFacts {
+                name: name.to_string(),
+                host: "local".into(),
+                reachable: false,
+                ..Default::default()
+            }
+        }
+        Ok(Err(e)) => {
             warn!(error = %e, "local machine probe failed");
+            MachineFacts {
+                name: name.to_string(),
+                host: "local".into(),
+                reachable: false,
+                ..Default::default()
+            }
+        }
+        Err(_) => {
+            warn!("local machine probe timed out");
             MachineFacts {
                 name: name.to_string(),
                 host: "local".into(),
@@ -901,110 +974,8 @@ mod tests {
     }
 
     #[test]
-    fn local_and_remote_probe_commands_use_login_shell() {
-        let cmd = local_probe_command();
-        let program = cmd.as_std().get_program().to_string_lossy();
-        assert!(
-            program.contains("bash") || program.contains("sh"),
-            "local probe program should be a shell: {program}"
-        );
-        let args: Vec<String> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            args.iter().any(|arg| arg == "-l" || arg == "-lc" || arg.contains("-l")),
-            "local probe must run with login shell flag (-l): {args:?}"
-        );
-        let remote_cmd = remote_probe_command();
-        assert!(
-            remote_cmd.contains("bash -lc") || remote_cmd.contains("bash -l -c"),
-            "remote probe must use login shell: {remote_cmd}"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn local_probe_reports_tools_from_login_shell_profile() {
-        use std::os::unix::fs::PermissionsExt;
-
-        struct TempDir {
-            path: std::path::PathBuf,
-        }
-        impl Drop for TempDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.path);
-            }
-        }
-        let temp_dir = {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static N: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "hive-probe-test-{}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&path).expect("create temp dir");
-            TempDir { path }
-        };
-        let bin_dir = temp_dir.path.join("bin");
-        std::fs::create_dir_all(&bin_dir).expect("bin dir");
-
-        let stub_cargo = bin_dir.join("cargo");
-        std::fs::write(&stub_cargo, "#!/bin/sh\necho cargo 1.80.0\n").expect("write stub");
-        std::fs::set_permissions(&stub_cargo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        // Write profile exports so login shell picks up the stub binary on PATH
-        let profile_content = format!("export PATH=\"{}:$PATH\"\n", bin_dir.display());
-        std::fs::write(temp_dir.path.join(".profile"), &profile_content).expect("write .profile");
-        std::fs::write(temp_dir.path.join(".bash_profile"), &profile_content).expect("write .bash_profile");
-
-        struct EnvGuard {
-            home: Option<std::ffi::OsString>,
-            path: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                if let Some(ref h) = self.home {
-                    std::env::set_var("HOME", h);
-                } else {
-                    std::env::remove_var("HOME");
-                }
-                if let Some(ref p) = self.path {
-                    std::env::set_var("PATH", p);
-                } else {
-                    std::env::remove_var("PATH");
-                }
-            }
-        }
-
-        let _guard = EnvGuard {
-            home: std::env::var_os("HOME"),
-            path: std::env::var_os("PATH"),
-        };
-
-        std::env::set_var("HOME", &temp_dir.path);
-        std::env::set_var("PATH", "/usr/bin:/bin");
-
-        let facts = probe_local("test-master").await;
-
-        assert!(
-            facts.reachable,
-            "probe must succeed with fake HOME"
-        );
-        assert!(
-            facts.tools.contains(&"cargo".to_string()),
-            "probe must report cargo added to PATH by login shell profile, got tools: {:?}",
-            facts.tools
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(not(unix))]
-    async fn local_probe_reports_tools_from_login_shell_profile() {
-        // Cleanly skipped on non-unix platforms
+    fn remote_probe_uses_login_shell() {
+        assert!(remote_probe_command().starts_with("bash -lc "));
     }
 }
 
