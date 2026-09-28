@@ -31,12 +31,33 @@ fn error(e: anyhow::Error) -> Response {
     (StatusCode::BAD_REQUEST, e.to_string()).into_response()
 }
 
+/// Overall deadline for one delegation planning attempt. A deadline failure
+/// is retried once by [`crate::chat::plan_with_retry`].
+const PLANNING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// Flatten a planner HTTP error into a loggable, storable error so every
+/// planning failure keeps the same durable failure path.
+async fn planning_error(response: Response) -> anyhow::Error {
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap_or_default();
+    anyhow::anyhow!("HTTP {status}: {}", String::from_utf8_lossy(&body))
+}
+
 pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
     let result=async {
         let agent=h.agent.as_ref().unwrap();
         let history=h.history.as_ref().unwrap();
         let context=history.context(&turn)?;
-        let plan=tokio::time::timeout(std::time::Duration::from_secs(240),delegation::plan(agent,&turn.user_input,&context.join("\n"))).await??;
+        let context_text=context.join("\n");
+        let plan=match crate::chat::plan_with_retry(
+            ||delegation::plan(agent,&turn.user_input,&context_text),
+            PLANNING_DEADLINE,
+        ).await{
+            Ok(plan)=>plan,
+            Err(response)=>return Err(planning_error(response).await),
+        };
         let reply=start_plan(agent,&store(&h)?,&turn.id,&turn.conversation_id,&plan).await?;
         // A detached run owns its own state. Finishing the receipt keeps this
         // conversation's composer available while the real agents work.
@@ -46,6 +67,9 @@ pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
     match result {
         Ok(reply) => Json(reply).into_response(),
         Err(e) => {
+            // Every planning failure is recorded with the conversation it
+            // belongs to, so a lost plan is traceable from the logs alone.
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation planning failed");
             if let Some(history) = &h.history {
                 let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
             }

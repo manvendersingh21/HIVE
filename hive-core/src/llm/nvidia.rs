@@ -3,6 +3,9 @@ use hive_common::config::NvidiaConfig;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// How many attempts a single POST gets inside the overall deadline.
+const ATTEMPTS: u32 = 3;
+
 pub struct NvidiaClient {
     http: reqwest::Client,
     key: Option<String>,
@@ -32,19 +35,28 @@ impl NvidiaClient {
         }
     }
 
+    /// Timeout for one attempt: a fraction of the overall deadline, so a
+    /// first attempt that hangs is cut off early enough for its retries to
+    /// still run. The overall deadline around the whole loop stays the hard
+    /// cap.
+    fn per_attempt_timeout(&self) -> Duration {
+        (self.deadline / ATTEMPTS).max(Duration::from_millis(1))
+    }
+
     async fn post(&self, path: &str, body: Value) -> anyhow::Result<Value> {
         let key = self
             .key
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("NVIDIA is not configured: set {}", self.key_env))?;
+        let per_attempt = self.per_attempt_timeout();
         tokio::time::timeout(self.deadline, async {
-            for attempt in 0..3 {
+            for attempt in 0..ATTEMPTS {
                 let response = self
                     .http
                     .post(format!("{}/{path}", self.base_url))
                     .bearer_auth(key)
                     .json(&body)
-                    .timeout(self.deadline)
+                    .timeout(per_attempt)
                     .send()
                     .await;
                 match response {
@@ -205,7 +217,10 @@ pub(crate) mod tests {
                     let mut eof = [0u8; 1];
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {},
-                        _ = stream.read(&mut eof) => return,
+                        // The client gave up on this attempt (e.g. its
+                        // per-attempt timeout fired): skip this reply and
+                        // let the next scripted reply serve the retry.
+                        _ = stream.read(&mut eof) => continue,
                     }
                 }
                 let body = body.to_string();
@@ -312,6 +327,26 @@ pub(crate) mod tests {
         ])
         .await;
         assert_eq!(router(url).local_complete("x").await.unwrap(), "ok");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_hung_first_attempt_is_cut_off_and_the_retry_succeeds() {
+        // The first reply hangs past the per-attempt timeout (a third of the
+        // overall deadline) but well inside the overall deadline itself.
+        let (url, requests, task) = server(vec![
+            (200, answer("late"), Duration::from_millis(400)),
+            (200, answer("retried"), Duration::ZERO),
+        ])
+        .await;
+        let mut r = router(url);
+        r.nvidia.deadline = Duration::from_millis(900);
+        let start = std::time::Instant::now();
+        assert_eq!(r.local_complete("x").await.unwrap(), "retried");
+        // Success must come from the retry, before the overall deadline and
+        // without waiting for the hung first attempt to finish.
+        assert!(start.elapsed() < Duration::from_millis(900));
         task.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
     }

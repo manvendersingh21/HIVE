@@ -52,6 +52,17 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- NVIDIA planning no longer fails wholesale with "NVIDIA request deadline
+  exceeded": each HTTP attempt now gets a per-attempt timeout (a fraction of
+  the overall deadline), so a hung first attempt is cut off and its retries
+  still run inside the overall deadline, which remains the hard cap.
+- Planning failures in the delegation chat path are logged with `warn!`
+  including the conversation ID and the error, and the planner is bounded by
+  a semaphore (max 2 concurrent calls) so simultaneous chats cannot overload
+  the model endpoint.
+- A chat message whose planning deadline fires is retried once automatically;
+  if the retry also times out, the user sees an actionable message (no
+  commands were executed; resend the message) instead of a bare timeout.
 - `config/workers.toml` is no longer tracked. It describes a specific fleet,
   including real hostnames and SSH account names; copy
   `config/workers.example.toml` instead.

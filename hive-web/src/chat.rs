@@ -26,14 +26,24 @@ use tracing::{info, warn};
 const PLANNING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 const CONTINUATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Bounds how many planner calls run at once. The planner hits a single
+/// upstream model endpoint; two concurrent plans is the most it serves
+/// without timing out.
+static PLANNER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 // Bound the whole planning phase, including sequential model and memory calls.
 // This future never executes commands, so dropping it on timeout is safe.
-async fn bounded_plan(
-    plan: impl std::future::Future<Output = anyhow::Result<PlannedRun>>,
+// A permit is held for the whole call, bounding concurrent planner calls.
+async fn bounded_plan<T>(
+    plan: impl std::future::Future<Output = anyhow::Result<T>>,
     deadline: std::time::Duration,
-) -> Result<PlannedRun, Response> {
+) -> Result<T, Response> {
+    let _permit = PLANNER_SLOTS
+        .acquire()
+        .await
+        .expect("planner semaphore is never closed");
     match tokio::time::timeout(deadline, plan).await {
-        Ok(Ok(plan)) => Ok(plan),
+        Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => {
             warn!(error = %e, "planning failed");
             Err((StatusCode::BAD_GATEWAY, format!("planning failed: {e}")).into_response())
@@ -42,9 +52,39 @@ async fn bounded_plan(
             warn!("total planning deadline exceeded");
             Err((
                 StatusCode::GATEWAY_TIMEOUT,
-                "Planning timed out. No commands were executed from this planning round. Earlier results, if any, remain saved.",
+                "Planning timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
             )
                 .into_response())
+        }
+    }
+}
+
+/// One automatic retry of the whole plan when its deadline fires: a transient
+/// provider stall should not lose the user's message. A deadline failure on
+/// the retry as well becomes a user-facing explanation instead of a bare
+/// timeout.
+pub(crate) async fn plan_with_retry<T, F, Fut>(
+    make_plan: F,
+    deadline: std::time::Duration,
+) -> Result<T, Response>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match bounded_plan(make_plan(), deadline).await {
+        Ok(plan) => Ok(plan),
+        Err(response) if response.status() != StatusCode::GATEWAY_TIMEOUT => Err(response),
+        Err(_) => {
+            warn!("planning deadline exceeded; retrying the whole plan once");
+            match bounded_plan(make_plan(), deadline).await {
+                Ok(plan) => Ok(plan),
+                Err(response) if response.status() == StatusCode::GATEWAY_TIMEOUT => Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Planning timed out and one automatic retry also timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message in a moment, and if it keeps timing out, try a shorter or simpler request.",
+                )
+                    .into_response()),
+                Err(response) => Err(response),
+            }
         }
     }
 }
@@ -303,8 +343,8 @@ async fn process_chat(h: AgentHandle, turn: SavedTurn) -> Response {
         Ok(history) => history,
         Err(e) => return save_failure(store, &turn, storage_error(e)).await,
     };
-    let plan = match bounded_plan(
-        agent.plan_chat_run(&turn.user_input, history),
+    let plan = match plan_with_retry(
+        || agent.plan_chat_run(&turn.user_input, history.clone()),
         PLANNING_TIMEOUT,
     )
     .await
@@ -1086,8 +1126,92 @@ pub fn apply_persisted_fleet(workers: &hive_core::workers::WorkerPool) {
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn empty_plan() -> PlannedRun {
+        serde_json::from_value(serde_json::json!({
+            "id": "plan-1",
+            "user_input": "hi",
+            "summary": "nothing",
+            "complexity": "simple",
+            "routed_provider": "local",
+            "provider": "local",
+            "steps": []
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_planning_deadline_failure_is_retried_once_and_can_succeed() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let plan = empty_plan();
+        let result = plan_with_retry(
+            move || {
+                let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+                let plan = plan.clone();
+                async move {
+                    if first {
+                        // The first attempt hangs past the deadline.
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(plan)
+                }
+            },
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.id, "plan-1");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_second_deadline_failure_tells_the_user_what_to_do() {
+        let response = plan_with_retry(
+            || std::future::pending::<anyhow::Result<PlannedRun>>(),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("automatic retry"), "{text}");
+        assert!(text.contains("resend"), "{text}");
+        assert!(text.contains("No commands were executed"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn planner_calls_are_bounded_to_two_concurrent() {
+        let inside = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let (inside, peak) = (inside.clone(), peak.clone());
+                tokio::spawn(bounded_plan(
+                    async move {
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                        anyhow::Ok(())
+                    },
+                    Duration::from_secs(30),
+                ))
+            })
+            .collect();
+        for task in tasks {
+            assert!(task.await.unwrap().is_ok());
+        }
+        assert_eq!(inside.load(Ordering::SeqCst), 0);
+        // The semaphore allows at most two planner calls at once, and the
+        // waiting calls above really did run two at a time.
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn planning_deadline_cancels_work_before_execution() {
@@ -1120,7 +1244,7 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn provider_failure_is_reported_without_waiting_for_total_deadline() {
-        let response = bounded_plan(
+        let response = bounded_plan::<()>(
             async { anyhow::bail!("NVIDIA request deadline exceeded") },
             Duration::from_secs(150),
         )
