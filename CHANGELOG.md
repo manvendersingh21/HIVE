@@ -78,8 +78,10 @@ may still change without a deprecation period.
 - The master-agent provider selection and any Z.ai key entered in the
   settings UI are now persisted robustly: `~/.hive/master-agent.json`
   (relocatable via `HIVE_MASTER_AGENT_FILE`) is written atomically with
-  `0600` permissions, re-applied at startup below env/`hive.toml`
-  precedence, and never echoed by the API or logs. A corrupt state file is
+  `0600` permissions, and re-applied at startup: the Z.ai key only fills a
+  router that has none from env/`hive.toml`, and the provider selection
+  overrides the `hive.toml` `single_provider` default (see the BUG13 entry
+  above). The key is never echoed by the API or logs. A corrupt state file is
   ignored instead of affecting startup. See
   [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - Peer dependency deadlocks: a queued verifier can start when its implementer
