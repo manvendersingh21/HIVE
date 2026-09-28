@@ -7,10 +7,6 @@ use super::*;
 async fn local_probe_reports_tools_from_login_shell_profile() {
     use std::os::unix::fs::PermissionsExt;
 
-    // Mutex to avoid concurrency interference with environment variables and cache
-    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _lock = TEST_LOCK.lock().await;
-
     struct TempDir {
         path: std::path::PathBuf,
     }
@@ -60,46 +56,17 @@ exec /bin/sh "$@"
     std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o755))
         .expect("chmod");
 
-    struct EnvGuard {
-        home: Option<std::ffi::OsString>,
-        shell: Option<std::ffi::OsString>,
-        path: Option<std::ffi::OsString>,
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(ref h) = self.home {
-                std::env::set_var("HOME", h);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(ref s) = self.shell {
-                std::env::set_var("SHELL", s);
-            } else {
-                std::env::remove_var("SHELL");
-            }
-            if let Some(ref p) = self.path {
-                std::env::set_var("PATH", p);
-            } else {
-                std::env::remove_var("PATH");
-            }
-        }
-    }
+    // Never mutate process-wide environment variables in tests!
+    // Test the resolver and probe directly using explicit shell and HOME parameters.
+    let resolved_path =
+        resolve_login_path_with(&fake_shell, &temp_dir.path, "/usr/bin:/bin").await;
+    assert!(
+        resolved_path.contains(&bin_dir.display().to_string()),
+        "resolved PATH must include stub tool dir from profile: {resolved_path}"
+    );
 
-    let _guard = EnvGuard {
-        home: std::env::var_os("HOME"),
-        shell: std::env::var_os("SHELL"),
-        path: std::env::var_os("PATH"),
-    };
-
-    std::env::set_var("HOME", &temp_dir.path);
-    std::env::set_var("SHELL", &fake_shell);
-    std::env::set_var("PATH", "/usr/bin:/bin");
-
-    reset_cached_login_path().await;
-
-    let facts = probe_local("test-master").await;
-
-    reset_cached_login_path().await;
+    let facts =
+        probe_local_with("test-master", &fake_shell, &temp_dir.path, "/usr/bin:/bin").await;
 
     assert!(
         facts.reachable,
