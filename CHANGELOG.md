@@ -58,6 +58,23 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- A cross-task peer message is now recorded once before it is refused. The
+  task-boundary check in `RunStore::message` returned `MessageRejected` without
+  any evidence, because the existing incident helper attributes an incident to a
+  stored message and a refused route never stores one. The refusal now writes
+  one `route` incident and one `reject` audit row per (message ID, reason) using
+  the caller's routing, so a journal that re-emits the same event on every sync
+  leaves exactly one record and the message is still never inserted.
+- NVIDIA streaming now retries a body error that arrives before the first chunk.
+  The stream-error retry in `complete_streaming` required `is_connect()` or
+  `is_timeout()`, neither of which a body read on a client with no reqwest
+  timeout ever reports, so the branch was unreachable. An error before any bytes
+  were received consumed nothing and is replayed on the next attempt; an error
+  after content has arrived still fails without a retry.
+- A planner-slot wait timeout is returned immediately. `plan_with_retry` retried
+  the whole plan on any 504, including a permit-wait timeout that had already
+  spent the whole-request budget, so a caller could wait twice that long before
+  seeing the error. Only a plan that ran out of its own deadline is retried now.
 - A run's lock is released when its coordinator is, not when its children are
   (BUG14). `RunLock` took an exclusive `flock` on `runtime.lock` and relied on
   closing the descriptor to release it, but an `flock` belongs to the *open file
