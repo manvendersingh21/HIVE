@@ -1,5 +1,6 @@
-use super::{Assignment, DelegationPlan};
-use rusqlite::{params, Connection};
+use super::{coordination::AgreementRecord, Assignment, DelegationPlan};
+use hacp::v2::ContractState;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,7 @@ pub struct Run {
     pub cursor: i64,
     pub runner_path: Option<String>,
     pub review: Value,
+    pub contracts: Vec<AgreementRecord>,
 }
 
 #[derive(Clone)]
@@ -61,7 +63,8 @@ impl RunStore {
           UNIQUE(task_id, assignment));
           CREATE TABLE IF NOT EXISTS delegated_events (run_id TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(run_id,id));
           CREATE TABLE IF NOT EXISTS delegated_decisions (run_id TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, decision TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(run_id,id));
-          CREATE TABLE IF NOT EXISTS delegated_messages (id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL, payload TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);")?;
+          CREATE TABLE IF NOT EXISTS delegated_messages (id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL, payload TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
+          CREATE TABLE IF NOT EXISTS delegated_contracts (task_id TEXT NOT NULL, party_a TEXT NOT NULL, party_b TEXT NOT NULL, contract TEXT NOT NULL, PRIMARY KEY(task_id,party_a,party_b));")?;
         conn.lock().unwrap().execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0);")?;
         Ok(Self(conn))
     }
@@ -172,7 +175,7 @@ impl RunStore {
                 r.get::<_, Option<String>>(9)?,
             ))
         })?;
-        rows.map(|row| {
+        let mut runs: Vec<Run> = rows.map(|row| {
             let (id, task_id, conversation_id, a, tmux_name, state, m, cursor, runner_path, review) = row?;
             Ok(Run {
                 id,
@@ -188,9 +191,44 @@ impl RunStore {
                     .map(|s| serde_json::from_str(&s))
                     .transpose()?
                     .unwrap_or(Value::Null),
+                contracts: vec![],
             })
         })
-        .collect()
+        .collect::<anyhow::Result<_>>()?;
+        drop(stmt);
+        drop(db);
+        for run in &mut runs { run.contracts = self.contracts_for(&run.id)?; }
+        Ok(runs)
+    }
+
+    pub fn contracts_for(&self, run: &str) -> anyhow::Result<Vec<AgreementRecord>> {
+        let db = self.0.lock().unwrap();
+        let mut stmt = db.prepare("SELECT contract FROM delegated_contracts WHERE party_a=? OR party_b=? ORDER BY rowid")?;
+        let rows = stmt.query_map([run, run], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    /// Apply a peer agreement to one durable bilateral HACP v2 contract.
+    pub fn record_agreement(&self, source: &str, destination: &str, text: &str) -> anyhow::Result<String> {
+        let from = self.get(source)?;
+        let to = self.get(destination)?;
+        anyhow::ensure!(from.task_id == to.task_id, "Peer agreement crosses task boundary");
+        let (party_a, party_b) = if source < destination { (source, destination) } else { (destination, source) };
+        let db = self.0.lock().unwrap();
+        let saved: Option<String> = db.query_row(
+            "SELECT contract FROM delegated_contracts WHERE task_id=? AND party_a=? AND party_b=?",
+            params![from.task_id, party_a, party_b], |row| row.get(0)).optional()?;
+        let mut record = match saved.as_ref() {
+            None => AgreementRecord::propose(&from.task_id, source, destination, text)?,
+            Some(saved) => serde_json::from_str(saved)?,
+        };
+        let result = if saved.is_none() { Ok(record.proposed_digest.clone()) }
+            else if record.contract.state == ContractState::Executing { record.propose_amendment(source, text) }
+            else if record.contract.state == ContractState::Amending { record.agree_amendment(source, text) }
+            else { record.agree(source, text) };
+        db.execute("INSERT INTO delegated_contracts(task_id,party_a,party_b,contract) VALUES (?,?,?,?) ON CONFLICT(task_id,party_a,party_b) DO UPDATE SET contract=excluded.contract",
+            params![from.task_id, party_a, party_b, serde_json::to_string(&record)?])?;
+        result
     }
     pub fn get(&self, id: &str) -> anyhow::Result<Run> {
         self.list()?
@@ -430,6 +468,28 @@ mod tests {
         let reopened = RunStore::new(g.shared_conn()).unwrap();
         reopened.message("message", a, b, &payload).unwrap();
         assert!(reopened.pending_messages(b).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bilateral_agreements_are_frozen_stored_and_visible_to_both_runs() {
+        let g = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let s = RunStore::new(g.shared_conn()).unwrap();
+        let mut p = plan();
+        let mut second = p.assignments[0].clone();
+        second.key = "b".into();
+        p.assignments.push(second);
+        let runs = s.create("task", "chat", &p).unwrap();
+        let digest = s.record_agreement(&runs[0].id, &runs[1].id, "API v1").unwrap();
+        s.record_agreement(&runs[1].id, &runs[0].id, &digest).unwrap();
+        for run in s.list().unwrap() {
+            assert_eq!(run.contracts.len(), 1);
+            assert_eq!(run.contracts[0].contract.state, ContractState::Executing);
+        }
+        let amendment = s.record_agreement(&runs[0].id, &runs[1].id, "API v2").unwrap();
+        assert!(s.record_agreement(&runs[1].id, &runs[0].id, "one-sided-v3").is_err());
+        assert_eq!(s.contracts_for(&runs[0].id).unwrap()[0].rejected_changes.len(), 1);
+        s.record_agreement(&runs[1].id, &runs[0].id, &amendment).unwrap();
+        assert_eq!(s.contracts_for(&runs[1].id).unwrap()[0].contract.revisions.len(), 2);
     }
 
     #[test]

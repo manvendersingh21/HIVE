@@ -655,7 +655,15 @@ async fn sync_run(
             let id = event["id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Peer event ID missing"))?;
-            let payload = json!({"id":id,"source":run.id,"kind":event["payload"]["kind"],"text":format!("Peer {} on {} ({}) says: {}",run.assignment.key,run.assignment.device,event["payload"]["kind"].as_str().unwrap_or("message"),event["payload"]["text"].as_str().unwrap_or(""))});
+            let kind = event["payload"]["kind"].as_str().unwrap_or("message");
+            let text = event["payload"]["text"].as_str().unwrap_or("");
+            let agreement = if kind == "agreement" {
+                Some(match store.record_agreement(&run.id, to, text) {
+                    Ok(digest) => format!(" HACP v2 contract digest: {digest}. Echo this digest in an agreement message to accept."),
+                    Err(error) => format!(" HACP v2 rejected this unilateral change: {error}."),
+                })
+            } else { None };
+            let payload = json!({"id":id,"source":run.id,"kind":kind,"text":format!("Peer {} on {} ({kind}) says: {}{}",run.assignment.key,run.assignment.device,text,agreement.as_deref().unwrap_or(""))});
             if runs.iter().any(|r| r.id == to && r.state != "superseded") {
                 store.message(id, &run.id, to, &payload)?;
             }
