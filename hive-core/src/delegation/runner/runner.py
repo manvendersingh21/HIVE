@@ -705,6 +705,8 @@ class Agy(JsonProcess):
         else:
             hooks.write_text(encode(expected_hooks))
         args = [executable('agy'), '--input-format', 'stream-json', '--output-format', 'stream-json']
+        if assignment.get('autonomy') == 'yolo':
+            args += ['--dangerously-skip-permissions']
         if assignment.get('model'):
             args += ['--model', assignment['model']]
         if journal.get('native_conversation_id'):
@@ -725,6 +727,10 @@ class Agy(JsonProcess):
             if event.get('event') == 'init' and payload.get('model'):
                 self.j.set('actual_model', payload['model'])
             if event.get('event') == 'result':
+                denied = payload.get('denied_actions') or []
+                response = payload.get('response') or payload.get('output') or ''
+                if denied and not response:
+                    raise RuntimeError('AGY turn denied with no response; denied actions: '+encode(denied))
                 if payload.get('status') != 'SUCCESS':
                     raise RuntimeError('AGY '+str(payload.get('status', 'missing result status'))+': '+payload.get('error', 'Turn did not complete successfully'))
                 return
