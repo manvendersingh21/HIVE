@@ -1189,7 +1189,7 @@ class OpenCode:
         return encode([[part.get('type'), (part.get('state') or {}).get('status')] for part in message.get('parts', [])])
 
     def journaled(self):
-        # The message list always returns the whole history; a new turn or a
+        # Every message list repeats earlier history; a new turn or a
         # restarted runner must not journal it again.
         revisions = {}
         for (payload,) in self.j.db.execute("SELECT payload FROM events WHERE kind='native' ORDER BY seq"):
@@ -1263,7 +1263,8 @@ class OpenCode:
             raise RuntimeError('Prior OpenCode prompt is uncertain; reconcile its message before submitting another')
         # Match OpenCode's ascending IDs: low 48 bits of milliseconds*4096
         # plus a per-timestamp counter, followed by fourteen random characters.
-        timestamp = (int(time.time()*1000)*0x1000 + 1) & ((1 << 48)-1)
+        started = int(time.time()*1000)
+        timestamp = (started*0x1000 + 1) & ((1 << 48)-1)
         message_id = 'msg_'+format(timestamp, '012x')+uuid.uuid4().hex[:14]
         self.j.set('opencode_pending_message', message_id)
         # Checkpoint before sending. Even a lost HTTP response must not resubmit
@@ -1273,6 +1274,12 @@ class OpenCode:
         if not hasattr(self, 'revisions'):
             self.revisions = self.journaled()
         actions = set()
+        # OpenCode may add user messages of its own after the prompt (context
+        # compaction, auto-continue); the final reply is parented to the last
+        # of them. The set persists across polls because a long turn pushes
+        # earlier messages out of the newest page. Creation times, not ids,
+        # order them: the 48-bit id timestamp wraps.
+        chain = {message_id}
         while True:
             for request in await self.http('GET', '/permission'):
                 if request.get('sessionID') != self.native:
@@ -1305,7 +1312,13 @@ class OpenCode:
                     arguments = dict(request=request, tool_input=arguments)
                 allowed = await permission(self.j, tool, arguments, self.a['workspace'])
                 await self.http('POST', '/permission/'+request['id']+'/reply', {'reply': 'once' if allowed else 'reject'})
+            # OpenCode returns the newest `limit` messages in chronological order.
             messages = await self.http('GET', '/session/'+self.native+'/message?limit=100')
+            for message in messages:
+                info = message.get('info') or {}
+                created = (info.get('time') or {}).get('created')
+                if info.get('role') == 'user' and info.get('id') and isinstance(created, (int, float)) and created >= started:
+                    chain.add(info['id'])
             terminal = []
             for message in messages:
                 info = message.get('info', {})
@@ -1314,7 +1327,7 @@ class OpenCode:
                 if self.revisions.get(ident) != revision:
                     self.revisions[ident] = revision
                     self.j.emit('native', message)
-                if info.get('parentID') != message_id or info.get('role') != 'assistant':
+                if info.get('parentID') not in chain or info.get('role') != 'assistant':
                     continue
                 if info.get('error'):
                     raise RuntimeError(encode(info['error']))
