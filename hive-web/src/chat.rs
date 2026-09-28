@@ -987,31 +987,79 @@ fn load_master_agent_state() -> Option<PersistedMasterAgent> {
     }
 }
 
+/// Why the master agent ended up on the provider it starts with. Reported
+/// by [`apply_persisted_master_agent`] and logged once at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderSelectionReason {
+    /// The selection saved from the settings UI was restored.
+    PersistedChoice,
+    /// No usable persisted selection; `hive.toml` `single_provider` applies.
+    ConfigDefault,
+    /// Neither a usable persisted selection nor a configured
+    /// `single_provider`: legacy routing with the local model as default.
+    Fallback,
+}
+
+impl ProviderSelectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PersistedChoice => "persisted choice",
+            Self::ConfigDefault => "config default",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
 /// Apply a persisted master-agent selection to a freshly built router, if
 /// one was saved by an earlier run. Called once at startup, before the
-/// router is shared behind an `Arc`.
+/// router is shared behind an `Arc`. Returns (and logs at `info`) the
+/// provider the master agent starts with and why.
 ///
-/// Precedence — the environment and `hive.toml` always win over the file:
-/// - Z.ai key: a key already resolved from `[llm.zai]`/`Z_AI` by
-///   `from_config` is never replaced; the persisted key only fills a router
-///   that has none.
-/// - Provider: an explicit `single_provider` in `hive.toml` beats the
-///   persisted selection; with none configured, the persisted provider is
-///   restored.
+/// Precedence:
+/// - Provider: the persisted selection is the operator's most recent
+///   explicit choice, so it overrides `hive.toml` `single_provider` — as
+///   long as that provider is still configured/usable (e.g. `nvidia` still
+///   has `NVIDIA_API_KEY_FLASH`, `zai` still has a key). A persisted
+///   provider that is unknown or no longer usable is ignored and the
+///   `hive.toml` default applies (or, with none, legacy routing on the
+///   local model). `hive.toml` is therefore the default, not an override.
+/// - Z.ai key: unchanged — the environment and `hive.toml` win over the
+///   file. A key already resolved from `[llm.zai]`/`Z_AI` by `from_config`
+///   is never replaced; the persisted key only fills a router that has none.
 ///
-/// Failures are logged, not fatal — the process falls back to whatever
-/// `hive.toml` configured.
+/// Failures are logged, not fatal. API keys are never logged.
 pub fn apply_persisted_master_agent(
     llm: &hive_core::llm::LlmRouter,
     cfg: &hive_common::config::LlmConfig,
-) {
-    let Some(state) = load_master_agent_state() else {
-        return;
+) -> (hive_common::AiProvider, ProviderSelectionReason) {
+    let restored = restore_persisted_provider(llm);
+    let (provider, reason) = if let Some(provider) = restored {
+        (provider, ProviderSelectionReason::PersistedChoice)
+    } else if let Some(provider) = cfg.single_provider {
+        (provider, ProviderSelectionReason::ConfigDefault)
+    } else {
+        (llm.current_provider(), ProviderSelectionReason::Fallback)
     };
+    info!(
+        provider = %provider,
+        reason = reason.as_str(),
+        configured_default = ?cfg.single_provider,
+        "master-agent provider selected"
+    );
+    (provider, reason)
+}
+
+/// Seed the persisted Z.ai key and try to switch the router to the
+/// persisted provider. Returns the provider when it was restored; `None`
+/// when there is no state file, the provider is unknown, or it is no longer
+/// usable (the router then keeps its `hive.toml` configuration untouched,
+/// since `set_provider` only mutates on success).
+fn restore_persisted_provider(llm: &hive_core::llm::LlmRouter) -> Option<hive_common::AiProvider> {
+    let state = load_master_agent_state()?;
     // Make the persisted Z.ai key available first (a no-op when env/config
-    // already provided one — exactly the precedence above). Seeding happens
-    // regardless of the persisted provider so a key entered while running
-    // on `local` still works after a restart.
+    // already provided one — env/config keys keep precedence). Seeding
+    // happens regardless of the persisted provider so a key entered while
+    // running on `local` still works after a restart.
     if let Some(key) = state
         .zai_api_key
         .as_deref()
@@ -1022,22 +1070,19 @@ pub fn apply_persisted_master_agent(
     }
     let Some(provider) = parse_persisted_provider(&state.provider) else {
         warn!(provider = %state.provider, "ignoring unrecognized persisted master-agent provider");
-        return;
+        return None;
     };
-    if cfg.single_provider.is_some() {
-        if cfg.single_provider != Some(provider) {
-            info!(
-                configured = ?cfg.single_provider,
-                persisted = %state.provider,
-                "hive.toml single_provider wins over the persisted master-agent selection"
+    match llm.set_provider(provider, None) {
+        Ok(()) => Some(provider),
+        Err(e) => {
+            // The error names a missing env var at most, never a key value.
+            warn!(
+                error = %e,
+                provider = %state.provider,
+                "persisted master-agent provider is no longer configured; using the hive.toml default"
             );
+            None
         }
-        return;
-    }
-    if let Err(e) = llm.set_provider(provider, None) {
-        warn!(error = %e, provider = %state.provider, "could not restore persisted master-agent selection");
-    } else {
-        info!(provider = %state.provider, "restored persisted master-agent selection");
     }
 }
 
@@ -1570,7 +1615,7 @@ mod master_agent_state_tests {
     }
 
     #[test]
-    fn configured_single_provider_wins_over_the_persisted_selection() {
+    fn persisted_selection_overrides_the_configured_default_when_still_usable() {
         let _env = ENV_LOCK.lock().unwrap();
         let (file, dir) = isolated_state_file();
         let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
@@ -1579,15 +1624,89 @@ mod master_agent_state_tests {
         let mut cfg = quiet_llm_config();
         cfg.single_provider = Some(hive_common::AiProvider::Local);
         let router = LlmRouter::from_config(&cfg);
-        apply_persisted_master_agent(&router, &cfg);
+        let selected = apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(
+            selected,
+            (hive_common::AiProvider::Zai, ProviderSelectionReason::PersistedChoice)
+        );
         assert_eq!(
             router.current_provider(),
-            hive_common::AiProvider::Local,
-            "hive.toml single_provider beats the persisted provider"
+            hive_common::AiProvider::Zai,
+            "the persisted provider beats hive.toml single_provider"
         );
-        // The persisted key is still made available — precedence decides
-        // which key wins when both exist, not whether the file is read.
         assert!(router.zai_configured());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_nvidia_overrides_a_configured_local_default() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        let _nvidia = EnvGuard::set("NVIDIA_API_KEY_FLASH", "test-nvidia-key");
+        save_master_agent_selection("nvidia", None).unwrap();
+
+        let mut cfg = quiet_llm_config();
+        cfg.single_provider = Some(hive_common::AiProvider::Local);
+        let router = LlmRouter::from_config(&cfg);
+        let selected = apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(
+            selected,
+            (hive_common::AiProvider::Nvidia, ProviderSelectionReason::PersistedChoice)
+        );
+        assert_eq!(router.current_provider(), hive_common::AiProvider::Nvidia);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_provider_no_longer_configured_falls_back_to_the_config_default() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        // Saved while NVIDIA was configured; its key is gone at this startup.
+        save_master_agent_selection("nvidia", None).unwrap();
+        let _nvidia = EnvGuard::remove("NVIDIA_API_KEY_FLASH");
+
+        let mut cfg = quiet_llm_config();
+        cfg.single_provider = Some(hive_common::AiProvider::Local);
+        let router = LlmRouter::from_config(&cfg);
+        let selected = apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(
+            selected,
+            (hive_common::AiProvider::Local, ProviderSelectionReason::ConfigDefault)
+        );
+        assert_eq!(router.current_provider(), hive_common::AiProvider::Local);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_a_persisted_file_the_config_default_applies() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        let _nvidia = EnvGuard::set("NVIDIA_API_KEY_FLASH", "test-nvidia-key");
+        assert!(!file.exists());
+
+        let mut cfg = quiet_llm_config();
+        cfg.single_provider = Some(hive_common::AiProvider::Nvidia);
+        let router = LlmRouter::from_config(&cfg);
+        let selected = apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(
+            selected,
+            (hive_common::AiProvider::Nvidia, ProviderSelectionReason::ConfigDefault)
+        );
+        assert_eq!(router.current_provider(), hive_common::AiProvider::Nvidia);
+
+        // With neither a file nor a configured default: legacy fallback.
+        let cfg = quiet_llm_config();
+        let router = LlmRouter::from_config(&cfg);
+        assert_eq!(
+            apply_persisted_master_agent(&router, &cfg),
+            (hive_common::AiProvider::Local, ProviderSelectionReason::Fallback)
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

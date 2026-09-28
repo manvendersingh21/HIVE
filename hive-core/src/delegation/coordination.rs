@@ -38,10 +38,15 @@ impl AgreementRecord {
                 owner: proposer.clone(),
             },
             Relationship::Collaboration,
+            None,
+            None,
+            None,
+            None,
             vec![],
             ContractLimits {
                 max_rounds: 3,
                 max_amendments: 16,
+                max_rework: 2,
             },
         )?;
         contract.agree(&proposer, &terms)?;
