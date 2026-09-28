@@ -70,6 +70,10 @@ may still change without a deprecation period.
   `config/workers.example.toml` instead.
 - The mock planning response in `scripts/check-nvidia.py` omitted the
   `target_machine` field that plan validation requires, failing CI on every run.
+- Local machine probe in `machines.rs`, delegation launch in `hive-core/src/delegation/transport.rs local_shell`,
+  and session launch in `hive-web/src/sessions.rs` now resolve and inherit the user's login-shell PATH
+  (with timeout and caching) with close-on-exec fd isolation, so tools added via shell profiles
+  (e.g. `~/.cargo/bin`, `~/.opencode/bin`, `~/.local/bin`) are discovered and executable without hardcoding or fd leakage.
 
 ### Known limitations
 

@@ -266,10 +266,14 @@ pub async fn create(name: &str, kind: Kind, working_dir: Option<&str>) -> anyhow
     if let Some(dir) = working_dir {
         cmd.args(["-c", dir]);
     }
-    // Login shell so ~/.local/bin (claude, codex) is on PATH. Without `-l`
-    // the tools resolve only for interactive logins, not for what we spawn.
+    let login_path = hive_core::memory::machines::resolve_login_path().await;
+    cmd.env("PATH", &login_path);
     match kind.launch_command() {
-        Some(program) => cmd.args(["bash", "-lc", &format!("{program}; exec bash -l")]),
+        Some(program) => cmd.args([
+            "bash",
+            "-lc",
+            &format!("export PATH={}; {program}; exec bash -l", quote(&login_path)),
+        ]),
         None => cmd.args(["bash", "-l"]),
     };
 
