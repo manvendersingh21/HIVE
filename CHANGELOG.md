@@ -40,8 +40,14 @@ may still change without a deprecation period.
 
 ### Changed
 
-- HACP is pinned to `7891da077d469e6308f31cbaa93d838c39cc54e6`, with
-  guardian-backed secure envelopes enabled in `hive-core`.
+- HACP is pinned to `3d008d4719e0dcf0ba4057650831ab4696495923`, with
+  guardian-backed secure envelopes enabled in `hive-core`. This pin adopts
+  HACP's V3/V4/V7 fixes: bilateral delegation contracts are formed under a
+  per-run capability grant (the deployment charters the supervisor, which
+  grants the worker) with a matching escalation path, and contracts set
+  `max_rework = 2`. A rework verdict beyond that bound ends the run as
+  `Rejected` with a "rework budget exhausted" reason, even when
+  `--max-rework` allows more attempts.
 - HACP is consumed as a commit-pinned Git dependency from its own repository
   rather than vendored into this tree.
 - Placement restrictions are enforced during plan validation: assignments
