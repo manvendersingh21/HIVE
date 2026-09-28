@@ -98,6 +98,11 @@ def probe():
             else:
                 record['controls'] = ['native-approval', 'persistent-session']
                 record['runtime_ready'] = capture([path, 'serve', '--help'])[0] == 0
+                if record['runtime_ready']:
+                    discovered = discover_opencode(path)
+                    if discovered:
+                        record['models'] = discovered['models']
+                        record['default_model'] = discovered['default_model']
             record['runtime_ready'] = record['runtime_ready'] and bool(executable('tmux'))
         records.append(record)
     return records
@@ -440,6 +445,57 @@ async def discover_codex(path):
             await process.close()
 
 
+def discover_opencode(path):
+    """Connected provider/model ids straight from OpenCode's own registry.
+
+    GET /provider's `default` maps a catalog default onto EVERY provider, so
+    only the model OpenCode itself is configured to default to (config
+    "model") is reported as default_model; the rest are arbitrary guesses.
+    """
+    import base64
+    import socket
+    import urllib.request
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    password = uuid.uuid4().hex + uuid.uuid4().hex
+    url = 'http://127.0.0.1:'+str(port)
+    auth = 'Basic '+base64.b64encode(('opencode:'+password).encode()).decode()
+    env = dict(os.environ, OPENCODE_SERVER_PASSWORD=password)
+    proc = subprocess.Popen([path, 'serve', '--pure', '--hostname', '127.0.0.1', '--port', str(port)],
+                            cwd=str(Path.home()), env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def get(target):
+        with urllib.request.urlopen(urllib.request.Request(url+target, headers={'Authorization': auth}),
+                                    timeout=30) as response:
+            return json.loads(response.read() or b'null')
+    try:
+        for _ in range(40):
+            if proc.poll() is not None:
+                return None
+            try:
+                providers = get('/provider')
+                break
+            except Exception:
+                time.sleep(.25)
+        else:
+            return None
+        available = [provider['id']+'/'+model for provider in providers.get('all', [])
+                     if provider['id'] in providers.get('connected', []) for model in provider.get('models', {})]
+        try:
+            configured = (get('/config') or {}).get('model')
+        except Exception:
+            configured = None
+        return dict(models=available, default_model=configured if configured in available else None)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 class Codex(JsonProcess):
     @staticmethod
     def validate_hive_tool(journal, name, args):
@@ -737,6 +793,35 @@ class Agy(JsonProcess):
 
 
 class OpenCode:
+    @staticmethod
+    def tool_capable(model):
+        # QwQ/QvQ reasoning models answer but never call tools; an automatic
+        # choice of one ends turns with no actions at all.
+        lowered = model.lower()
+        return 'qwq' not in lowered and 'qvq' not in lowered
+
+    @staticmethod
+    def choose_model(providers, available, configured):
+        """`providers['default']` names a catalog default for EVERY provider,
+        so its first entry is arbitrary — that is how alibaba/qwq-plus was
+        once chosen and produced a turn with no actions. Only the provider
+        OpenCode itself marks as default (the one in its configured default
+        model) may contribute a default entry, and never a reasoning-only
+        family."""
+        candidates = []
+        if isinstance(configured, str):
+            candidates.append(configured)
+            if '/' in configured:
+                entry = providers.get('default', {}).get(configured.split('/', 1)[0])
+                if entry:
+                    candidates.append(configured.split('/', 1)[0]+'/'+entry)
+        candidates.extend(available)
+        usable = [candidate for candidate in candidates
+                  if candidate in available and OpenCode.tool_capable(candidate)]
+        if not usable:
+            raise RuntimeError('OpenCode has no connected tool-capable model; qwq/qvq reasoning models never call tools')
+        return usable[0]
+
     async def http(self, method, path, body=None):
         import urllib.request
         def request():
@@ -784,7 +869,10 @@ class OpenCode:
         if model and model not in available:
             raise RuntimeError('Unavailable OpenCode model: '+model)
         if not model:
-            model = next((provider+'/'+model for provider, model in providers.get('default', {}).items() if provider+'/'+model in available), available[0])
+            config = await self.http('GET', '/config')
+            configured = config.get('model') if isinstance(config, dict) else None
+            model = self.choose_model(providers, available, configured)
+            self.j.emit('warning', dict(message='No model was assigned; OpenCode model '+model+' was chosen automatically', model=model))
         self.model = dict(zip(('providerID', 'modelID'), model.split('/', 1)))
         self.native = journal.get('native_conversation_id')
         if not self.native:
@@ -806,6 +894,7 @@ class OpenCode:
         await self.http('POST', '/session/'+self.native+'/prompt_async',
                         dict(messageID=message_id, model=self.model, parts=[dict(type='text', text=prompt)]))
         seen = set()
+        actions = set()
         while True:
             for request in await self.http('GET', '/permission'):
                 if request.get('sessionID') != self.native:
@@ -852,11 +941,19 @@ class OpenCode:
                     raise RuntimeError(encode(info['error']))
                 if info.get('providerID') and info.get('modelID'):
                     self.j.set('actual_model', info['providerID']+'/'+info['modelID'])
+                for part in message.get('parts', []):
+                    if part.get('type') == 'tool' or (part.get('type') == 'text' and part.get('text', '').strip()):
+                        actions.add(part['type'])
                 if info.get('time', {}).get('completed') and info.get('finish') not in (None, 'tool-calls', 'unknown'):
                     terminal.append(message)
             statuses = await self.http('GET', '/session/status')
             if terminal and statuses.get(self.native, {}).get('type', 'idle') == 'idle':
                 self.j.set('opencode_pending_message', None)
+                if not actions:
+                    # A reply of pure reasoning (qwq-style) produced nothing
+                    # verifiable; marking such a turn completed once released
+                    # dependents on work that never happened.
+                    raise RuntimeError('turn produced no actions')
                 return
             await asyncio.sleep(.5)
 

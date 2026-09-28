@@ -167,6 +167,69 @@ fn validate_new_containers(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow
     Ok(())
 }
 
+/// Model ids from OpenCode's qwq/qvq reasoning families answer prompts but
+/// never call tools; a turn run on one can end with no actions at all.
+fn reasoning_family(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    id.contains("qwq") || id.contains("qvq")
+}
+
+/// The verified models an OpenCode install on `device` offers: the probe's
+/// connected catalog plus any model with real invocation evidence.
+fn opencode_models(agent: &MasterAgent, device: &str) -> anyhow::Result<Vec<String>> {
+    let Some(record) = agent
+        .memory
+        .graph
+        .entity(&entity_id("device-agent", &format!("{device}/opencode")))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut models: Vec<String> = record.attrs["models"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(invoked) = record.attrs["invocation"]["model"].as_str() {
+        if !models.iter().any(|m| m == invoked) {
+            models.push(invoked.to_string());
+        }
+    }
+    Ok(models)
+}
+
+/// A verified tool-capable OpenCode model for `device`, preferring the model
+/// OpenCode itself is configured to default to, never a reasoning family.
+fn select_opencode_model(agent: &MasterAgent, device: &str) -> anyhow::Result<Option<String>> {
+    let models = opencode_models(agent, device)?;
+    let default = agent
+        .memory
+        .graph
+        .entity(&entity_id("device-agent", &format!("{device}/opencode")))?
+        .and_then(|r| r.attrs["default_model"].as_str().map(str::to_string));
+    if let Some(default) = default {
+        if models.contains(&default) && !reasoning_family(&default) {
+            return Ok(Some(default));
+        }
+    }
+    Ok(models.into_iter().find(|m| !reasoning_family(m)))
+}
+
+/// OpenCode's own default can be a reasoning model that never calls tools,
+/// so a null model is filled with a verified tool-capable model before the
+/// plan is validated. Null for other agents stays a native-default choice.
+fn repair_models(plan: &mut DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
+    for a in &mut plan.assignments {
+        if a.agent == "opencode" && a.model.is_none() {
+            a.model = select_opencode_model(agent, &a.device)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
     anyhow::ensure!(
         plan.assignments.len() <= 16,
@@ -191,6 +254,15 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             "Unknown agent: {}",
             a.agent
         );
+        if a.agent == "opencode" {
+            if let Some(model) = &a.model {
+                anyhow::ensure!(
+                    !reasoning_family(model),
+                    "{}: OpenCode model {model} is from a qwq/qvq reasoning family that never calls tools",
+                    a.device
+                );
+            }
+        }
         anyhow::ensure!(
             valid_workspace(&a.workspace),
             "Workspace must be a child of ~/hive-workspaces"
@@ -206,6 +278,12 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
                 a.device
             );
             continue;
+        }
+        if a.agent == "opencode" && a.model.is_none() {
+            anyhow::bail!(
+                "{}: no verified OpenCode model is available; connect a model provider on that device, name a verified model explicitly, or use another agent",
+                a.device
+            );
         }
         let machine = agent
             .memory
@@ -412,7 +490,9 @@ pub async fn plan(
     let mut prompt = format!("You are Hive's coordinator. Plan work for real agent conversations on configured devices. \
         Return structured assignments, never shell commands or file contents. The complete fleet is below. \
         Select device, installed agent and available model automatically; explicit user device/agent/model choices take precedence. \
-        Use null model when no model identifiers were verified; native default is resolved before execution. \
+        For opencode, set model to a verified id from that device's agent inventory (provider/model ids) and never a qwq/qvq reasoning model: those never call tools, so a turn can end with no actions. \
+        A null opencode model is filled from the device's verified models (the configured default first); a plan with no verified opencode model is rejected instead of guessing. \
+        For other agents use null model when no model identifiers were verified; native default is resolved before execution. \
         Missing authentication, runtime or software is reported by Hive on that exact device; do not silently substitute explicit choices. \
         Prefer dedicated devices for ordinary work. Laptops/light hosts and login nodes only receive short light work. \
         GPU/shared scheduler work requires a scheduler allocation; never launch sustained work directly on login nodes. \
@@ -447,6 +527,7 @@ pub async fn plan(
             .map_err(anyhow::Error::from)
             .and_then(|mut p| {
                 repair_workspaces(&mut p);
+                repair_models(&mut p, agent)?;
                 validate(&p, agent)?;
                 validate_explicit(request, &p, agent)?;
                 validate_coordinator(request, &p, agent)?;
@@ -513,6 +594,14 @@ pub fn setup_reason(
                 assignment.agent
             )));
         }
+    }
+    if assignment.agent == "opencode"
+        && assignment.model.is_none()
+        && select_opencode_model(agent, device)?.is_none()
+    {
+        return Ok(Some(format!(
+            "{device}: opencode has no verified tool-capable model; qwq/qvq reasoning models never call tools"
+        )));
     }
     Ok(None)
 }
@@ -902,5 +991,52 @@ mod tests {
             .unwrap()
             .unwrap()
             .contains("claude-other"));
+    }
+    #[test]
+    fn opencode_null_model_selects_verified_model_and_skips_qwq_plus() {
+        let agent = agent();
+        inventory::project(&agent.memory.graph,"air",&[json!({"agent":"opencode","executable":"/opencode","runtime_ready":true,"authentication":"authenticated",
+            "models":["alibaba/qwq-plus","alibaba/qwen3.5-plus","zai-coding-plan/glm-5.3"],"default_model":"alibaba/qwq-plus"})]).unwrap();
+        let mut p = plan();
+        p.assignments[0].agent = "opencode".into();
+        repair_models(&mut p, &agent).unwrap();
+        // The configured default is a qwq reasoning model; the first coding-capable model wins.
+        assert_eq!(p.assignments[0].model.as_deref(), Some("alibaba/qwen3.5-plus"));
+        assert!(validate(&p, &agent).is_ok());
+        assert!(setup_reason(&agent, &p.assignments[0]).unwrap().is_none());
+        // A tool-capable configured default is preferred over other verified models.
+        inventory::project(&agent.memory.graph,"air",&[json!({"agent":"opencode","executable":"/opencode","runtime_ready":true,"authentication":"authenticated",
+            "models":["alibaba/qwq-plus","zai-coding-plan/glm-5.3"],"default_model":"zai-coding-plan/glm-5.3"})]).unwrap();
+        let mut preferred = plan();
+        preferred.assignments[0].agent = "opencode".into();
+        repair_models(&mut preferred, &agent).unwrap();
+        assert_eq!(preferred.assignments[0].model.as_deref(), Some("zai-coding-plan/glm-5.3"));
+        // A qwq family id is rejected even when it is named explicitly.
+        preferred.assignments[0].model = Some("alibaba/qwq-plus".into());
+        let err = validate(&preferred, &agent).unwrap_err().to_string();
+        assert!(err.contains("reasoning family"), "{err}");
+        assert!(err.contains("qwq"), "{err}");
+    }
+    #[test]
+    fn opencode_plan_without_a_verified_model_is_rejected_with_a_clear_reason() {
+        let agent = agent();
+        inventory::project(&agent.memory.graph,"air",&[json!({"agent":"opencode","executable":"/opencode","runtime_ready":true,"authentication":"authenticated","models":[],"default_model":null})]).unwrap();
+        let mut p = plan();
+        p.assignments[0].agent = "opencode".into();
+        repair_models(&mut p, &agent).unwrap();
+        assert!(p.assignments[0].model.is_none());
+        let err = validate(&p, &agent).unwrap_err().to_string();
+        assert!(err.contains("no verified OpenCode model"), "{err}");
+        // The same gap is reported at launch time on a probed device.
+        let reason = setup_reason(&agent, &p.assignments[0]).unwrap().unwrap();
+        assert!(reason.contains("no verified tool-capable model"), "{reason}");
+        // A model with real invocation evidence counts as verified even with an empty catalog.
+        inventory::project(&agent.memory.graph,"air",&[json!({"agent":"opencode","executable":"/opencode","runtime_ready":true,"authentication":"authenticated",
+            "models":[],"invocation":{"model":"zai-coding-plan/glm-5.3"}})]).unwrap();
+        let mut invoked = plan();
+        invoked.assignments[0].agent = "opencode".into();
+        repair_models(&mut invoked, &agent).unwrap();
+        assert_eq!(invoked.assignments[0].model.as_deref(), Some("zai-coding-plan/glm-5.3"));
+        assert!(validate(&invoked, &agent).is_ok());
     }
 }
