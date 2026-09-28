@@ -70,6 +70,13 @@ impl ZaiClient {
         &self.model
     }
 
+    /// Same-crate tests assert key precedence (env/config vs. the persisted
+    /// state file); production code must never read the key back out.
+    #[cfg(test)]
+    pub(crate) fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
     /// Build a client from config, resolving the API key from config or
     /// the `Z_AI` environment variable. Fails if no key is available anywhere.
     pub fn new(cfg: &CloudLlmConfig) -> anyhow::Result<Self> {
