@@ -29,6 +29,18 @@ may still change without a deprecation period.
   prerequisites, and discovered models, refreshed in the background.
 - Saved chats — search, reopen, and continue web conversations stored in SQLite.
   See [docs/CHAT-HISTORY.md](docs/CHAT-HISTORY.md).
+- Deleting saved chats. `DELETE /api/chats/{id}` (authenticated) removes the
+  conversation, its messages and web turns, its RAG memory rows, and the
+  records of its finished delegated runs (events, decisions, and task-scoped
+  contracts/reviews), all in one transaction. It returns `204` on success,
+  `404` for an unknown chat, and `409` with an explanation while any of the
+  chat's delegated runs is live (`queued`, `launching`, `working`,
+  `waiting-for-peer`, `awaiting-approval`, `paused-quota`) or a chat request is
+  still planning, executing, or awaiting approval. Relay audit rows, and the
+  envelopes, messages, keys, and incidents they reference, are never deleted,
+  so the audit chain still verifies afterwards. The chat history sidebar has a
+  delete button per chat with an inline confirmation; a deleted chat leaves the
+  list without a page reload, and a refusal is shown on that chat's row.
 - Project-scoped memory: knowledge graph extraction plus a RAG pipeline over
   conversation history.
 - NVIDIA provider support for master reasoning and embeddings, alongside the

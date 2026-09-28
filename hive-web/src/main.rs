@@ -277,7 +277,10 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}", axum::routing::delete(kill_session))
         .route("/api/chats", get(chat::list_chats).post(chat::create_chat))
-        .route("/api/chats/{id}", get(chat::get_chat))
+        .route(
+            "/api/chats/{id}",
+            get(chat::get_chat).delete(chat::delete_chat),
+        )
         .route("/api/chat", post(chat::chat))
         .route("/api/chat/{run_id}/approve", post(chat::approve))
         .route("/api/runs", get(delegation::list))
@@ -319,6 +322,9 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         ))
         .with_state(state)
 }
+
+#[cfg(test)]
+mod chat_delete_tests;
 
 #[cfg(test)]
 mod router_tests {
