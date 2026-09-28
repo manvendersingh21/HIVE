@@ -52,11 +52,43 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- Run journals no longer store one event per streamed token. The Cursor adapter
+  joins contiguous `thinking` deltas and contiguous assistant text into one
+  event per block, flushed by any other event (tool call, tool result, result)
+  and at turn end; tool calls and results stay individual events. AGY response
+  `text_delta` step updates are joined the same way. OpenCode no longer
+  re-journals the whole message history every turn, nor a streaming message on
+  every poll: an unfinished message is journaled again only when a part starts
+  or changes status. A recorded Cursor run shrinks from 5,443 to 403 native
+  events. The native conversation id is written only when it changes, not on
+  every stream line.
+- Cursor runs record the `--model` value actually passed (or `auto`) as the
+  actual model and invocation evidence, never the init event's display name
+  (e.g. "GPT-5.2 Medium"), which `--model` rejects. A rejected model's
+  "Available models: ..." list is saved as the run's available models, and
+  display names stored by earlier runs are dropped when the run loads.
+- The master-agent provider selection and any Z.ai key entered in the
+  settings UI are now persisted robustly: `~/.hive/master-agent.json`
+  (relocatable via `HIVE_MASTER_AGENT_FILE`) is written atomically with
+  `0600` permissions, re-applied at startup below env/`hive.toml`
+  precedence, and never echoed by the API or logs. A corrupt state file is
+  ignored instead of affecting startup. See
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- Peer dependency deadlocks: a queued verifier can start when its implementer
+  is waiting for a peer with a pending message addressed to that verifier.
+  Other working or failed prerequisites still block launch. Plans can declare
+  `peer_dependencies` for required replies or agreements; validation rejects
+  peers queued directly or transitively behind their asker. Waiting runs explain
+  when a requested peer is queued behind them, across repeated sync cycles.
 - `config/workers.toml` is no longer tracked. It describes a specific fleet,
   including real hostnames and SSH account names; copy
   `config/workers.example.toml` instead.
 - The mock planning response in `scripts/check-nvidia.py` omitted the
   `target_machine` field that plan validation requires, failing CI on every run.
+- Local machine probe in `machines.rs`, delegation launch in `hive-core/src/delegation/transport.rs local_shell`,
+  and session launch in `hive-web/src/sessions.rs` now resolve and inherit the user's login-shell PATH
+  (with timeout and caching) with close-on-exec fd isolation, so tools added via shell profiles
+  (e.g. `~/.cargo/bin`, `~/.opencode/bin`, `~/.local/bin`) are discovered and executable without hardcoding or fd leakage.
 
 ### Known limitations
 

@@ -528,19 +528,24 @@ fn acknowledge(unacknowledged: &Unacknowledged, run: &str, snapshot: &Value) {
 
 const SESSION_ENDED: &str = "The agent's session has ended, so this run can't continue.";
 
-/// Whether every dependency of `run` completed so it may start. A dependency
-/// that failed can never complete, so the dependent is failed with that
-/// reason instead of waiting queued forever: work that cannot start must say
-/// so, and a dependent must never launch on a failed run.
-fn dependency_ready(runs: &[Run], run: &Run) -> Result<bool, String> {
+/// A dependency releases its dependent when it completes or waits for a peer
+/// with a pending message addressed to that dependent. Otherwise an implementer
+/// asking its queued verifier a question could wait forever for its own finish.
+/// Each prerequisite is checked independently; a message cannot bypass another
+/// working or failed prerequisite. `messages` is the dependent's durable inbox.
+fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool, String> {
+    let mut ready = true;
     for key in &run.assignment.dependencies {
         let mut completed = false;
         let mut failed = false;
+        let mut waiting_for_us = false;
         for dependency in runs.iter().filter(|r| {
             r.task_id == run.task_id && &r.assignment.key == key && r.state != "superseded"
         }) {
             completed |= dependency.state == "completed";
             failed |= dependency.state == "failed";
+            waiting_for_us |= dependency.state == "waiting-for-peer"
+                && messages.iter().any(|message| message["source"] == dependency.id);
         }
         if completed {
             continue;
@@ -548,9 +553,9 @@ fn dependency_ready(runs: &[Run], run: &Run) -> Result<bool, String> {
         if failed {
             return Err(format!("dependency {key} failed and can never complete"));
         }
-        return Ok(false);
+        ready &= waiting_for_us;
     }
-    Ok(true)
+    Ok(ready)
 }
 
 /// States in which a launched run's tmux session must still exist.
@@ -607,7 +612,7 @@ async fn sync_run(
         return Ok(());
     }
     if run.state == "queued" {
-        match dependency_ready(runs, run) {
+        match dependency_ready(runs, run, &store.pending_messages(&run.id)?) {
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(reason) => {
@@ -715,30 +720,7 @@ async fn sync_run(
         transport::update_peers(&worker, &run.id, &peers).await?;
     }
 
-    // Stage outgoing peer messages before advancing the source event cursor.
-    for event in snapshot["events"].as_array().into_iter().flatten() {
-        if event["kind"] == "peer" {
-            let to = event["payload"]["to"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Peer destination missing"))?;
-            let id = event["id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Peer event ID missing"))?;
-            let kind = event["payload"]["kind"].as_str().unwrap_or("message");
-            let text = event["payload"]["text"].as_str().unwrap_or("");
-            let agreement = if kind == "agreement" {
-                Some(match store.record_agreement(&run.id, to, text) {
-                    Ok(digest) => format!(" HACP v2 contract digest: {digest}. Echo this digest in an agreement message to accept."),
-                    Err(error) => format!(" HACP v2 rejected this unilateral change: {error}."),
-                })
-            } else { None };
-            let payload = json!({"id":id,"source":run.id,"kind":kind,"text":format!("Peer {} on {} ({kind}) says: {}{}",run.assignment.key,run.assignment.device,text,agreement.as_deref().unwrap_or(""))});
-            if runs.iter().any(|r| r.id == to && r.state != "superseded") {
-                store.message(id, &run.id, to, &payload)?;
-            }
-        }
-    }
-    store.sync(&run.id, &snapshot)?;
+    sync_peer_snapshot(store, run, runs, &mut snapshot)?;
     // The journal's report is authoritative, so a message it acknowledged in
     // this snapshot no longer needs a run that keeps syncing for it.
     acknowledge(unacknowledged, &run.id, &snapshot);
@@ -811,6 +793,74 @@ async fn sync_run(
     Ok(())
 }
 
+/// Import outgoing messages before advancing the journal cursor, and attach a
+/// coordinator reason to every waiting snapshot. The durable inbox, rather than
+/// just this page of new events, keeps the reason visible across sync cycles.
+fn sync_peer_snapshot(
+    store: &RunStore,
+    run: &Run,
+    runs: &[Run],
+    snapshot: &mut Value,
+) -> anyhow::Result<()> {
+    for event in snapshot["events"].as_array().into_iter().flatten() {
+        if event["kind"] == "peer" {
+            let to = event["payload"]["to"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Peer destination missing"))?;
+            let id = event["id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Peer event ID missing"))?;
+            let kind = event["payload"]["kind"].as_str().unwrap_or("message");
+            let text = event["payload"]["text"].as_str().unwrap_or("");
+            let agreement = if kind == "agreement" {
+                Some(match store.record_agreement(&run.id, to, text) {
+                    Ok(digest) => format!(" HACP v2 contract digest: {digest}. Echo this digest in an agreement message to accept."),
+                    Err(error) => format!(" HACP v2 rejected this unilateral change: {error}."),
+                })
+            } else { None };
+            let payload = json!({"id":id,"source":run.id,"kind":kind,"text":format!("Peer {} on {} ({kind}) says: {}{}",run.assignment.key,run.assignment.device,text,agreement.as_deref().unwrap_or(""))});
+            if runs.iter().any(|r| r.id == to && r.state != "superseded") {
+                store.message(id, &run.id, to, &payload)?;
+            }
+        }
+    }
+    if snapshot["metadata"]["state"] == "waiting-for-peer" {
+        let mut queued_behind = std::collections::HashSet::from([run.assignment.key.as_str()]);
+        loop {
+            let before = queued_behind.len();
+            for peer in runs
+                .iter()
+                .filter(|peer| peer.task_id == run.task_id && peer.state == "queued")
+            {
+                if peer.assignment.dependencies.iter().any(|key| queued_behind.contains(key.as_str())) {
+                    queued_behind.insert(peer.assignment.key.as_str());
+                }
+            }
+            if queued_behind.len() == before {
+                break;
+            }
+        }
+        for peer in runs.iter().filter(|peer| {
+            peer.task_id == run.task_id
+                && peer.state == "queued"
+                && queued_behind.contains(peer.assignment.key.as_str())
+        }) {
+            if store
+                .pending_messages(&peer.id)?
+                .iter()
+                .any(|message| message["source"] == run.id)
+            {
+                snapshot["metadata"]["reason"] = json!(format!(
+                    "waiting for {}, which is queued behind this run",
+                    peer.assignment.key
+                ));
+                break;
+            }
+        }
+    }
+    store.sync(&run.id, snapshot)
+}
+
 // Codex approval requests reference a previously emitted file-change item.
 // Retain its exact diff for review without altering the native grant fingerprint.
 fn enrich_approvals(snapshot: &mut Value, stored: &[Value]) {
@@ -841,6 +891,10 @@ fn enrich_approvals(snapshot: &mut Value, stored: &[Value]) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "delegation_tests.rs"]
+mod peer_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1106,24 +1160,24 @@ mod tests {
         let (a, b) = (&runs[0], &runs[1]);
         // While the dependency works the dependent just waits.
         store.sync(&a.id, &json!({"metadata":{"state":"working"},"events":[],"approvals":[]})).unwrap();
-        assert_eq!(dependency_ready(&runs, b), Ok(false));
+        assert_eq!(dependency_ready(&store.list().unwrap(), b, &[]), Ok(false));
         // A failed dependency (e.g. 'turn produced no actions') never releases it.
         store.sync(&a.id, &json!({"metadata":{"state":"failed"},"events":[],"approvals":[]})).unwrap();
         let runs = store.list().unwrap();
         let b = runs.iter().find(|r| r.id == b.id).unwrap();
-        match dependency_ready(&runs, b) {
+        match dependency_ready(&runs, b, &[]) {
             Err(reason) => assert!(reason.contains("dependency a failed"), "{reason}"),
             other => panic!("expected failure reason, got {other:?}"),
         }
-        // Only a completed dependency releases the dependent.
+        // Without a peer message, only completion releases the dependent.
         store.state(&a.id, "completed", "").unwrap();
         let runs = store.list().unwrap();
-        assert_eq!(dependency_ready(&runs, runs.iter().find(|r| r.id == b.id).unwrap()), Ok(true));
+        assert_eq!(dependency_ready(&runs, runs.iter().find(|r| r.id == b.id).unwrap(), &[]), Ok(true));
         // An unknown or superseded dependency keeps waiting, never starts.
         let mut orphan = plan.clone();
         orphan.assignments[1].dependencies = vec!["missing".into()];
         let superseded = store.create("task2", "chat", &orphan).unwrap();
-        assert_eq!(dependency_ready(&superseded, &superseded[1]), Ok(false));
+        assert_eq!(dependency_ready(&superseded, &superseded[1], &[]), Ok(false));
     }
 
     #[test]

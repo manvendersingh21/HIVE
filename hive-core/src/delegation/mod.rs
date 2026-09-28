@@ -23,6 +23,10 @@ pub struct Assignment {
     pub workspace: String,
     pub objective: String,
     pub dependencies: Vec<String>,
+    /// Peers whose replies or agreements are needed during this assignment.
+    /// These are communication requirements, not completion prerequisites.
+    #[serde(default)]
+    pub peer_dependencies: Vec<String>,
     pub acceptance_criteria: Vec<String>,
     /// Repository-relative globs exclusively owned by this assignment.
     #[serde(default)]
@@ -348,6 +352,35 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             "Unknown or cyclic assignment dependencies"
         );
     }
+    // A peer conversation may be bilateral, but its recipient must be able to
+    // start before the asker finishes. Catch planned circular waits here;
+    // runtime message handling is a fallback for unplanned questions.
+    for a in &plan.assignments {
+        if a.peer_dependencies.is_empty() {
+            continue;
+        }
+        let mut queued_behind = std::collections::HashSet::from([a.key.as_str()]);
+        loop {
+            let before = queued_behind.len();
+            for candidate in &plan.assignments {
+                if candidate.dependencies.iter().any(|d| queued_behind.contains(d.as_str())) {
+                    queued_behind.insert(candidate.key.as_str());
+                }
+            }
+            if queued_behind.len() == before {
+                break;
+            }
+        }
+        for peer in &a.peer_dependencies {
+            anyhow::ensure!(keys.contains(peer), "Unknown peer dependency {peer} for {}", a.key);
+            anyhow::ensure!(peer != &a.key, "Assignment {} cannot be its own peer dependency", a.key);
+            anyhow::ensure!(
+                !queued_behind.contains(peer.as_str()),
+                "Assignment {} needs replies from {peer}, which is queued behind it by completion dependencies; remove the blocking dependencies so these peers can run concurrently",
+                a.key
+            );
+        }
+    }
     Ok(())
 }
 
@@ -540,7 +573,9 @@ pub async fn plan(
         Only require GPU or heavy-compute when the user explicitly needs that capability. \
         Every workspace is a fresh unique child of ~/hive-workspaces/. Each assignment has a unique key. \
         owned_paths are repository-relative globs exclusively owned by that assignment; never assign equal, parent, or child paths to two assignments. \
-        dependencies are assignment keys that must complete before this starts; peers that must negotiate concurrently have no dependency on each other. \
+        dependencies are assignment keys that normally complete before this starts; a waiting dependency may wake its dependent early with a peer message. \
+        peer_dependencies lists assignment keys whose replies or agreements this assignment needs during its work, or [] when none are required. These do not delay launch. \
+        Peers that must negotiate concurrently have no completion dependency on each other: validation rejects a required peer queued directly or transitively behind its asker. \
         Acceptance criteria must require implementation, independent verification, deployment evidence when requested and peer agreement. \
         For questions that need no work, answer in summary and use an empty assignments list. \
         containers: leave it empty unless the user explicitly asks for a new container or sandbox; existing containers are already in the fleet with a container tag, so reuse them. \
@@ -553,10 +588,10 @@ pub async fn plan(
     "containers":{"type":"array","maxItems":MAX_NEW_CONTAINERS,"items":{"type":"object","additionalProperties":false,
         "required":["name","host"],"properties":{"name":{"type":"string"},"host":{"type":"string"}}}},
     "assignments":{"type":"array","items":{"type":"object","additionalProperties":false,
-    "required":["key","device","agent","model","workspace","objective","dependencies","acceptance_criteria","owned_paths","required_capabilities"],"properties":{
+    "required":["key","device","agent","model","workspace","objective","dependencies","peer_dependencies","acceptance_criteria","owned_paths","required_capabilities"],"properties":{
         "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode","cursor"]},
         "model":{"type":["string","null"]},"workspace":{"type":"string"},"objective":{"type":"string"},
-        "dependencies":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},
+        "dependencies":{"type":"array","items":{"type":"string"}},"peer_dependencies":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},
         "owned_paths":{"type":"array","items":{"type":"string"}},
         "required_capabilities":{"type":"array","items":{"type":"string"}}
     }}}}});
@@ -824,6 +859,62 @@ mod tests {
         p.assignments[0].workspace = "~/hive-workspaces/test".into();
         p.assignments[0].required_capabilities = vec!["heavy-compute".into()];
         assert!(validate(&p, &agent).is_err());
+    }
+
+    fn peer_plan() -> DelegationPlan {
+        let mut p = plan();
+        let mut verifier = p.assignments[0].clone();
+        verifier.key = "verifier".into();
+        verifier.workspace = "~/hive-workspaces/verifier".into();
+        verifier.objective = "verify implementation".into();
+        verifier.dependencies = vec!["a".into()];
+        p.assignments.push(verifier);
+        p
+    }
+
+    #[test]
+    fn peer_dependencies_allow_verification_and_concurrent_conversations() {
+        let agent = agent();
+        let mut p = peer_plan();
+        // Old saved plans remain valid; verification can wait for implementation
+        // when the implementer does not already require a verifier's reply.
+        assert!(p.assignments[0].peer_dependencies.is_empty());
+        validate(&p, &agent).unwrap();
+        p.assignments[0].peer_dependencies = vec!["verifier".into()];
+        let error = validate(&p, &agent).unwrap_err().to_string();
+        assert!(error.contains("needs replies from verifier, which is queued behind it"), "{error}");
+        // Mutual peer requirements are legal once both can launch concurrently.
+        p.assignments[1].dependencies.clear();
+        p.assignments[1].peer_dependencies = vec!["a".into()];
+        validate(&p, &agent).unwrap();
+    }
+
+    #[test]
+    fn peer_dependencies_reject_transitive_completion_waits() {
+        let agent = agent();
+        let mut p = peer_plan();
+        let mut middle = p.assignments[1].clone();
+        middle.key = "middle".into();
+        middle.workspace = "~/hive-workspaces/middle".into();
+        p.assignments[1].dependencies = vec!["middle".into()];
+        p.assignments.push(middle);
+        p.assignments[0].peer_dependencies = vec!["verifier".into()];
+        let error = validate(&p, &agent).unwrap_err().to_string();
+        assert!(error.contains("needs replies from verifier, which is queued behind it"), "{error}");
+    }
+
+    #[test]
+    fn peer_dependencies_reject_unknown_and_self_peers_without_relaxing_cycles() {
+        let agent = agent();
+        let mut p = peer_plan();
+        for (peer, expected) in [("missing", "Unknown peer dependency"), ("a", "own peer dependency")] {
+            p.assignments[0].peer_dependencies = vec![peer.into()];
+            let error = validate(&p, &agent).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        p.assignments[0].peer_dependencies = vec!["verifier".into()];
+        p.assignments[0].dependencies = vec!["verifier".into()];
+        assert!(validate(&p, &agent).unwrap_err().to_string().contains("cyclic assignment dependencies"));
     }
     fn coordinator(name: &str) -> MasterAgent {
         let agent = agent().with_master_name(name);
