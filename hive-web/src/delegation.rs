@@ -9,7 +9,7 @@ use axum::{
 use hive_core::{
     delegation::{
         self, inventory,
-        store::{Run, RunStore},
+        store::{MessageRejected, Run, RunStore},
         transport,
     },
     memory::chats::SavedTurn,
@@ -171,8 +171,19 @@ pub async fn events(
         Err(e) => error(e),
     }
 }
-pub async fn audit(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
-    match store(&h).and_then(|s| s.audit(&id)) {
+#[derive(Deserialize, Default)]
+pub struct AuditQuery {
+    /// `?full=1` re-verifies the whole chain instead of only new rows.
+    #[serde(default)]
+    pub full: Option<String>,
+}
+pub async fn audit(
+    State(h): State<AgentHandle>,
+    Path(id): Path<String>,
+    Query(q): Query<AuditQuery>,
+) -> Response {
+    let full = matches!(q.full.as_deref(), Some("1" | "true"));
+    match store(&h).and_then(|s| if full { s.audit_full(&id) } else { s.audit(&id) }) {
         Ok(report) => Json(report).into_response(),
         Err(e) => error(e),
     }
@@ -382,6 +393,12 @@ pub async fn reconcile(
 }
 
 pub fn start(h: AgentHandle) {
+    // Full re-verification once per process start; polls are then incremental.
+    match store(&h).and_then(|s| s.verify_audit_chain()) {
+        Ok(true) => {}
+        Ok(false) => tracing::error!("relay audit chain failed full verification"),
+        Err(error) => tracing::warn!(error=%error, "relay audit verification unavailable"),
+    }
     let reviewer = h.clone();
     tokio::spawn(async move {
         loop {
@@ -820,7 +837,15 @@ fn sync_peer_snapshot(
             } else { None };
             let payload = json!({"id":id,"source":run.id,"kind":kind,"text":format!("Peer {} on {} ({kind}) says: {}{}",run.assignment.key,run.assignment.device,text,agreement.as_deref().unwrap_or(""))});
             if runs.iter().any(|r| r.id == to && r.state != "superseded") {
-                store.message(id, &run.id, to, &payload)?;
+                // A rejected event (changed envelope under a reused ID, or a
+                // forbidden route) is recorded once as an incident; skipping it
+                // lets the cursor advance instead of retrying it forever.
+                if let Err(error) = store.message(id, &run.id, to, &payload) {
+                    if !error.is::<MessageRejected>() {
+                        return Err(error);
+                    }
+                    tracing::warn!(run=%run.id, message=%id, error=%error, "peer event rejected");
+                }
             }
         }
     }
@@ -919,7 +944,7 @@ mod tests {
         let id = run_with_events(&h, 0);
         let store = store(&h).unwrap();
         store.message("audit-test", "user", &id, &json!({"id":"audit-test","text":"hello"})).unwrap();
-        let response = audit(State(h.clone()), Path(id.clone())).await;
+        let response = audit(State(h.clone()), Path(id.clone()), Query(AuditQuery::default())).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
@@ -930,7 +955,12 @@ mod tests {
         assert!(!raw.contains("secret"));
         assert!(!raw.contains("hello"));
         assert!(raw.contains("public_key"));
-        assert_eq!(audit(State(h), Path("unknown".into())).await.status(), StatusCode::BAD_REQUEST);
+        let full = audit(State(h.clone()), Path(id.clone()), Query(AuditQuery { full: Some("1".into()) })).await;
+        let body = axum::body::to_bytes(full.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["verification"], "full");
+        assert_eq!(value["chain_valid"], true);
+        assert_eq!(audit(State(h), Path("unknown".into()), Query(AuditQuery::default())).await.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1200,5 +1230,38 @@ mod tests {
         let mut unknown = json!({"approvals":[{"action":json!({"tool":"item/fileChange/requestApproval","arguments":{"itemId":"absent"}}).to_string()}]});
         enrich_approvals(&mut unknown, &events);
         assert!(unknown["approvals"][0]["details"].is_null());
+    }
+
+    #[test]
+    fn rejected_peer_event_is_one_incident_and_cursor_advances() {
+        let h = handle();
+        let store = store(&h).unwrap();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[
+            {"key":"a","device":"air","agent":"codex","model":null,"workspace":"~/hive-workspaces/a","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]},
+            {"key":"b","device":"air","agent":"codex","model":null,"workspace":"~/hive-workspaces/b","objective":"review","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        let runs = store.create("task", "chat", &plan).unwrap();
+        let (a, b) = (&runs[0], &runs[1]);
+        let peer = |seq: i64, text: &str| json!({"metadata":{"state":"working"},"approvals":[],"events":[
+            {"id":"peer-1","seq":seq,"kind":"peer","payload":{"to":b.id,"kind":"message","text":text}}]});
+        sync_peer_snapshot(&store, a, &runs, &mut peer(1, "original")).unwrap();
+        assert_eq!(store.get(&a.id).unwrap().cursor, 1);
+        // The untrusted journal re-emits the same ID with different content.
+        for attempt in 0..5 {
+            sync_peer_snapshot(&store, a, &runs, &mut peer(2 + attempt, "changed")).unwrap();
+        }
+        let run = store.get(&a.id).unwrap();
+        assert_eq!(run.cursor, 6, "cursor advances past the rejected event");
+        assert_eq!(run.relay["incidents"].as_array().unwrap().len(), 1);
+        assert_eq!(run.relay["incidents"][0]["message_id"], "peer-1");
+        let rejects = store.audit_full(&a.id).unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["record"]["event"] == "reject")
+            .count();
+        assert_eq!(rejects, 1);
+        // The original, verified message still reaches its destination.
+        let delivery = store.next_delivery(&b.id).unwrap().unwrap();
+        assert!(delivery.payload["text"].as_str().unwrap().ends_with("says: original"));
     }
 }

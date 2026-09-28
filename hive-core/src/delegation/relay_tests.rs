@@ -303,6 +303,8 @@ fn append_only_audit_detects_modified_missing_middle_tail_and_all_rows() {
         assert!(store.0.lock().unwrap().execute_batch(mutation).is_err());
         exec(&store,"DROP TRIGGER relay_audit_no_update; DROP TRIGGER relay_audit_no_delete;");
         exec(&store,mutation);
+        assert_eq!(store.audit_full(&runs[0].id).unwrap()["chain_valid"],false,"{mutation}");
+        // A failed full verification is sticky for subsequent cheap polls.
         assert_eq!(store.audit(&runs[0].id).unwrap()["chain_valid"],false,"{mutation}");
     }
 }
@@ -332,4 +334,107 @@ fn migration_does_not_resign_unsigned_messages_and_sync_cannot_erase_incidents()
             "integrity"
         );
     }
+}
+
+/// Appends `count` synthetic audit rows in one transaction (fast seeding).
+fn seed_chain(store: &RunStore, run: &Run, count: usize) {
+    let mut db = store.0.lock().unwrap();
+    let tx = db.transaction().unwrap();
+    let envelope = relay::Envelope {
+        id: "seed".into(),
+        task_id: run.task_id.clone(),
+        source: run.id.clone(),
+        destination: "elsewhere".into(),
+        kind: "message".into(),
+        text_digest: String::new(),
+        seq: 1,
+        staged_at: String::new(),
+    };
+    for _ in 0..count {
+        relay::audit(&tx, "stage", &envelope, json!({}), 1_000).unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn incremental_audit_reads_only_new_rows_of_a_large_chain() {
+    let (store, runs) = fixture(relay::Budget::default());
+    seed_chain(&store, &runs[0], 20_000);
+    let started = std::time::Instant::now();
+    let full = store.audit_full(&runs[0].id).unwrap();
+    let full_time = started.elapsed();
+    assert_eq!(full["chain_valid"], true);
+    assert_eq!(full["verification"], "full");
+    assert_eq!(full["verified_rows"], 20_000);
+    assert_eq!(full["total_entries"], 20_000);
+    assert_eq!(full["entries"].as_array().unwrap().len(), 200);
+    assert_eq!(full["entries"][199]["record"]["position"], 20_000);
+    // Default call: nothing new since the checkpoint, so nothing is re-hashed.
+    let started = std::time::Instant::now();
+    let cached = store.audit(&runs[0].id).unwrap();
+    let cached_time = started.elapsed();
+    assert_eq!(cached["verification"], "incremental");
+    assert_eq!(cached["verified_rows"], 0);
+    assert_eq!(cached["chain_valid"], true);
+    assert!(cached_time < full_time, "{cached_time:?} vs {full_time:?}");
+    // One new message adds exactly one stage row; only that row is read.
+    stage(&store, &runs[0], &runs[1], "fresh");
+    let next = store.audit(&runs[1].id).unwrap();
+    assert_eq!(next["verified_rows"], 1);
+    assert_eq!(next["verified_through"], 20_001);
+    assert_eq!(next["chain_valid"], true);
+    // Only the requested run's entries are returned.
+    assert_eq!(next["total_entries"], 1);
+    assert_eq!(next["entries"][0]["record"]["message_id"], "fresh");
+}
+
+#[test]
+fn full_audit_detects_old_rows_and_incremental_detects_new_rows() {
+    let (store, runs) = fixture(relay::Budget::default());
+    stage(&store, &runs[0], &runs[1], "one");
+    stage(&store, &runs[0], &runs[1], "two");
+    assert_eq!(store.audit(&runs[0].id).unwrap()["chain_valid"], true);
+    exec(&store, "DROP TRIGGER relay_audit_no_update; DROP TRIGGER relay_audit_no_delete;");
+    // Tampering with a row the checkpoint already covers is found by a full pass.
+    exec(&store, "UPDATE delegated_relay_audit SET record=json_set(record,'$.seq',9) WHERE position=1");
+    assert_eq!(store.audit_full(&runs[0].id).unwrap()["chain_valid"], false);
+
+    let (store, runs) = fixture(relay::Budget::default());
+    stage(&store, &runs[0], &runs[1], "one");
+    stage(&store, &runs[0], &runs[1], "two");
+    assert_eq!(store.audit(&runs[0].id).unwrap()["chain_valid"], true);
+    exec(&store, "DROP TRIGGER relay_audit_no_update; DROP TRIGGER relay_audit_no_delete;");
+    exec(&store, "DELETE FROM delegated_relay_audit WHERE position=1");
+    assert_eq!(store.audit_full(&runs[0].id).unwrap()["chain_valid"], false);
+
+    // A row appended after the checkpoint is verified by the default call.
+    let (store, runs) = fixture(relay::Budget::default());
+    stage(&store, &runs[0], &runs[1], "one");
+    assert_eq!(store.audit(&runs[0].id).unwrap()["chain_valid"], true);
+    stage(&store, &runs[0], &runs[1], "two");
+    exec(&store, "DROP TRIGGER relay_audit_no_update;");
+    exec(&store, "UPDATE delegated_relay_audit SET record=json_set(record,'$.seq',9) WHERE position=2");
+    let report = store.audit(&runs[0].id).unwrap();
+    assert_eq!(report["verification"], "incremental");
+    assert_eq!(report["verified_rows"], 1);
+    assert_eq!(report["chain_valid"], false);
+}
+
+#[test]
+fn repeated_conflicting_message_records_one_incident_and_one_reject() {
+    let (store, runs) = fixture(relay::Budget::default());
+    stage(&store, &runs[0], &runs[1], "one");
+    for _ in 0..5 {
+        let error = store
+            .message("one", &runs[0].id, &runs[1].id, &json!({"id":"one","text":"changed"}))
+            .unwrap_err();
+        assert!(error.is::<MessageRejected>());
+    }
+    let incidents: i64 = store.0.lock().unwrap().query_row(
+        "SELECT count(*) FROM delegated_relay_incidents WHERE message_id='one'", [], |r| r.get(0)).unwrap();
+    assert_eq!(incidents, 1);
+    let rejects: i64 = store.0.lock().unwrap().query_row(
+        "SELECT count(*) FROM delegated_relay_audit WHERE json_extract(record,'$.event')='reject'", [], |r| r.get(0)).unwrap();
+    assert_eq!(rejects, 1);
+    assert_eq!(store.audit_full(&runs[0].id).unwrap()["chain_valid"], true);
 }

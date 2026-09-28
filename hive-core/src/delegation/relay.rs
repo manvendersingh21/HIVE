@@ -8,7 +8,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hacp::v2::canon;
 use rand_core::{OsRng, RngCore};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -103,6 +103,11 @@ pub(super) fn schema(db: &Connection) -> anyhow::Result<()> {
         CREATE TABLE IF NOT EXISTS delegated_relay_head (
         singleton INTEGER PRIMARY KEY CHECK(singleton=1), position INTEGER NOT NULL, digest TEXT NOT NULL);
         INSERT OR IGNORE INTO delegated_relay_head VALUES(1,0,'');
+        CREATE TABLE IF NOT EXISTS delegated_relay_verified (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), position INTEGER NOT NULL,
+        digest TEXT NOT NULL, valid INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS relay_audit_source ON delegated_relay_audit(json_extract(record,'$.source'));
+        CREATE INDEX IF NOT EXISTS relay_audit_destination ON delegated_relay_audit(json_extract(record,'$.destination'));
         CREATE TRIGGER IF NOT EXISTS relay_audit_no_update BEFORE UPDATE ON delegated_relay_audit
         BEGIN SELECT RAISE(ABORT,'relay audit is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS relay_audit_no_delete BEFORE DELETE ON delegated_relay_audit
@@ -211,7 +216,7 @@ fn timestamp(now: i64) -> anyhow::Result<String> {
         .to_string())
 }
 
-fn audit(
+pub(super) fn audit(
     db: &Connection,
     event: &str,
     envelope: &Envelope,
@@ -314,7 +319,18 @@ fn routing(db: &Connection, id: &str) -> anyhow::Result<Envelope> {
     })?)
 }
 
+/// Records an integrity incident at most once per (message, reason), so an
+/// untrusted journal that keeps re-emitting the same conflict cannot grow the
+/// append-only chain on every sync retry.
 pub(super) fn incident(db: &Connection, id: &str, reason: &str, now: i64) -> anyhow::Result<()> {
+    let seen: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM delegated_relay_incidents WHERE message_id=? AND reason=?)",
+        params![id, reason],
+        |r| r.get(0),
+    )?;
+    if seen {
+        return Ok(());
+    }
     let envelope = routing(db, id)?;
     db.execute("INSERT INTO delegated_relay_incidents(source,destination,message_id,kind,reason,created_at) VALUES(?,?,?,'integrity',?,?)", params![envelope.source,envelope.destination,id,reason,timestamp(now)?])?;
     audit(
@@ -512,40 +528,117 @@ pub(super) fn status(db: &Connection, run: &str) -> anyhow::Result<Value> {
     Ok(json!({"mode":MODE,"incidents":incidents,"held":held}))
 }
 
-pub(super) fn audit_report(db: &Connection, run: &str) -> anyhow::Result<Value> {
-    let mut stmt =
-        db.prepare("SELECT position,record,digest FROM delegated_relay_audit ORDER BY position")?;
-    let rows = stmt.query_map([], |r| {
+/// Verifies audit rows after `(position, digest)` and returns the last verified
+/// link, whether every link held, and how many rows were read.
+fn verify_chain(
+    db: &Connection,
+    mut position: i64,
+    mut previous: String,
+) -> anyhow::Result<(i64, String, bool, u64)> {
+    let mut stmt = db.prepare(
+        "SELECT position,record,digest FROM delegated_relay_audit WHERE position>? ORDER BY position",
+    )?;
+    let rows = stmt.query_map([position], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
         ))
     })?;
-    let (mut position, mut previous, mut valid) = (0, String::new(), true);
-    let mut entries = Vec::new();
+    let (mut valid, mut read) = (true, 0);
     for row in rows {
         let (index, raw, digest) = row?;
+        read += 1;
         let record: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
         valid &= index == position + 1
             && record["position"] == index
             && record["previous_digest"] == previous
             && canon::digest_of(&record).ok().as_ref() == Some(&digest);
-        if record["source"] == run || record["destination"] == run {
-            entries.push(json!({"record":record,"digest":digest}));
-        }
         position = index;
         previous = digest;
     }
+    Ok((position, previous, valid, read))
+}
+
+/// Serves the audit chain for one run. By default only rows appended since the
+/// persisted checkpoint are hashed, so the 5-second UI poll is O(new rows) rather
+/// than O(history). `full` re-verifies the whole chain from genesis (used at
+/// startup and on demand) and is the only mode that detects edits to rows
+/// older than the checkpoint. Must run inside a write transaction.
+pub(super) fn audit_report(db: &Connection, run: &str, full: bool) -> anyhow::Result<Value> {
     let head: (i64, String) = db.query_row(
         "SELECT position,digest FROM delegated_relay_head WHERE singleton=1",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    valid &= head == (position, previous);
-    // Validation covers the entire global chain, including its anchored tail.
-    let start = entries.len().saturating_sub(100);
-    Ok(
-        json!({"mode":MODE,"chain_valid":valid,"head":{"position":head.0,"digest":head.1},"entries":entries[start..],"total_entries":entries.len()}),
-    )
+    let checkpoint: Option<(i64, String, bool)> = db
+        .query_row(
+            "SELECT position,digest,valid FROM delegated_relay_verified WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let full = full || checkpoint.is_none();
+    let (valid, position, digest, read) = match checkpoint.filter(|_| !full) {
+        // A failed chain stays failed until a full re-verification clears it.
+        Some((position, digest, false)) => (false, position, digest, 0),
+        Some((position, digest, true)) => {
+            // The anchor row must still hold the digest verified earlier; this
+            // detects truncation of the tail and a rewound head in O(1).
+            let anchored = position == 0
+                || db
+                    .query_row(
+                        "SELECT digest FROM delegated_relay_audit WHERE position=?",
+                        [position],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .as_ref()
+                    == Some(&digest);
+            let (end, last, linked, read) = verify_chain(db, position, digest.clone())?;
+            let valid = anchored && linked && head == (end, last.clone());
+            if valid {
+                (true, end, last, read)
+            } else {
+                (false, position, digest, read)
+            }
+        }
+        None => {
+            let (end, last, linked, read) = verify_chain(db, 0, String::new())?;
+            let valid = linked && head == (end, last.clone());
+            (valid, end, last, read)
+        }
+    };
+    db.execute(
+        "INSERT INTO delegated_relay_verified VALUES(1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET position=excluded.position,digest=excluded.digest,valid=excluded.valid",
+        params![position, digest, valid],
+    )?;
+    let run_rows = "SELECT position,record,digest FROM delegated_relay_audit WHERE json_extract(record,'$.source')=?1 UNION SELECT position,record,digest FROM delegated_relay_audit WHERE json_extract(record,'$.destination')=?1";
+    let total: i64 = db.query_row(
+        &format!("SELECT count(*) FROM ({run_rows})"),
+        [run],
+        |r| r.get(0),
+    )?;
+    let mut stmt = db.prepare(&format!(
+        "SELECT record,digest FROM ({run_rows}) ORDER BY position DESC LIMIT 200"
+    ))?;
+    let mut entries = stmt
+        .query_map([run], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .map(|row| {
+            let (raw, digest) = row?;
+            let record: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+            Ok(json!({"record":record,"digest":digest}))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    entries.reverse();
+    Ok(json!({
+        "mode":MODE,
+        "chain_valid":valid,
+        "verification":if full {"full"} else {"incremental"},
+        "verified_rows":read,
+        "verified_through":position,
+        "head":{"position":head.0,"digest":head.1},
+        "entries":entries,
+        "total_entries":total,
+    }))
 }

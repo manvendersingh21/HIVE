@@ -22,6 +22,18 @@ pub struct Run {
     pub relay: Value,
 }
 
+/// A message was refused because its ID already names a different envelope, or
+/// its route is not allowed. The refusal is already recorded (as a single
+/// incident where a message exists), so a sync loop may continue past it.
+#[derive(Debug)]
+pub struct MessageRejected(pub String);
+impl std::fmt::Display for MessageRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for MessageRejected {}
+
 #[derive(Clone)]
 pub struct RunStore(Arc<Mutex<Connection>>, relay::Budget);
 
@@ -384,11 +396,8 @@ impl RunStore {
         payload: &Value,
     ) -> anyhow::Result<()> {
         let to = self.get(destination)?;
-        if source != "user" {
-            anyhow::ensure!(
-                self.get(source)?.task_id == to.task_id,
-                "Peer message crosses task boundary"
-            );
+        if source != "user" && self.get(source)?.task_id != to.task_id {
+            return Err(MessageRejected("Peer message crosses task boundary".into()).into());
         }
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -402,6 +411,9 @@ impl RunStore {
                 let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM delegated_messages WHERE id=?)", [id], |r| r.get(0))?;
                 if exists { relay::incident(&tx, id, "Message ID reused with a different envelope", chrono::Utc::now().timestamp())?; }
                 tx.commit()?;
+                if exists {
+                    return Err(MessageRejected(error.to_string()).into());
+                }
                 Err(error)
             }
         }
@@ -435,13 +447,30 @@ impl RunStore {
     pub fn delivery_failed(&self, delivery: &relay::Delivery) -> anyhow::Result<()> {
         relay::release(&self.0.lock().unwrap(), delivery)
     }
+    /// Incremental audit: hashes only rows appended since the last verified
+    /// checkpoint and serves the cached validity otherwise.
     pub fn audit(&self, run: &str) -> anyhow::Result<Value> {
+        self.audit_with(run, false)
+    }
+    /// Full audit from genesis; detects removed or modified old rows.
+    pub fn audit_full(&self, run: &str) -> anyhow::Result<Value> {
+        self.audit_with(run, true)
+    }
+    fn audit_with(&self, run: &str, full: bool) -> anyhow::Result<Value> {
         self.get(run)?;
+        self.audit_report(run, full)
+    }
+    /// Re-verifies the whole chain and refreshes the checkpoint (startup).
+    pub fn verify_audit_chain(&self) -> anyhow::Result<bool> {
+        Ok(self.audit_report("", true)?["chain_valid"] == true)
+    }
+    fn audit_report(&self, run: &str, full: bool) -> anyhow::Result<Value> {
         let mut db = self.0.lock().unwrap();
         // Read the chain and its head from one SQLite snapshot even when a
-        // second coordinator connection is appending audit records.
-        let tx = db.transaction()?;
-        let report = relay::audit_report(&tx, run)?;
+        // second coordinator connection is appending audit records; IMMEDIATE
+        // because the verified checkpoint is written in the same transaction.
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let report = relay::audit_report(&tx, run, full)?;
         tx.commit()?;
         Ok(report)
     }
