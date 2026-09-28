@@ -131,8 +131,9 @@ export default function AgentPage() {
   useEffect(() => {
     void api<{ chat: boolean }>("/api/capabilities")
       .then((data) => {
+        // The search effect below loads the first page; loading it here as
+        // well raced a quick "Load more" and could overwrite page two.
         setCapable(data.chat);
-        if (data.chat) void loadChats("", 0);
         const linked = new URLSearchParams(window.location.search).get("chat");
         if (data.chat && linked) void open(linked);
       })

@@ -431,10 +431,12 @@ fn is_shared(machine: &Entity) -> bool {
         .unwrap_or(false)
 }
 
-/// Remove machines from the graph that are not in `known`.
+/// Remove machines and agent inventories from the graph that are not in `known`.
 ///
 /// Returns the names dropped. Called after a refresh, so the graph tracks the
-/// configured fleet rather than accumulating every host ever probed.
+/// configured fleet rather than accumulating every host ever probed. Device
+/// agent entities are stored separately from their machines, so they must be
+/// removed explicitly; deleting a machine only cascades its `has_agent` edge.
 pub fn prune_unknown(kg: &KnowledgeGraph, known: &[String]) -> anyhow::Result<Vec<String>> {
     let mut removed = Vec::new();
     for machine in kg.entities_of_kind("machine")? {
@@ -442,6 +444,12 @@ pub fn prune_unknown(kg: &KnowledgeGraph, known: &[String]) -> anyhow::Result<Ve
             if kg.remove_entity(&machine.id)? {
                 removed.push(machine.name);
             }
+        }
+    }
+    for agent in kg.entities_of_kind("device-agent")? {
+        let device = agent.attrs.get("device").and_then(|value| value.as_str());
+        if !device.is_some_and(|device| known.iter().any(|known| known == device)) {
+            kg.remove_entity(&agent.id)?;
         }
     }
     Ok(removed)
@@ -810,6 +818,37 @@ mod tests {
 
         // Idempotent: a second pass finds nothing left to drop.
         assert!(prune_unknown(&kg, &["keep-me".to_string()]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pruning_drops_only_unknown_device_agent_inventory() {
+        let kg = KnowledgeGraph::in_memory().unwrap();
+        for device in ["known", "unknown"] {
+            project_into_graph(&kg, &facts(device, &[], 8.0, true)).unwrap();
+            let agent = Entity::new(
+                "device-agent",
+                &format!("{device}/codex"),
+                json!({"device": device, "agent": "codex"}),
+            );
+            kg.upsert_entity(&agent).unwrap();
+            kg.add_edge(&entity_id("machine", device), "has_agent", &agent.id)
+                .unwrap();
+        }
+
+        let dropped = prune_unknown(&kg, &["known".to_string()]).unwrap();
+
+        assert_eq!(dropped, vec!["unknown"]);
+        assert!(kg.entity("device-agent:known/codex").unwrap().is_some());
+        assert!(kg.entity("device-agent:unknown/codex").unwrap().is_none());
+        assert_eq!(
+            kg.edges_from("machine:known")
+                .unwrap()
+                .iter()
+                .filter(|edge| edge.relation == "has_agent")
+                .count(),
+            1
+        );
+        assert!(kg.edges_from("machine:unknown").unwrap().is_empty());
     }
 
     #[test]
