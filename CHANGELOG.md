@@ -67,6 +67,19 @@ may still change without a deprecation period.
   (e.g. "GPT-5.2 Medium"), which `--model` rejects. A rejected model's
   "Available models: ..." list is saved as the run's available models, and
   display names stored by earlier runs are dropped when the run loads.
+- The master-agent provider selection and any Z.ai key entered in the
+  settings UI are now persisted robustly: `~/.hive/master-agent.json`
+  (relocatable via `HIVE_MASTER_AGENT_FILE`) is written atomically with
+  `0600` permissions, re-applied at startup below env/`hive.toml`
+  precedence, and never echoed by the API or logs. A corrupt state file is
+  ignored instead of affecting startup. See
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- Peer dependency deadlocks: a queued verifier can start when its implementer
+  is waiting for a peer with a pending message addressed to that verifier.
+  Other working or failed prerequisites still block launch. Plans can declare
+  `peer_dependencies` for required replies or agreements; validation rejects
+  peers queued directly or transitively behind their asker. Waiting runs explain
+  when a requested peer is queued behind them, across repeated sync cycles.
 - `config/workers.toml` is no longer tracked. It describes a specific fleet,
   including real hostnames and SSH account names; copy
   `config/workers.example.toml` instead.

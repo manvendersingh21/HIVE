@@ -33,9 +33,30 @@ export HIVE_CONFIG_ROOT="/path/to/config"
 export HIVE_WEB_STATIC="/path/to/static/files"
 export HIVE_MASTER_NAME="your-master-name"
 
+# Master-agent settings persistence (optional)
+export HIVE_MASTER_AGENT_FILE="/var/lib/hive/master-agent.json"
+
 # Logging
 export RUST_LOG="hive_web=info,hive_core=info"
 ```
+
+### Master-Agent Settings Persistence
+
+The provider picked in the settings UI (and any Z.ai key entered there) is
+persisted in `~/.hive/master-agent.json` so it survives restarts; set
+`HIVE_MASTER_AGENT_FILE` to move the file (e.g. onto persistent storage).
+
+- **Permissions**: the file is written atomically (temp file + rename) with
+  mode `0600` — it holds an API key, so only the service user may read it.
+- **Precedence**: the environment and `hive.toml` always win over the file.
+  A key resolved from `[llm.zai]`/`Z_AI` is never replaced by the persisted
+  one, and an explicit `single_provider` in `hive.toml` beats the persisted
+  provider selection.
+- **Key handling**: the key is never echoed by the settings API (it reports
+  `configured: true/false` only), never logged, and never placed in a prompt.
+- **Corrupt files**: unreadable or corrupt state is ignored at startup (the
+  process falls back to `hive.toml`) and rewritten on the next save.
+
 
 The browser frontend is a TypeScript Next.js app exported as static files. The
 export is not committed: `hive-web/static/` is build output. The launch script
