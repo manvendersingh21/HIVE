@@ -86,6 +86,42 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
                 await adapter.connect(self.assignment, self.j)
             self.assertEqual(adapter.start.call_count, 2)
 
+    async def test_agy_yolo_adds_dangerously_skip_permissions(self):
+        adapter = self.agy()
+        adapter.start = AsyncMock()
+        yolo_assignment = dict(self.assignment, autonomy='yolo')
+        with patch.object(runner, 'executable', return_value='/bin/agy'):
+            await adapter.connect(yolo_assignment, self.j)
+        args = adapter.start.call_args.args[0]
+        self.assertIn('--dangerously-skip-permissions', args)
+
+    async def test_agy_non_yolo_omits_dangerously_skip_permissions(self):
+        adapter = self.agy()
+        adapter.start = AsyncMock()
+        with patch.object(runner, 'executable', return_value='/bin/agy'):
+            await adapter.connect(self.assignment, self.j)
+        args = adapter.start.call_args.args[0]
+        self.assertNotIn('--dangerously-skip-permissions', args)
+
+    async def test_agy_denied_actions_with_empty_response_fails_turn(self):
+        adapter = self.agy()
+        adapter.notifications.put_nowait(dict(event='result', result=dict(
+            conversation_id='native-id', status='SUCCESS',
+            denied_actions=[dict(tool='bash', command='rm -rf /')],
+            response='',
+        )))
+        with self.assertRaisesRegex(RuntimeError, 'denied actions'):
+            await adapter.turn('start')
+
+    async def test_agy_denied_actions_with_nonempty_response_succeeds(self):
+        adapter = self.agy()
+        adapter.notifications.put_nowait(dict(event='result', result=dict(
+            conversation_id='native-id', status='SUCCESS',
+            denied_actions=[dict(tool='bash', command='rm -rf /')],
+            response='partial output',
+        )))
+        await adapter.turn('start')
+
     async def test_agy_hook_denies_then_consumes_only_exact_one_use_grant(self):
         request = dict(toolCall=dict(name='run_command', args=dict(CommandLine='sudo true', Cwd=str(self.workspace))),
                        conversationId='native-id', modelName='model')
