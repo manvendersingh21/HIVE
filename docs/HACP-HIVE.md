@@ -20,14 +20,17 @@ deserializing a wire object is not a substitute for validation and authorization
 
 ## Dependency and versions
 
-The root `Cargo.toml` declares `hacp` with an HTTPS Git URL and a full commit
-revision. `hive-core` and `hive-adapter` consume that workspace dependency. The
-lockfile records the exact source. There is no HACP source directory or submodule
-in HIVE, and a contributor does not need a local protocol checkout to build it.
+The root `Cargo.toml` declares `hacp` with an HTTPS Git URL pinned to commit
+`9e784bfe5db115ebeeb9fe537ee170ea377ab975`. `hive-core` enables HACP's
+`guardian` feature; `hive-adapter` consumes the workspace dependency without
+that feature. The lockfile records the exact source. There is no HACP source
+directory or submodule in HIVE, and a contributor does not need a local protocol
+checkout to build it.
 
-The package remains version **1.1.0**. Root modules implement frozen HACP/1.1;
-`hacp::v2` implements the separate HACP/2.0 draft. Cargo package versions do not
-identify the wire version, and these two wire protocols are not compatible.
+The pinned package reports version **1.1.1**. Root modules implement frozen
+HACP/1.1; `hacp::v2` implements the separate HACP/2.0 draft. Cargo package
+versions do not identify the wire version, and these two wire protocols are not
+compatible.
 
 - `hive-core/src/collab` and `hive-adapter` use the legacy 1.1 APIs.
 - `hive-core/src/runtime` and `hive collab` use the v2 bilateral APIs.
