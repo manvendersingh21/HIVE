@@ -102,12 +102,10 @@ fn remote_shell(worker: &WorkerInfo, command: &str) -> Command {
 const LOCAL_ENV: [&str; 6] = ["HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR"];
 
 pub fn local_shell(command: &str) -> Command {
-    let mut cmd = Command::new("/bin/sh");
+    let mut cmd = Command::new("bash");
     cmd.env_clear()
         .envs(LOCAL_ENV.iter().filter_map(|k| Some((*k, std::env::var_os(k)?))))
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .arg("-c")
-        .arg(format!("{}; {command}", crate::workers::ssh::REMOTE_PATH));
+        .args(["-l", "-c", &format!("{}; export PATH=\"$HOME/.cargo/bin:$PATH\"; {command}", crate::workers::ssh::REMOTE_PATH)]);
     if let Some(home) = std::env::var_os("HOME") {
         cmd.current_dir(home);
     }
@@ -230,5 +228,17 @@ mod tests {
         let err = ssh(&coordinator(), "echo nope >&2; exit 3", None).await.unwrap_err();
         assert_eq!(err.to_string(), "mac-mini: nope\n");
         assert!(ssh_timeout(&coordinator(), "sleep 5", None, 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn coordinator_commands_use_login_shell_path() {
+        let out = ssh(
+            &coordinator(),
+            r#"case ":$PATH:" in *":$HOME/.cargo/bin:"*) printf 'cargo-on-path';; esac"#,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "cargo-on-path");
     }
 }

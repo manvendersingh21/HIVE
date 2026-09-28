@@ -57,6 +57,11 @@ may still change without a deprecation period.
   `config/workers.example.toml` instead.
 - The mock planning response in `scripts/check-nvidia.py` omitted the
   `target_machine` field that plan validation requires, failing CI on every run.
+- Local machine probe in `machines.rs`, delegation launch in `transport.rs`
+  `local_shell`, and session launch in `hive-web/src/sessions.rs` now run
+  through the user's login shell with login-shell PATH so tools installed in
+  `~/.cargo/bin` or added to PATH via shell profile (e.g. cargo, rustc, opencode)
+  are discovered and executable.
 
 ### Known limitations
 
