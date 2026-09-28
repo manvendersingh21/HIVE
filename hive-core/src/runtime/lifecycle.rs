@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 
 use hacp::v2::contract::{ContractLimits, Relationship, Submission, Task, Verdict};
 use hacp::v2::{
-    canon, kinds, Artifact, Check, Contract, ContractState, Envelope, Session, Verification,
+    canon, kinds, Artifact, Check, Contract, ContractError, ContractState, Envelope, Session,
+    Verification,
 };
 use serde_json::{json, Value};
 
@@ -450,6 +451,15 @@ async fn drive(
         if let Err(e) = validate_terms(&candidate) { fail!(Stage::Review, "invalid counter terms: {e}"); }
         if let Err(e) = contract.counter(b_urn) {
             if contract.state == ContractState::NoAgreement {
+                return negotiation_exhausted(&mut session, a, b, session_id, a_urn, b_urn, contract_id, &e.to_string()).await;
+            }
+            if matches!(e, ContractError::RepeatedCounter(_)) {
+                // §7.4 (HACP/2.0): the same participant cannot counter twice in
+                // succession — e.g. the worker asks another clarification after
+                // the supervisor adopted the proposed terms. The protocol
+                // refuses to record the counter; the negotiation is over, so
+                // settle as NoAgreement rather than failing the run.
+                contract.expire_negotiation()?;
                 return negotiation_exhausted(&mut session, a, b, session_id, a_urn, b_urn, contract_id, &e.to_string()).await;
             }
             return Err(e.into());
@@ -1553,13 +1563,37 @@ mod tests {
     #[tokio::test]
     async fn negotiation_limit_is_no_agreement_without_executing_work() {
         let scratch = Scratch::new("negotiation-bound");
-        let request = write("accept.json", "{\"accepted\":false,\"question\":\"clarify the scope\"}");
-        let host = FakeAgent::new(vec![write("delegation-terms.json", &terms("status.txt")), request.clone(),
-            write("counter-1.json", "{\"accepted\":true}"), request.clone(),
-            write("counter-2.json", "{\"accepted\":true}"), request]);
+        // §7.4 (HACP/2.0): a participant cannot counter twice in succession, so
+        // the bound is reached by alternating — worker question (round 1),
+        // supervisor revision (round 2), worker question (round 3 of 3).
+        let question = write("accept.json", "{\"accepted\":false,\"question\":\"clarify the scope\"}");
+        let revision = write("counter-1.json", &json!({
+            "accepted": false,
+            "terms": serde_json::from_str::<Value>(&terms("status.txt")).unwrap(),
+            "answer": "clarified"
+        }).to_string());
+        let host = FakeAgent::new(vec![write("delegation-terms.json", &terms("status.txt")),
+            question.clone(), revision, question]);
         let report = run_bilateral(&host, &durable_config(scratch.join("run"))).await.unwrap();
         assert!(matches!(report.outcome, RunOutcome::NoAgreement { .. }));
-        assert_eq!(report.calls.len(), 6);
+        assert_eq!(report.calls.len(), 4);
+        assert!(report.calls.iter().all(|c| !c.stage.contains("work")));
+        assert!(report.artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_repeated_question_cannot_counter_twice_in_succession() {
+        let scratch = Scratch::new("negotiation-repeat");
+        // The worker questions, the supervisor adopts the proposed terms, and
+        // the worker questions again: §7.4 refuses the second successive
+        // counter by the same participant, and the run settles as NoAgreement
+        // instead of an error.
+        let question = write("accept.json", "{\"accepted\":false,\"question\":\"clarify the scope\"}");
+        let host = FakeAgent::new(vec![write("delegation-terms.json", &terms("status.txt")),
+            question.clone(), write("counter-1.json", "{\"accepted\":true}"), question]);
+        let report = run_bilateral(&host, &durable_config(scratch.join("run"))).await.unwrap();
+        assert!(matches!(report.outcome, RunOutcome::NoAgreement { .. }));
+        assert_eq!(report.calls.len(), 4);
         assert!(report.calls.iter().all(|c| !c.stage.contains("work")));
         assert!(report.artifacts.is_empty());
     }
