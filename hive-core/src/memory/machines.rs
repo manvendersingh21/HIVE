@@ -219,11 +219,15 @@ fn parse_probe(name: &str, host: &str, tags: Vec<String>, raw: &str) -> MachineF
 }
 
 static CACHED_LOGIN_PATH: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+const PATH_SENTINEL: &str = "__HIVE_PATH__=";
 
 /// Query the user's login shell once to resolve PATH additions from shell profiles.
-async fn query_login_path() -> String {
+async fn query_login_path() -> (String, bool) {
     let fallback = || {
-        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string())
+        (
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string()),
+            false,
+        )
     };
     let shell = std::env::var("SHELL").unwrap_or_default();
     let shell = if shell.trim().is_empty() {
@@ -233,7 +237,7 @@ async fn query_login_path() -> String {
     };
 
     let mut std_cmd = std::process::Command::new(&shell);
-    std_cmd.args(["-lic", "printf %s \"$PATH\""]);
+    std_cmd.args(["-lic", "printf '\\n__HIVE_PATH__=%s\\n' \"$PATH\""]);
     #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt;
@@ -250,11 +254,16 @@ async fn query_login_path() -> String {
 
     match tokio::time::timeout(std::time::Duration::from_secs(3), cmd.output()).await {
         Ok(Ok(out)) if out.status.success() => {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if s.is_empty() {
-                fallback()
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some((_, val)) = text.rsplit_once(PATH_SENTINEL) {
+                let s = val.lines().next().unwrap_or("").trim().to_string();
+                if s.is_empty() {
+                    fallback()
+                } else {
+                    (s, true)
+                }
             } else {
-                s
+                fallback()
             }
         }
         _ => fallback(),
@@ -273,7 +282,7 @@ fn query_login_path_sync() -> String {
     };
 
     let mut std_cmd = std::process::Command::new(&shell);
-    std_cmd.args(["-lic", "printf %s \"$PATH\""]);
+    std_cmd.args(["-lic", "printf '\\n__HIVE_PATH__=%s\\n' \"$PATH\""]);
     #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt;
@@ -287,14 +296,19 @@ fn query_login_path_sync() -> String {
 
     match std_cmd.output() {
         Ok(out) if out.status.success() => {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if s.is_empty() {
-                fallback()
-            } else {
-                if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
-                    *guard = Some(s.clone());
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some((_, val)) = text.rsplit_once(PATH_SENTINEL) {
+                let s = val.lines().next().unwrap_or("").trim().to_string();
+                if s.is_empty() {
+                    fallback()
+                } else {
+                    if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
+                        *guard = Some(s.clone());
+                    }
+                    s
                 }
-                s
+            } else {
+                fallback()
             }
         }
         _ => fallback(),
@@ -318,9 +332,11 @@ pub async fn resolve_login_path() -> String {
             return path.clone();
         }
     }
-    let resolved = query_login_path().await;
-    if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
-        *guard = Some(resolved.clone());
+    let (resolved, success) = query_login_path().await;
+    if success {
+        if let Ok(mut guard) = CACHED_LOGIN_PATH.write() {
+            *guard = Some(resolved.clone());
+        }
     }
     resolved
 }
