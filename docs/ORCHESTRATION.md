@@ -62,7 +62,7 @@ Each assignment is one agent, on one device, with one objective:
 ```
 
 `device` must name a machine from `config/workers.toml`. `agent` must be one of
-`claude`, `codex`, `agy`, `opencode`. `model` is optional; `null` lets the agent
+`claude`, `codex`, `agy`, `opencode`, `cursor`. `model` is optional; `null` lets the agent
 use its own default. `dependencies` reference other assignments by `key`, and an
 assignment waits until the ones it names have finished.
 

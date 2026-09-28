@@ -255,7 +255,7 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             anyhow::bail!("Unknown device: {}", a.device);
         }
         anyhow::ensure!(
-            ["claude", "codex", "agy", "opencode"].contains(&a.agent.as_str()),
+            ["claude", "codex", "agy", "opencode", "cursor"].contains(&a.agent.as_str()),
             "Unknown agent: {}",
             a.agent
         );
@@ -445,7 +445,7 @@ pub fn validate_explicit(
     let mut placements = Vec::new();
     for worker in &targets(agent) {
         let pattern = format!(
-            r"(?i)\b(claude|codex|agy|opencode)(?:\s+agent)?\s+on\s+{}(?:\s+(?:using|with)\s+(?:the\s+)?model\s+([[:alnum:]][[:alnum:]_.:/@\[\]-]*[[:alnum:]_\]])|(?:$|\.(?:\s|$)|[^[:alnum:]_.-]))",
+            r"(?i)\b(claude|codex|agy|opencode|cursor)(?:\s+agent)?\s+on\s+{}(?:\s+(?:using|with)\s+(?:the\s+)?model\s+([[:alnum:]][[:alnum:]_.:/@\[\]-]*[[:alnum:]_\]])|(?:$|\.(?:\s|$)|[^[:alnum:]_.-]))",
             regex::escape(&worker.name)
         );
         for captures in regex::Regex::new(&pattern)?.captures_iter(request) {
@@ -553,7 +553,7 @@ pub async fn plan(
         "required":["name","host"],"properties":{"name":{"type":"string"},"host":{"type":"string"}}}},
     "assignments":{"type":"array","items":{"type":"object","additionalProperties":false,
     "required":["key","device","agent","model","workspace","objective","dependencies","acceptance_criteria","owned_paths","required_capabilities"],"properties":{
-        "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode"]},
+        "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode","cursor"]},
         "model":{"type":["string","null"]},"workspace":{"type":"string"},"objective":{"type":"string"},
         "dependencies":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},
         "owned_paths":{"type":"array","items":{"type":"string"}},
@@ -931,6 +931,29 @@ mod tests {
         changed.assignments[0].agent = "codex".into();
         assert!(validate_explicit("Use Codex on air", &changed, &agent).is_ok());
         assert!(validate_explicit("Use Claude on air", &changed, &agent).is_err());
+    }
+    #[test]
+    fn cursor_assignments_validate_and_honour_explicit_placements() {
+        let agent = agent();
+        let mut p = plan();
+        p.assignments[0].agent = "cursor".into();
+        p.assignments[0].model = Some("gpt-5.2".into());
+        // Cursor is a known type, so the plan validates.
+        assert!(validate(&p, &agent).is_ok());
+        // It is also recognised as an explicit placement the user named.
+        assert!(validate_explicit("Use cursor on air", &p, &agent).is_ok());
+        assert!(validate_explicit("Use cursor on air using model gpt-5.2", &p, &agent).is_ok());
+        // The model the user names has to be the one assigned.
+        assert!(validate_explicit("Use cursor on air using model gpt-5.3-codex", &p, &agent).is_err());
+        // A device name that merely starts like the worker's is not a
+        // placement: codex is in no assignment, so a match would be an error.
+        assert!(validate_explicit("Use codex on air_backup", &p, &agent).is_ok());
+        assert!(validate_explicit("Use codex on air", &p, &agent).is_err());
+        // An unknown type is still rejected.
+        let mut unknown = p.clone();
+        unknown.assignments[0].agent = "cursr".into();
+        let err = validate(&unknown, &agent).unwrap_err().to_string();
+        assert!(err.contains("Unknown agent"), "{err}");
     }
     #[test]
     fn invalid_workspaces_are_replaced_and_valid_ones_kept() {

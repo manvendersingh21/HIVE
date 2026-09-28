@@ -71,6 +71,7 @@ pub const PROBED_TOOLS: &[&str] = &[
     "codex",
     "opencode",
     "agy",
+    "cursor-agent",
     "ollama",
     "git",
     "tmux",
