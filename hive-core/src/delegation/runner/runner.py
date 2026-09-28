@@ -551,6 +551,118 @@ def discover_opencode(path):
             proc.wait()
 
 
+# A paused run sends its continue turn this long after the provider's reset,
+# so a clock that runs slightly ahead of the provider's does not fail it again.
+QUOTA_GRACE = 60
+QUOTA_POLL = 5
+
+
+class QuotaPaused(RuntimeError):
+    """A turn stopped on a provider usage limit that resets at a known time."""
+
+    def __init__(self, agent, resets_at, message):
+        super().__init__(message)
+        self.agent, self.resets_at, self.message = agent, int(resets_at), message
+
+
+def usage_snapshot(agent, rate_limits, previous=None, now=None):
+    """Merge Codex's sparse `account/rateLimits/updated` into one usage record.
+
+    A missing window is unavailable in that update, not cleared. The record's
+    percent and reset come from the most used window; with several exhausted
+    windows the latest reset wins, since all of them must reset.
+    """
+    windows = dict((previous or {}).get('windows') or {})
+    for name in ('primary', 'secondary'):
+        window = (rate_limits or {}).get(name)
+        if isinstance(window, dict) and isinstance(window.get('usedPercent'), (int, float)):
+            windows[name] = dict(used_percent=window['usedPercent'], resets_at=window.get('resetsAt'),
+                                 window_minutes=window.get('windowDurationMins'))
+    if not windows:
+        return previous
+    worst = max(windows.values(), key=lambda w: (w['used_percent'], w.get('resets_at') or 0))
+    return dict(agent=agent, used_percent=worst['used_percent'], resets_at=worst.get('resets_at'),
+                exhausted=worst['used_percent'] >= 100, windows=windows,
+                observed_at=int(time.time() if now is None else now))
+
+
+def reset_from_message(text, now=None):
+    """The reset time a usage-limit message states, as epoch seconds, or None."""
+    now = time.time() if now is None else now
+    match = re.search(r'limit reached\|(\d{10})\b', text)
+    if match:
+        return int(match.group(1))
+    units = dict(d=86400, h=3600, m=60, s=1)
+    match = re.search(r'(?i)\b(?:in|after)\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b[\s,]*(?:and\s+)?)+)', text)
+    if match:
+        seconds = sum(int(n)*units[u[0].lower()] for n, u in re.findall(r'(\d+)\s*([A-Za-z]+)', match.group(1)))
+        if seconds:
+            return int(now + seconds)
+    match = re.search(r'(?i)\b(?:at|resets?(?:\s+at)?|until)\s+(\d{1,2})(?::(\d{2}))?\s*([ap])?\.?m?\.?(?=[\s,.;)]|$)', text)
+    if match and (match.group(2) or match.group(3)):
+        import datetime
+        hour, minute = int(match.group(1)), int(match.group(2) or 0)
+        if match.group(3):
+            hour = hour % 12 + (12 if match.group(3).lower() == 'p' else 0)
+        if hour < 24 and minute < 60:
+            local = datetime.datetime.fromtimestamp(now)
+            reset = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if reset.timestamp() <= now:
+                reset += datetime.timedelta(days=1)
+            return int(reset.timestamp())
+    return None
+
+
+USAGE_LIMIT = re.compile(r'(?i)usage limit|rate limit|quota|hit your limit|limit reached|out of credits')
+
+
+def quota_pause(agent, message, usage=None, now=None):
+    """A QuotaPaused for a usage-limit failure with a future reset, else None.
+
+    Without a known reset time a run stays failed: resuming blind would only
+    fail again on the same limit.
+    """
+    now = time.time() if now is None else now
+    if not USAGE_LIMIT.search(message):
+        return None
+    resets_at = reset_from_message(message, now)
+    if resets_at is None and usage and isinstance(usage.get('resets_at'), (int, float)):
+        resets_at = usage['resets_at']
+    if resets_at is None or resets_at <= now:
+        return None
+    return QuotaPaused(agent, resets_at, message)
+
+
+def pause_for_quota(journal, message_id, pause):
+    """The paused turn was delivered and ended cleanly: acknowledge it and wait."""
+    with journal.db:
+        journal.db.execute("UPDATE inbox SET state='acknowledged' WHERE id=?", (message_id,))
+    journal.emit('acknowledgment', dict(message_id=message_id))
+    journal.set('usage', dict(journal.get('usage') or {}, agent=pause.agent, used_percent=100,
+                              resets_at=pause.resets_at, exhausted=True, observed_at=int(time.time())))
+    quota = dict(agent=pause.agent, resets_at=pause.resets_at, message=pause.message[:2000],
+                 paused_at=int(time.time()))
+    journal.set('quota', quota)
+    journal.state('paused-quota')
+    journal.emit('quota-paused', quota)
+
+
+def resume_after_quota(journal, now=None):
+    """Queue the continue turn once a paused quota has reset; True while still paused."""
+    quota = journal.get('quota')
+    if not quota:
+        return False
+    now = time.time() if now is None else now
+    if now < quota['resets_at'] + QUOTA_GRACE:
+        return True
+    journal.enqueue(dict(id='quota-resume-'+str(uuid.uuid4()),
+                         text='Your '+quota['agent']+' usage limit has reset. Continue the same assignment from where you stopped; '
+                              'inspect the workspace first and do not repeat work that already succeeded.'))
+    journal.set('quota', None)
+    journal.emit('quota-resumed', dict(quota, resumed_at=int(now)))
+    return False
+
+
 class Codex(JsonProcess):
     @staticmethod
     def validate_hive_tool(journal, name, args):
@@ -722,13 +834,43 @@ class Codex(JsonProcess):
         journal.set('native_conversation_id', self.native)
         journal.set('actual_model', result.get('model'))
 
+    @staticmethod
+    def usage_limited(error):
+        return isinstance(error, dict) and error.get('codexErrorInfo') == 'usageLimitExceeded'
+
+    @staticmethod
+    def quota_pause(journal, error, now=None):
+        """A usageLimitExceeded turn error pauses until its window resets.
+
+        The latest rate-limit update names the reset of the exhausted window;
+        the error text is the fallback when no update arrived this session.
+        """
+        now = time.time() if now is None else now
+        message = str(error.get('message') or 'Codex usage limit exceeded')
+        usage = journal.get('usage') or {}
+        windows = list((usage.get('windows') or {}).values())
+        exhausted = [w['resets_at'] for w in windows if w.get('used_percent', 0) >= 100 and isinstance(w.get('resets_at'), (int, float))]
+        resets_at = max(exhausted) if exhausted else reset_from_message(message, now)
+        if resets_at is None and isinstance(usage.get('resets_at'), (int, float)):
+            resets_at = usage['resets_at']
+        if resets_at is None or resets_at <= now:
+            return None
+        return QuotaPaused('codex', resets_at, message)
+
     async def turn(self, prompt):
         await self.rpc('turn/start', dict(threadId=self.native, input=[dict(type='text', text=prompt)]))
+        limited = None
         while True:
             event = await self.notifications.get()
             if 'disconnected' in event:
                 raise RuntimeError(event['disconnected'])
             method, params = event.get('method', ''), event.get('params', {})
+            if method == 'account/rateLimits/updated' and isinstance(params.get('rateLimits'), dict):
+                usage = usage_snapshot('codex', params['rateLimits'], self.j.get('usage'))
+                if usage:
+                    self.j.set('usage', usage)
+            if method == 'error' and self.usage_limited(params.get('error')) and not params.get('willRetry'):
+                limited = params['error']
             if method in ('item/started', 'item/completed') and params.get('item', {}).get('id'):
                 self.items[params['item']['id']] = params['item']
             if 'id' in event and method:
@@ -754,8 +896,13 @@ class Codex(JsonProcess):
             if method:
                 self.j.emit('native', event)
             if method == 'turn/completed':
-                if params.get('turn', {}).get('status') != 'completed':
-                    raise RuntimeError(encode(params.get('turn', {})))
+                turn = params.get('turn', {})
+                if turn.get('status') != 'completed':
+                    error = turn.get('error') if self.usage_limited(turn.get('error')) else limited
+                    pause = self.quota_pause(self.j, error) if error else None
+                    if pause:
+                        raise pause
+                    raise RuntimeError(encode(turn))
                 return
 
 
@@ -1368,6 +1515,10 @@ async def run(assignment, journal):
             journal.enqueue(dict(id='initial', text=prompt))
         recovery_message = 'recovery-'+authorization['id'] if authorization else None
         while True:
+            # Nothing is delivered while paused: every turn would hit the same limit.
+            if resume_after_quota(journal):
+                await asyncio.sleep(QUOTA_POLL)
+                continue
             row = journal.db.execute("SELECT * FROM inbox WHERE state='queued' ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END, rowid LIMIT 1", (recovery_message,)).fetchone()
             if row is None:
                 await asyncio.sleep(0.5)
@@ -1377,7 +1528,17 @@ async def run(assignment, journal):
             with journal.db:
                 journal.db.execute("UPDATE inbox SET state='delivering' WHERE id=?", (row['id'],))
             journal.state('working')
-            await adapter.turn(message.get('text', encode(message)))
+            try:
+                await adapter.turn(message.get('text', encode(message)))
+            except QuotaPaused as pause:
+                pause_for_quota(journal, row['id'], pause)
+                continue
+            except RuntimeError as error:
+                pause = quota_pause(assignment['agent'], str(error), journal.get('usage'))
+                if pause is None:
+                    raise
+                pause_for_quota(journal, row['id'], pause)
+                continue
             with journal.db:
                 journal.db.execute("UPDATE inbox SET state='acknowledged' WHERE id=?", (row['id'],))
             journal.emit('acknowledgment', dict(message_id=row['id']))

@@ -6,8 +6,10 @@ import {
   Entry,
   RunEvent,
   TERMINAL_STATES,
+  Quota,
   describeAction,
   lastError,
+  pausedLabel,
   stateTone,
   transcript,
 } from "../lib/runEvents";
@@ -44,6 +46,7 @@ export type Run = {
     error?: string;
     actual_model?: string;
     approvals?: Approval[];
+    quota?: Quota | null;
   };
   review?: { status?: string; summary?: string } | null;
 };
@@ -54,11 +57,17 @@ const STATE_LABELS: Record<string, string> = {
   "awaiting-approval": "Needs approval",
   "needs-setup": "Needs setup",
   "waiting-for-peer": "Waiting for peer",
+  "paused-quota": "Paused: quota",
 };
-export function StateChip({ state }: { state: string }) {
+// With its run, a quota pause names the agent and when its quota resets.
+export function StateChip({ state, run }: { state: string; run?: Run }) {
+  const label =
+    state === "paused-quota" && run
+      ? pausedLabel(run.metadata?.quota || undefined, run.assignment.agent)
+      : STATE_LABELS[state] || state;
   return (
     <span className={`chip ${stateTone(state)}`} data-state={state}>
-      {STATE_LABELS[state] || state}
+      {label}
     </span>
   );
 }
@@ -293,6 +302,16 @@ export function RunAttention({
           <div>{failure}</div>
         </div>
       )}
+      {run.state === "paused-quota" && (
+        <div className="banner" role="status" data-testid="quota-paused">
+          <strong>{pausedLabel(run.metadata?.quota || undefined, run.assignment.agent)}</strong>
+          <div>
+            The agent hit its usage limit. Hive continues this conversation automatically
+            after the reset; runs that depend on it stay queued unless it hands over a branch
+            or commit.
+          </div>
+        </div>
+      )}
       {run.state === "queued" && waitingOn.length > 0 && (
         <div className="banner">
           <strong>Waiting to start</strong>
@@ -310,7 +329,7 @@ export function RunAttention({
                 )}{" "}
                 {dep && (
                   <>
-                    (<StateChip state={dep.state} />)
+                    (<StateChip state={dep.state} run={dep} />)
                   </>
                 )}
               </span>
@@ -573,7 +592,7 @@ export function RunTitle({ run }: { run: Run }) {
         </strong>
         {model && <span className="pill mono">{model}</span>}
       </div>
-      <StateChip state={run.state} />
+      <StateChip state={run.state} run={run} />
     </div>
   );
 }

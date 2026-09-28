@@ -153,9 +153,13 @@ reliably; see the caveat below.
 These are real constraints, not planned work that happens to be undone:
 
 - **Explicit pairs are the reliable form.** Canonical phrases such as
-  `Claude on gpu-node` are enforced against the fleet. Phrasing outside that
-  shape still depends on how the planner interprets it; there is no general
-  natural-language constraint parser.
+  `Claude on gpu-node` are enforced against the fleet when phrased as an
+  assignment: `Assignment 1: Claude on gpu-node`, `assignments: …`,
+  `use Claude on gpu-node`, or `Claude on gpu-node implements …`. A pair
+  mentioned in parentheses or quotes, in narrative, or in a negation ("don't
+  use …") is not a requirement, and a rejected plan quotes the sentence that
+  required the pair. Phrasing outside that shape still depends on how the
+  planner interprets it; there is no general natural-language constraint parser.
 - **AGY and OpenCode need live validation.** Both adapters are implemented and
   appear in inventory, but provider-backed execution through them has not been
   verified end to end. Presence in inventory is not proof of working
