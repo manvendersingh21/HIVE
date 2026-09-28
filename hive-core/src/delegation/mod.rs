@@ -728,6 +728,7 @@ pub async fn plan(
         peer_dependencies lists assignment keys whose replies or agreements this assignment needs during its work, or [] when none are required. These do not delay launch. \
         Peers that must negotiate concurrently have no completion dependency on each other: validation rejects a required peer queued directly or transitively behind its asker. \
         Acceptance criteria must require implementation, independent verification, deployment evidence when requested and peer agreement. \
+        Never instruct agents to edit CHANGELOG.md directly; instruct them to add a changelog.d/ fragment instead. \
         For questions that need no work, answer in summary and use an empty assignments list. \
         containers: leave it empty unless the user explicitly asks for a new container or sandbox; existing containers are already in the fleet with a container tag, so reuse them. \
         When asked, list at most {MAX_NEW_CONTAINERS} new containers as {{name, host}}: host is a fleet machine or the coordinator (never a container), and name becomes a new device that assignments in this plan may use. \
