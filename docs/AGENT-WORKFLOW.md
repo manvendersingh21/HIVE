@@ -53,3 +53,7 @@ The last command uses real Ollama and configured workers through an isolated
 Hive web instance. It leaves requested files and sessions available for
 inspection. The harness submits requests; all workload implementation happens
 inside Hive.
+
+## Recording changes
+
+Agents and contributors must not edit `CHANGELOG.md` directly. Instead, add a changelog fragment in `changelog.d/<name>.md` using standard Keep a Changelog headings (`### Added`, `### Changed`, `### Fixed`, etc.) and validate with `python3 scripts/changelog.py check`. See [CONTRIBUTING.md](../CONTRIBUTING.md#how-to-record-a-change).

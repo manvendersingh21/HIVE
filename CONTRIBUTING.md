@@ -41,6 +41,27 @@ alter production data merely to make a diagnostic pass. Preserve paused tasks
 for inspection. Capture the exact commands and evidence, distinguish seeded
 faults from naturally occurring failures, and report skipped tests honestly.
 
+## How to record a change
+
+Do not edit `CHANGELOG.md` directly. When multiple contributors or agents work concurrently, editing `CHANGELOG.md` causes merge conflicts. Instead, record notable changes using fragment files in `changelog.d/`.
+
+1. Create a markdown file under `changelog.d/<name>.md` (e.g. `changelog.d/fix-login-path.md` or `changelog.d/123-new-adapter.md`).
+2. Use standard Keep a Changelog section headings:
+   - `### Added` for new features.
+   - `### Changed` for changes in existing functionality.
+   - `### Deprecated` for soon-to-be removed features.
+   - `### Removed` for now removed features.
+   - `### Fixed` for any bug fixes.
+   - `### Security` in case of vulnerabilities.
+3. Under each heading, write concise bullet points describing the change. Fragment files must not be empty and must contain at least one valid section heading.
+4. Validate your fragment locally before submitting a pull request:
+
+   ```sh
+   python3 scripts/changelog.py check
+   ```
+
+At release time, maintainers run `python3 scripts/changelog.py release <version>` to fold all fragments into `CHANGELOG.md` under the new version heading and delete the fragment files.
+
 ## Pull requests
 
 - Explain the problem, implementation, limitations, and exact validation run.
