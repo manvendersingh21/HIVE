@@ -4,6 +4,7 @@ pub mod containers;
 pub mod coordination;
 pub mod inventory;
 pub mod review;
+pub mod relay;
 pub mod store;
 pub mod transport;
 

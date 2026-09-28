@@ -88,6 +88,7 @@ async function defaults(page: Page) {
       "/api/chats": [chat],
       "/api/chats/chat-1": { messages: [] },
       "/api/runs": [],
+      "/api/runs/run-1/audit": { mode: "Relay-attested (HACP Secure degraded mode)", chain_valid: true, entries: [], total_entries: 0, head: { position: 0, digest: "" } },
       "/api/sessions": [session],
       "/api/session-hosts": [
         { host: "local", name: "local" },
@@ -2341,4 +2342,45 @@ test.describe("managed containers", () => {
     await expect(page.getByRole("status")).toContainText("The container itself is still there");
     expect(deletes).toEqual([""]);
   });
+});
+
+test("relay audit exposes degraded attestation, holds and integrity incidents", async ({ page }) => {
+  await page.route("**/api/runs?*", route => route.fulfill({ json: [{ ...run,
+    identity: { public_key: "ab".repeat(32), fingerprint: "cd".repeat(32) },
+    relay: { mode: "Relay-attested (HACP Secure degraded mode)",
+      held: [{ message_id: "m2", reason: "Per-run peer message budget exhausted; held for the rolling 60-second window" }],
+      incidents: [{ kind: "integrity", message_id: "m1", reason: "Signature, payload, routing or sequence verification failed", created_at: "2026-09-28T10:00:00Z" }] }
+  }] }));
+  await page.route("**/api/runs/run-1/events?*", route => route.fulfill({ json: [] }));
+  await page.route("**/api/runs/run-1/audit", route => route.fulfill({ json: {
+    mode: "Relay-attested (HACP Secure degraded mode)", chain_valid: true, total_entries: 1,
+    head: { position: 1, digest: "ef".repeat(32) },
+    entries: [{ digest: "ef".repeat(32), record: { position: 1, event: "reject", at: "2026-09-28T10:00:00Z", message_id: "m1", seq: 1, detail: { reason: "Signature mismatch" } } }]
+  } }));
+  await page.goto("/session/?run=run-1");
+  await expect(page.getByRole("heading", { name: "Relay-attested (HACP Secure degraded mode)" })).toBeVisible();
+  await expect(page.getByText("Audit chain verified")).toBeVisible();
+  await expect(page.getByText("Relay integrity incident", { exact: true })).toBeVisible();
+  await expect(page.getByText("Peer messages held", { exact: true })).toBeVisible();
+  await page.getByText("Run public identity", { exact: true }).click();
+  await expect(page.getByText("cd".repeat(32), { exact: true })).toBeVisible();
+  await page.getByText("Recent audit events (1)", { exact: true }).click();
+  await expect(page.getByText("Signature mismatch", { exact: true })).toBeVisible();
+  await page.screenshot({ path: "/tmp/wp-a-relay-session.png", fullPage: true });
+});
+
+test("relay audit shows a broken chain and an unavailable audit without claiming verification", async ({ page }) => {
+  await page.route("**/api/runs?*", route => route.fulfill({ json: [run] }));
+  await page.route("**/api/runs/run-1/events?*", route => route.fulfill({ json: [] }));
+  await page.route("**/api/runs/run-1/audit", route => route.fulfill({ json: {
+    mode: "Relay-attested (HACP Secure degraded mode)", chain_valid: false, total_entries: 0,
+    head: { position: 1, digest: "bad" }, entries: []
+  } }));
+  await page.goto("/session/?run=run-1");
+  await expect(page.getByText("Audit chain integrity failure", { exact: true })).toBeVisible();
+  await expect(page.getByText("Audit chain verified", { exact: true })).toHaveCount(0);
+  await page.route("**/api/runs/run-1/audit", route => route.fulfill({ status: 503, body: "Unavailable" }));
+  await page.reload();
+  await expect(page.getByText(/Audit unavailable:/)).toBeVisible();
+  await expect(page.getByText("Audit chain verified", { exact: true })).toHaveCount(0);
 });

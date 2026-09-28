@@ -46,6 +46,12 @@ export type Run = {
     approvals?: Approval[];
   };
   review?: { status?: string; summary?: string } | null;
+  identity?: { public_key: string; fingerprint: string };
+  relay?: {
+    mode: string;
+    held: { message_id: string; reason: string }[];
+    incidents: { kind: string; message_id: string; reason: string; created_at: string }[];
+  };
 };
 
 export const sessionUrl = (id: string) => `/session/?run=${encodeURIComponent(id)}`;
@@ -284,6 +290,16 @@ export function RunAttention({
   }
   return (
     <>
+      {!!run.relay?.incidents.length && <div className="banner bad" role="alert">
+        <strong>Relay integrity incident</strong>
+        {run.relay.incidents.map((incident, i) => <p key={`${incident.message_id}-${i}`}>
+          {incident.reason} <span className="mono small">({incident.message_id})</span>
+        </p>)}
+      </div>}
+      {!!run.relay?.held.length && <div className="banner" role="status">
+        <strong>Peer messages held</strong>
+        {run.relay.held.map((held) => <p key={held.message_id}>{held.reason}</p>)}
+      </div>}
       {pending.map((approval) => (
         <ApprovalCard key={approval.id} run={run} approval={approval} refresh={refresh} />
       ))}

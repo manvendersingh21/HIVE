@@ -997,12 +997,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "ed25519-dalek",
  "futures",
  "hacp",
  "hive-common",
  "libc",
  "openssh",
  "ractor",
+ "rand_core 0.6.4",
  "regex",
  "reqwest",
  "rusqlite",
@@ -1017,6 +1019,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

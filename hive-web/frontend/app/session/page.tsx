@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { api } from "../../lib/api";
 import { TERMINAL_STATES } from "../../lib/runEvents";
+import { RelayAudit } from "../../components/RelayAudit";
 import { Shell } from "../../components/Nav";
 import { usePoll } from "../../lib/poll";
 import {
@@ -92,6 +93,7 @@ export default function SessionPage() {
               <RunComposer run={run} refresh={load} />
             </section>
             <aside className="session-side">
+              <RelayAudit key={run.id} run={run} />
               <div className="card">
                 <h3>Details</h3>
                 <dl>

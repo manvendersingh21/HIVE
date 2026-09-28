@@ -171,6 +171,13 @@ pub async fn events(
         Err(e) => error(e),
     }
 }
+pub async fn audit(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
+    match store(&h).and_then(|s| s.audit(&id)) {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => error(e),
+    }
+}
+
 pub async fn autonomy() -> Json<Value> {
     Json(json!({ "mode": delegation::autonomy() }))
 }
@@ -473,7 +480,7 @@ fn idle(
     let delivered = unacknowledged.lock().unwrap();
     Ok(run.state == "completed"
         && store.pending_decisions(&run.id)?.is_empty()
-        && store.pending_messages(&run.id)?.is_empty()
+        && !store.has_pending_messages(&run.id)?
         && delivered.get(&run.id).is_none_or(|ids| ids.is_empty()))
 }
 
@@ -778,14 +785,13 @@ async fn sync_run(
         transport::control(&worker, runner, "decide", &run.id, 0, Some(&decision)).await?;
         store.decision_delivered(&run.id, decision["id"].as_str().unwrap())?;
     }
-    for message in store.pending_messages(&run.id)? {
-        let id = message["id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Message ID missing"))?
-            .to_string();
-        transport::control(&worker, runner, "enqueue", &run.id, 0, Some(&message)).await?;
-        store.message_delivered(&id)?;
-        deliver(unacknowledged, &run.id, &id);
+    while let Some(delivery) = store.next_delivery(&run.id)? {
+        if let Err(error) = transport::control(&worker, runner, "enqueue", &run.id, 0, Some(&delivery.payload)).await {
+            store.delivery_failed(&delivery)?;
+            return Err(error);
+        }
+        store.message_delivered(&delivery)?;
+        deliver(unacknowledged, &run.id, &delivery.id);
     }
     // Only a completed native invocation proves a model works; the runtime's
     // own catalog is recorded even when that first call failed, so the user
@@ -853,6 +859,26 @@ mod tests {
             master_name: "master".into(),
         }
     }
+    #[tokio::test]
+    async fn relay_audit_api_contains_only_public_evidence() {
+        let h = handle();
+        let id = run_with_events(&h, 0);
+        let store = store(&h).unwrap();
+        store.message("audit-test", "user", &id, &json!({"id":"audit-test","text":"hello"})).unwrap();
+        let response = audit(State(h.clone()), Path(id.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["chain_valid"], true);
+        assert_eq!(value["entries"][0]["record"]["event"], "stage");
+        let raw = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!raw.contains("seed"));
+        assert!(!raw.contains("secret"));
+        assert!(!raw.contains("hello"));
+        assert!(raw.contains("public_key"));
+        assert_eq!(audit(State(h), Path("unknown".into())).await.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn run_list_filters_by_state_and_task() {
         let h = handle();
@@ -1009,7 +1035,8 @@ mod tests {
             .message("follow-up", "user", &id, &json!({"id":"follow-up","text":"verify"}))
             .unwrap();
         assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
-        store.message_delivered("follow-up").unwrap();
+        let delivery = store.next_delivery(&id).unwrap().unwrap();
+        store.message_delivered(&delivery).unwrap();
         drop(store);
         drop(graph);
         let _ = std::fs::remove_file(path);
@@ -1033,7 +1060,8 @@ mod tests {
         // turn in the remote inbox.
         wake("first");
         assert!(!idle_now());
-        store.message_delivered("first").unwrap();
+        let delivery = store.next_delivery(&id).unwrap().unwrap();
+        store.message_delivered(&delivery).unwrap();
         deliver(&unacknowledged, &id, "first");
         // The journal has not reported that turn yet, so its acknowledgment and
         // the state it finishes in are still to be imported.
@@ -1041,7 +1069,8 @@ mod tests {
         // A second message revives the run again, and each is tracked on its own.
         wake("second");
         assert!(!idle_now());
-        store.message_delivered("second").unwrap();
+        let delivery = store.next_delivery(&id).unwrap().unwrap();
+        store.message_delivered(&delivery).unwrap();
         deliver(&unacknowledged, &id, "second");
         // Events that acknowledge nothing, and other messages' acknowledgments,
         // leave the run waiting.
