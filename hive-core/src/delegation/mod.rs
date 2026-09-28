@@ -1,6 +1,7 @@
 //! Durable fleet delegation. Remote journals own native conversations; the
 //! coordinator synchronizes evidence and never retries uncertain launches.
 pub mod containers;
+pub mod coordination;
 pub mod inventory;
 pub mod review;
 pub mod store;
@@ -22,6 +23,9 @@ pub struct Assignment {
     pub objective: String,
     pub dependencies: Vec<String>,
     pub acceptance_criteria: Vec<String>,
+    /// Repository-relative globs exclusively owned by this assignment.
+    #[serde(default)]
+    pub owned_paths: Vec<String>,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
 }
@@ -167,12 +171,76 @@ fn validate_new_containers(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow
     Ok(())
 }
 
+/// Model ids from OpenCode's qwq/qvq reasoning families answer prompts but
+/// never call tools; a turn run on one can end with no actions at all.
+fn reasoning_family(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    id.contains("qwq") || id.contains("qvq")
+}
+
+/// The verified models an OpenCode install on `device` offers: the probe's
+/// connected catalog plus any model with real invocation evidence.
+fn opencode_models(agent: &MasterAgent, device: &str) -> anyhow::Result<Vec<String>> {
+    let Some(record) = agent
+        .memory
+        .graph
+        .entity(&entity_id("device-agent", &format!("{device}/opencode")))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut models: Vec<String> = record.attrs["models"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(invoked) = record.attrs["invocation"]["model"].as_str() {
+        if !models.iter().any(|m| m == invoked) {
+            models.push(invoked.to_string());
+        }
+    }
+    Ok(models)
+}
+
+/// A verified tool-capable OpenCode model for `device`, preferring the model
+/// OpenCode itself is configured to default to, never a reasoning family.
+fn select_opencode_model(agent: &MasterAgent, device: &str) -> anyhow::Result<Option<String>> {
+    let models = opencode_models(agent, device)?;
+    let default = agent
+        .memory
+        .graph
+        .entity(&entity_id("device-agent", &format!("{device}/opencode")))?
+        .and_then(|r| r.attrs["default_model"].as_str().map(str::to_string));
+    if let Some(default) = default {
+        if models.contains(&default) && !reasoning_family(&default) {
+            return Ok(Some(default));
+        }
+    }
+    Ok(models.into_iter().find(|m| !reasoning_family(m)))
+}
+
+/// OpenCode's own default can be a reasoning model that never calls tools,
+/// so a null model is filled with a verified tool-capable model before the
+/// plan is validated. Null for other agents stays a native-default choice.
+fn repair_models(plan: &mut DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
+    for a in &mut plan.assignments {
+        if a.agent == "opencode" && a.model.is_none() {
+            a.model = select_opencode_model(agent, &a.device)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()> {
     anyhow::ensure!(
         plan.assignments.len() <= 16,
         "At most 16 assignments per task"
     );
     validate_new_containers(plan, agent)?;
+    validate_owned_paths(&plan.assignments)?;
     // Assignments may target a container this plan creates. It has no
     // inventory yet; its setup is checked once it exists.
     let planned: Vec<&str> = plan.containers.iter().map(|c| c.name.as_str()).collect();
@@ -191,6 +259,15 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             "Unknown agent: {}",
             a.agent
         );
+        if a.agent == "opencode" {
+            if let Some(model) = &a.model {
+                anyhow::ensure!(
+                    !reasoning_family(model),
+                    "{}: OpenCode model {model} is from a qwq/qvq reasoning family that never calls tools",
+                    a.device
+                );
+            }
+        }
         anyhow::ensure!(
             valid_workspace(&a.workspace),
             "Workspace must be a child of ~/hive-workspaces"
@@ -206,6 +283,12 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
                 a.device
             );
             continue;
+        }
+        if a.agent == "opencode" && a.model.is_none() {
+            anyhow::bail!(
+                "{}: no verified OpenCode model is available; connect a model provider on that device, name a verified model explicitly, or use another agent",
+                a.device
+            );
         }
         let machine = agent
             .memory
@@ -263,6 +346,40 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             done.len() > before,
             "Unknown or cyclic assignment dependencies"
         );
+    }
+    Ok(())
+}
+
+fn ownership_root(path: &str) -> anyhow::Result<&str> {
+    let path = path.trim().trim_start_matches("./").trim_end_matches('/');
+    anyhow::ensure!(!path.is_empty() && !path.starts_with('/')
+        && !path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        && !path.contains(['\n', '\r', '\0']),
+        "Owned paths must be non-empty repository-relative globs");
+    let wildcard = path.find(['*', '?', '[', '{']).unwrap_or(path.len());
+    Ok(path[..wildcard].trim_end_matches('/'))
+}
+
+fn paths_overlap(left: &str, right: &str) -> anyhow::Result<bool> {
+    let left = ownership_root(left)?;
+    let right = ownership_root(right)?;
+    Ok(left.is_empty() || right.is_empty() || left == right
+        || left.strip_prefix(right).is_some_and(|rest| rest.starts_with('/'))
+        || right.strip_prefix(left).is_some_and(|rest| rest.starts_with('/')))
+}
+
+/// Reject equal or parent/child ownership across assignments in one task.
+pub fn validate_owned_paths(assignments: &[Assignment]) -> anyhow::Result<()> {
+    for (index, left) in assignments.iter().enumerate() {
+        for right in assignments.iter().skip(index + 1) {
+            for left_path in &left.owned_paths {
+                for right_path in &right.owned_paths {
+                    anyhow::ensure!(!paths_overlap(left_path, right_path)?,
+                        "Assignments {} and {} have overlapping owned paths: {} and {}",
+                        left.key, right.key, left_path, right_path);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -412,13 +529,16 @@ pub async fn plan(
     let mut prompt = format!("You are Hive's coordinator. Plan work for real agent conversations on configured devices. \
         Return structured assignments, never shell commands or file contents. The complete fleet is below. \
         Select device, installed agent and available model automatically; explicit user device/agent/model choices take precedence. \
-        Use null model when no model identifiers were verified; native default is resolved before execution. \
+        For opencode, set model to a verified id from that device's agent inventory (provider/model ids) and never a qwq/qvq reasoning model: those never call tools, so a turn can end with no actions. \
+        A null opencode model is filled from the device's verified models (the configured default first); a plan with no verified opencode model is rejected instead of guessing. \
+        For other agents use null model when no model identifiers were verified; native default is resolved before execution. \
         Missing authentication, runtime or software is reported by Hive on that exact device; do not silently substitute explicit choices. \
         Prefer dedicated devices for ordinary work. Laptops/light hosts and login nodes only receive short light work. \
         GPU/shared scheduler work requires a scheduler allocation; never launch sustained work directly on login nodes. \
         Ordinary CLI coding tasks need required_capabilities=[]: Claude/Codex provider inference does NOT require local-inference on the worker. \
         Only require GPU or heavy-compute when the user explicitly needs that capability. \
         Every workspace is a fresh unique child of ~/hive-workspaces/. Each assignment has a unique key. \
+        owned_paths are repository-relative globs exclusively owned by that assignment; never assign equal, parent, or child paths to two assignments. \
         dependencies are assignment keys that must complete before this starts; peers that must negotiate concurrently have no dependency on each other. \
         Acceptance criteria must require implementation, independent verification, deployment evidence when requested and peer agreement. \
         For questions that need no work, answer in summary and use an empty assignments list. \
@@ -432,10 +552,11 @@ pub async fn plan(
     "containers":{"type":"array","maxItems":MAX_NEW_CONTAINERS,"items":{"type":"object","additionalProperties":false,
         "required":["name","host"],"properties":{"name":{"type":"string"},"host":{"type":"string"}}}},
     "assignments":{"type":"array","items":{"type":"object","additionalProperties":false,
-    "required":["key","device","agent","model","workspace","objective","dependencies","acceptance_criteria","required_capabilities"],"properties":{
+    "required":["key","device","agent","model","workspace","objective","dependencies","acceptance_criteria","owned_paths","required_capabilities"],"properties":{
         "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode","cursor"]},
         "model":{"type":["string","null"]},"workspace":{"type":"string"},"objective":{"type":"string"},
         "dependencies":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},
+        "owned_paths":{"type":"array","items":{"type":"string"}},
         "required_capabilities":{"type":"array","items":{"type":"string"}}
     }}}}});
     for attempt in 0..2 {
@@ -447,6 +568,7 @@ pub async fn plan(
             .map_err(anyhow::Error::from)
             .and_then(|mut p| {
                 repair_workspaces(&mut p);
+                repair_models(&mut p, agent)?;
                 validate(&p, agent)?;
                 validate_explicit(request, &p, agent)?;
                 validate_coordinator(request, &p, agent)?;
@@ -513,6 +635,14 @@ pub fn setup_reason(
                 assignment.agent
             )));
         }
+    }
+    if assignment.agent == "opencode"
+        && assignment.model.is_none()
+        && select_opencode_model(agent, device)?.is_none()
+    {
+        return Ok(Some(format!(
+            "{device}: opencode has no verified tool-capable model; qwq/qvq reasoning models never call tools"
+        )));
     }
     Ok(None)
 }
@@ -598,6 +728,20 @@ mod tests {
     }
     fn nc(name: &str, host: &str) -> NewContainer {
         NewContainer { name: name.into(), host: host.into() }
+    }
+
+    #[test]
+    fn owned_paths_accept_disjoint_and_reject_equal_or_nested() {
+        let mut left = plan().assignments.remove(0);
+        left.owned_paths = vec!["hive-core/src/**".into()];
+        let mut right = left.clone();
+        right.key = "b".into();
+        right.owned_paths = vec!["hive-web/src/**".into()];
+        validate_owned_paths(&[left.clone(), right.clone()]).unwrap();
+        right.owned_paths = vec!["hive-core/src/**".into()];
+        assert!(validate_owned_paths(&[left.clone(), right.clone()]).is_err());
+        right.owned_paths = vec!["hive-core/src/delegation/mod.rs".into()];
+        assert!(validate_owned_paths(&[left, right]).is_err());
     }
 
     #[test]
@@ -925,5 +1069,52 @@ mod tests {
             .unwrap()
             .unwrap()
             .contains("claude-other"));
+    }
+    #[test]
+    fn opencode_null_model_selects_verified_model_and_skips_qwq_plus() {
+        let agent = agent();
+        inventory::project(&agent.memory.graph,"air",&[json!({"agent":"opencode","executable":"/opencode","runtime_ready":true,"authentication":"authenticated",
+            "models":["alibaba/qwq-plus","alibaba/qwen3.5-plus","zai-coding-plan/glm-5.3"],"default_model":"alibaba/qwq-plus"})]).unwrap();
+        let mut p = plan();
+        p.assignments[0].agent = "opencode".into();
+        repair_models(&mut p, &agent).unwrap();
+        // The configured default is a qwq reasoning model; the first coding-capable model wins.
+        assert_eq!(p.assignments[0].model.as_deref(), Some("alibaba/qwen3.5-plus"));
+        assert!(validate(&p, &agent).is_ok());
+        assert!(setup_reason(&agent, &p.assignments[0]).unwrap().is_none());
+        // A tool-capable configured default is preferred over other verified models.
+        inventory::project(&agent.memory.graph,"air",&[json!({"agent":"opencode","executable":"/opencode","runtime_ready":true,"authentication":"authenticated",
+            "models":["alibaba/qwq-plus","zai-coding-plan/glm-5.3"],"default_model":"zai-coding-plan/glm-5.3"})]).unwrap();
+        let mut preferred = plan();
+        preferred.assignments[0].agent = "opencode".into();
+        repair_models(&mut preferred, &agent).unwrap();
+        assert_eq!(preferred.assignments[0].model.as_deref(), Some("zai-coding-plan/glm-5.3"));
+        // A qwq family id is rejected even when it is named explicitly.
+        preferred.assignments[0].model = Some("alibaba/qwq-plus".into());
+        let err = validate(&preferred, &agent).unwrap_err().to_string();
+        assert!(err.contains("reasoning family"), "{err}");
+        assert!(err.contains("qwq"), "{err}");
+    }
+    #[test]
+    fn opencode_plan_without_a_verified_model_is_rejected_with_a_clear_reason() {
+        let agent = agent();
+        inventory::project(&agent.memory.graph,"air",&[json!({"agent":"opencode","executable":"/opencode","runtime_ready":true,"authentication":"authenticated","models":[],"default_model":null})]).unwrap();
+        let mut p = plan();
+        p.assignments[0].agent = "opencode".into();
+        repair_models(&mut p, &agent).unwrap();
+        assert!(p.assignments[0].model.is_none());
+        let err = validate(&p, &agent).unwrap_err().to_string();
+        assert!(err.contains("no verified OpenCode model"), "{err}");
+        // The same gap is reported at launch time on a probed device.
+        let reason = setup_reason(&agent, &p.assignments[0]).unwrap().unwrap();
+        assert!(reason.contains("no verified tool-capable model"), "{reason}");
+        // A model with real invocation evidence counts as verified even with an empty catalog.
+        inventory::project(&agent.memory.graph,"air",&[json!({"agent":"opencode","executable":"/opencode","runtime_ready":true,"authentication":"authenticated",
+            "models":[],"invocation":{"model":"zai-coding-plan/glm-5.3"}})]).unwrap();
+        let mut invoked = plan();
+        invoked.assignments[0].agent = "opencode".into();
+        repair_models(&mut invoked, &agent).unwrap();
+        assert_eq!(invoked.assignments[0].model.as_deref(), Some("zai-coding-plan/glm-5.3"));
+        assert!(validate(&invoked, &agent).is_ok());
     }
 }
