@@ -32,7 +32,9 @@ fn error(e: anyhow::Error) -> Response {
 }
 
 /// Overall deadline for one delegation planning attempt. A deadline failure
-/// is retried once by [`crate::chat::plan_with_retry`].
+/// is retried once by [`crate::chat::plan_with_retry`]. The planner-slot
+/// wait happens outside the deadline timer, and NVIDIA's own overall
+/// deadline (120s by default) fits inside this budget.
 const PLANNING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
 
 /// Flatten a planner HTTP error into a loggable, storable error so every

@@ -23,6 +23,16 @@ use hive_core::memory::machines;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+// Planner-call budget, chat path:
+// 1. Concurrency limit: PLANNER_SLOTS bounds concurrent planning calls to 2.
+// 2. Semaphore exclusion: The permit is acquired *before* the deadline timer starts
+//    in `bounded_plan`, so waiting in the semaphore queue does NOT count against `deadline`.
+// 3. Deadline hierarchy: A single planning attempt runs within PLANNING_TIMEOUT (150s).
+//    Inside this window, NVIDIA's own overall deadline is 120s by default (split into
+//    an ~80s / ~2/3 first attempt, and the remaining budget for retries). This leaves
+//    a 30s margin for ancillary tasks (memory retrieval, prompt generation, complexity classification).
+// 4. Automatic retry: `plan_with_retry` grants one automatic retry of the whole plan if
+//    the deadline fires, giving up to ~300s total before a user-facing timeout message.
 const PLANNING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 const CONTINUATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -33,7 +43,9 @@ static PLANNER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new
 
 // Bound the whole planning phase, including sequential model and memory calls.
 // This future never executes commands, so dropping it on timeout is safe.
-// A permit is held for the whole call, bounding concurrent planner calls.
+// The permit is acquired before the timer starts, so semaphore wait time does
+// not count against `deadline`; the permit is then held for the whole call,
+// bounding concurrent planner calls.
 async fn bounded_plan<T>(
     plan: impl std::future::Future<Output = anyhow::Result<T>>,
     deadline: std::time::Duration,
@@ -1302,6 +1314,24 @@ mod deadline_tests {
         assert!(text.contains("automatic retry"), "{text}");
         assert!(text.contains("resend"), "{text}");
         assert!(text.contains("No commands were executed"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_planner_slot_does_not_consume_the_deadline() {
+        // Both slots occupied: the caller below must wait longer than its
+        // own deadline before its plan even starts. If the permit wait
+        // counted against the deadline, this call would time out; it must
+        // instead succeed once a slot frees up.
+        let hog1 = PLANNER_SLOTS.acquire().await.unwrap();
+        let hog2 = PLANNER_SLOTS.acquire().await.unwrap();
+        let waiter = tokio::spawn(bounded_plan(
+            async { anyhow::Ok(()) },
+            Duration::from_millis(50),
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(hog1);
+        drop(hog2);
+        assert!(waiter.await.unwrap().is_ok());
     }
 
     #[tokio::test]
