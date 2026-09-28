@@ -58,6 +58,21 @@ may still change without a deprecation period.
 
 ### Fixed
 
+- Coordinator review is bounded per task. After three consecutive `continue`
+  reviews with no new acceptance evidence the task is set to `blocked` with a
+  summary and no further messages are sent, instead of asking the same workers
+  for the same missing evidence forever. The count lives in the review claim
+  table, so it survives a restart and resets once a task is settled.
+- A follow-up message that cannot be delivered is dropped on its own, logged
+  with its `task_id`, `run_id` and reason, instead of failing the whole review.
+  Only a verdict whose messages are *all* unusable still fails. The coordinator
+  review warning now names the `task_id` it was reviewing.
+- Review sees what OpenCode and AGY runs actually did. Native evidence is
+  extracted from OpenCode's terminal assistant message and bash tool output and
+  from AGY's `result.event.result.response`, alongside the Claude and Codex
+  shapes, so a finished run no longer looks like it produced nothing.
+- A review answer that is not valid JSON is retried once with the parse error
+  appended to the prompt, instead of leaving the task unreviewed.
 - A run that hits its provider usage limit is paused, not failed. The Codex
   adapter records each `account/rateLimits/updated` snapshot (percent used and
   reset time of the most used window) and turns a `usageLimitExceeded` turn

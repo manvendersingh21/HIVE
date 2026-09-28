@@ -65,7 +65,13 @@ impl RunStore {
           CREATE TABLE IF NOT EXISTS delegated_decisions (run_id TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, decision TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(run_id,id));
           CREATE TABLE IF NOT EXISTS delegated_messages (id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL, payload TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS delegated_contracts (task_id TEXT NOT NULL, party_a TEXT NOT NULL, party_b TEXT NOT NULL, contract TEXT NOT NULL, PRIMARY KEY(task_id,party_a,party_b));")?;
-        conn.lock().unwrap().execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0);")?;
+        let db = conn.lock().unwrap();
+        db.execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0,continue_reviews INTEGER NOT NULL DEFAULT 0);")?;
+        // A database created before review rounds were bounded has no counter yet.
+        if db.prepare("SELECT continue_reviews FROM delegated_reviews").is_err() {
+            db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN continue_reviews INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        drop(db);
         Ok(Self(conn))
     }
     pub fn create(
@@ -102,6 +108,16 @@ impl RunStore {
         let now = chrono::Utc::now().timestamp();
         Ok(db.execute("INSERT INTO delegated_reviews(task_id,cursor,lock_until) VALUES (?,?,?) ON CONFLICT(task_id) DO UPDATE SET cursor=excluded.cursor,status='reviewing',lock_until=excluded.lock_until WHERE delegated_reviews.lock_until<? AND (delegated_reviews.cursor!=excluded.cursor OR delegated_reviews.status='reviewing')",params![task,cursor,now+240,now])?==1)
     }
+    /// Consecutive `continue` rounds already spent on a task. Reset whenever a
+    /// review settles the task, so the bound only ever counts real rounds.
+    pub fn continue_reviews(&self, task: &str) -> anyhow::Result<i64> {
+        let db = self.0.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT COALESCE((SELECT continue_reviews FROM delegated_reviews WHERE task_id=?),0)",
+            [task],
+            |row| row.get(0),
+        )?)
+    }
     pub fn finish_review(
         &self,
         task: &str,
@@ -112,7 +128,7 @@ impl RunStore {
     ) -> anyhow::Result<()> {
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction()?;
-        anyhow::ensure!(tx.execute("UPDATE delegated_reviews SET status=?,summary=?,lock_until=0 WHERE task_id=? AND cursor=?",params![status,summary,task,cursor])?==1,"Review was superseded");
+        anyhow::ensure!(tx.execute("UPDATE delegated_reviews SET status=?,summary=?,lock_until=0,continue_reviews=CASE WHEN ?='continue' THEN continue_reviews+1 ELSE 0 END WHERE task_id=? AND cursor=?",params![status,summary,status,task,cursor])?==1,"Review was superseded");
         for (destination, payload) in messages {
             let same_task: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM delegated_runs WHERE id=? AND task_id=? AND state!='superseded')",
