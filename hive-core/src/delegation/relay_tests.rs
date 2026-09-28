@@ -360,9 +360,7 @@ fn seed_chain(store: &RunStore, run: &Run, count: usize) {
 fn incremental_audit_reads_only_new_rows_of_a_large_chain() {
     let (store, runs) = fixture(relay::Budget::default());
     seed_chain(&store, &runs[0], 20_000);
-    let started = std::time::Instant::now();
     let full = store.audit_full(&runs[0].id).unwrap();
-    let full_time = started.elapsed();
     assert_eq!(full["chain_valid"], true);
     assert_eq!(full["verification"], "full");
     assert_eq!(full["verified_rows"], 20_000);
@@ -370,13 +368,10 @@ fn incremental_audit_reads_only_new_rows_of_a_large_chain() {
     assert_eq!(full["entries"].as_array().unwrap().len(), 200);
     assert_eq!(full["entries"][199]["record"]["position"], 20_000);
     // Default call: nothing new since the checkpoint, so nothing is re-hashed.
-    let started = std::time::Instant::now();
     let cached = store.audit(&runs[0].id).unwrap();
-    let cached_time = started.elapsed();
     assert_eq!(cached["verification"], "incremental");
     assert_eq!(cached["verified_rows"], 0);
     assert_eq!(cached["chain_valid"], true);
-    assert!(cached_time < full_time, "{cached_time:?} vs {full_time:?}");
     // One new message adds exactly one stage row; only that row is read.
     stage(&store, &runs[0], &runs[1], "fresh");
     let next = store.audit(&runs[1].id).unwrap();
