@@ -126,20 +126,47 @@ impl NvidiaClient {
         }
     }
 
+    /// NVIDIA documents JSON mode (`response_format: json_object`) for the
+    /// Nemotron 3 family; other configured models keep the plain request.
+    fn chat_body(&self, prompt: &str, effort: &str, stream: bool, json_mode: bool) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "messages": [{"role":"user", "content":prompt}],
+            "temperature":1, "top_p":0.95, "max_tokens":16384, "stream":stream,
+            "chat_template_kwargs":self.chat_template_kwargs(effort)
+        });
+        if json_mode && self.model.starts_with("nvidia/nemotron-") {
+            body["response_format"] = json!({"type":"json_object"});
+        }
+        body
+    }
+
     pub async fn complete(&self, prompt: &str, effort: &str) -> anyhow::Result<super::LlmResponse> {
+        self.complete_formatted(prompt, effort, false).await
+    }
+
+    /// Structured (schema) completion. Plain chat must use [`Self::complete`].
+    pub async fn complete_json(
+        &self,
+        prompt: &str,
+        effort: &str,
+    ) -> anyhow::Result<super::LlmResponse> {
+        self.complete_formatted(prompt, effort, true).await
+    }
+
+    async fn complete_formatted(
+        &self,
+        prompt: &str,
+        effort: &str,
+        json_mode: bool,
+    ) -> anyhow::Result<super::LlmResponse> {
         if self.stream {
-            return self.complete_streaming(prompt, effort).await;
+            return self
+                .stream_with_idle(prompt, effort, Duration::from_secs(15), json_mode)
+                .await;
         }
         let value = self
-            .post(
-                "chat/completions",
-                json!({
-                    "model": self.model,
-                    "messages": [{"role":"user", "content":prompt}],
-                    "temperature":1, "top_p":0.95, "max_tokens":16384, "stream":false,
-                    "chat_template_kwargs":self.chat_template_kwargs(effort)
-                }),
-            )
+            .post("chat/completions", self.chat_body(prompt, effort, false, json_mode))
             .await?;
         let choice = &value["choices"][0];
         anyhow::ensure!(
@@ -174,20 +201,23 @@ impl NvidiaClient {
         effort: &str,
         idle_timeout: Duration,
     ) -> anyhow::Result<super::LlmResponse> {
+        self.stream_with_idle(prompt, effort, idle_timeout, false)
+            .await
+    }
+
+    async fn stream_with_idle(
+        &self,
+        prompt: &str,
+        effort: &str,
+        idle_timeout: Duration,
+        json_mode: bool,
+    ) -> anyhow::Result<super::LlmResponse> {
         let key = self
             .key
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("NVIDIA is not configured: set {}", self.key_env))?;
         let start = std::time::Instant::now();
-        let body = json!({
-            "model": self.model,
-            "messages": [{"role":"user", "content":prompt}],
-            "temperature": 1,
-            "top_p": 0.95,
-            "max_tokens": 16384,
-            "stream": true,
-            "chat_template_kwargs": self.chat_template_kwargs(effort)
-        });
+        let body = self.chat_body(prompt, effort, true, json_mode);
 
         tokio::time::timeout(self.deadline, async {
             for attempt in 0..ATTEMPTS {
@@ -539,6 +569,82 @@ pub(crate) mod tests {
             );
             assert!(body.get("extra_body").is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn json_mode_is_requested_for_schema_calls_only() {
+        let (url, captured, task) = server(vec![
+            (200, answer("{\"a\":1}"), Duration::ZERO),
+            (200, answer("hello"), Duration::ZERO),
+        ])
+        .await;
+        let router = router(url);
+        let schema = json!({"type":"object","properties":{"a":{"type":"integer"}}});
+        let structured = router
+            .complete_json_with("give json", hive_common::AiProvider::Claude, &schema)
+            .await
+            .unwrap();
+        assert_eq!(structured.text, "{\"a\":1}");
+        let plain = router
+            .complete_with("say hi", hive_common::AiProvider::Claude)
+            .await
+            .unwrap();
+        assert_eq!(plain.text, "hello");
+        task.await.unwrap();
+
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let (headers, body) = &calls[0];
+        assert!(headers.starts_with("POST /v1/chat/completions"), "{headers}");
+        assert_eq!(body["model"], "nvidia/nemotron-3-ultra-550b-a55b");
+        assert_eq!(body["response_format"], json!({"type":"json_object"}));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("give json"));
+        let (_, body) = &calls[1];
+        assert!(
+            body.get("response_format").is_none(),
+            "plain chat must not request JSON mode: {body}"
+        );
+        assert_eq!(body["messages"][0]["content"], "say hi");
+    }
+
+    #[tokio::test]
+    async fn streaming_schema_calls_request_json_mode_too() {
+        let done = "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let (url, requests, task) = streaming_server(vec![
+            (200, vec![(done, Duration::ZERO), ("data: [DONE]\n\n", Duration::ZERO)]),
+            (200, vec![(done, Duration::ZERO), ("data: [DONE]\n\n", Duration::ZERO)]),
+        ])
+        .await;
+        let mut r = router(url);
+        r.nvidia.stream = true;
+        r.nvidia.complete_json("structured", "high").await.unwrap();
+        r.nvidia.complete("plain", "high").await.unwrap();
+        task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].1["stream"], true);
+        assert_eq!(requests[0].1["response_format"], json!({"type":"json_object"}));
+        assert!(requests[1].1.get("response_format").is_none());
+    }
+
+    #[test]
+    fn json_mode_is_only_sent_to_models_documented_to_support_it() {
+        let deepseek = NvidiaClient::for_reasoning(&NvidiaConfig {
+            model: "deepseek-ai/deepseek-v4-flash-0731".into(),
+            ..Default::default()
+        });
+        assert!(deepseek.chat_body("p", "high", false, true).get("response_format").is_none());
+        let nemotron = NvidiaClient::for_reasoning(&NvidiaConfig {
+            model: "nvidia/nemotron-3-ultra-550b-a55b".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            nemotron.chat_body("p", "high", false, true)["response_format"],
+            json!({"type":"json_object"})
+        );
+        assert!(nemotron.chat_body("p", "high", false, false).get("response_format").is_none());
     }
 
     #[tokio::test]

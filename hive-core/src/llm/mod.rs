@@ -374,11 +374,12 @@ impl LlmRouter {
         };
         let cloud_prompt = schema_prompt.as_deref().unwrap_or(prompt);
         if provider == AiProvider::Nvidia {
-            let mut response = self.nvidia.complete(cloud_prompt, "high").await?;
             if schema.is_some() {
+                let mut response = self.nvidia.complete_json(cloud_prompt, "high").await?;
                 response.text = extract_json(&response.text);
+                return Ok(response);
             }
-            return Ok(response);
+            return self.nvidia.complete(cloud_prompt, "high").await;
         }
         let result = match provider {
             AiProvider::Nvidia => unreachable!(),

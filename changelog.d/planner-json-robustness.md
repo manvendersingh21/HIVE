@@ -1,9 +1,9 @@
 ### Fixed
 
 - Structured (schema) calls to Z.AI now send `response_format: {"type": "json_object"}`,
-  so GLM returns syntactically valid JSON for plans. Plain chat calls are unchanged.
-  NVIDIA is unchanged: support for `response_format` on its hosted reasoning models
-  varies by model and was not verified.
+  so GLM returns syntactically valid JSON for plans. Structured calls to NVIDIA Nemotron 3
+  models (`nvidia/nemotron-*`), for which NVIDIA documents JSON mode, send it too,
+  streaming or not. Plain chat calls, and other configured NVIDIA models, are unchanged.
 - A plan that is not valid JSON, or does not match the plan schema, is retried once
   with the parser error and the offending excerpt appended to the prompt ("Your previous
   answer was invalid JSON at line 1 column N: …"). The retry shares the existing planning
