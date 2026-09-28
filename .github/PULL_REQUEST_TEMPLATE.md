@@ -29,7 +29,7 @@ git diff --check
 
 - [ ] Behavior changes come with regression tests
 - [ ] The relevant guide under `docs/` is updated, or no user-facing behavior changed
-- [ ] `CHANGELOG.md` updated under `## [Unreleased]`, or the change is not user-visible
+- [ ] Changelog fragment added in `changelog.d/`, or the change is not user-visible
 - [ ] No credentials, private transcripts, real hostnames, SSH account names, or personal home paths
 - [ ] Live or destructive tests, if any, ran against disposable workspaces and are identified above
 - [ ] Unrelated worktree changes are not included
