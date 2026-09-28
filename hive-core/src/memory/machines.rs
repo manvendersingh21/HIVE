@@ -1007,3 +1007,7 @@ mod tests {
         // Cleanly skipped on non-unix platforms
     }
 }
+
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod memory_tests;
