@@ -217,6 +217,30 @@ mod tests {
     }
 
     #[test]
+    fn opencode_connected_models_and_configured_default_are_persisted_and_reported() {
+        let graph = KnowledgeGraph::in_memory().unwrap();
+        crate::memory::machines::project_into_graph(
+            &graph,
+            &crate::memory::machines::MachineFacts {
+                name: "air".into(),
+                reachable: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        project(&graph, "air", &[json!({"agent":"opencode","executable":"/opencode","verified_at":chrono::Utc::now().timestamp(),
+            "models":["alibaba/qwq-plus","zai-coding-plan/glm-5.3"],"default_model":"zai-coding-plan/glm-5.3"})]).unwrap();
+        let records: Vec<Value> = serde_json::from_str(&describe(&graph).unwrap()).unwrap();
+        let record = records.iter().find(|r| r["agent"] == "opencode").unwrap();
+        assert_eq!(record["models"], json!(["alibaba/qwq-plus","zai-coding-plan/glm-5.3"]));
+        assert_eq!(record["default_model"], "zai-coding-plan/glm-5.3");
+        // A re-probe that could not query the registry keeps the last evidence.
+        project(&graph, "air", &[json!({"agent":"opencode","executable":"/opencode","verified_at":chrono::Utc::now().timestamp(),"models":[]})]).unwrap();
+        let records: Vec<Value> = serde_json::from_str(&describe(&graph).unwrap()).unwrap();
+        assert_eq!(records[0]["models"], json!(["alibaba/qwq-plus","zai-coding-plan/glm-5.3"]));
+    }
+
+    #[test]
     fn stale_inventory_and_invocation_evidence_survive_restart_and_refresh() {
         let path = std::env::temp_dir().join(format!("hive-inventory-{}.db", uuid::Uuid::new_v4()));
         let graph = KnowledgeGraph::open(&path).unwrap();

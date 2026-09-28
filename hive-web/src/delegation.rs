@@ -521,6 +521,31 @@ fn acknowledge(unacknowledged: &Unacknowledged, run: &str, snapshot: &Value) {
 
 const SESSION_ENDED: &str = "The agent's session has ended, so this run can't continue.";
 
+/// Whether every dependency of `run` completed so it may start. A dependency
+/// that failed can never complete, so the dependent is failed with that
+/// reason instead of waiting queued forever: work that cannot start must say
+/// so, and a dependent must never launch on a failed run.
+fn dependency_ready(runs: &[Run], run: &Run) -> Result<bool, String> {
+    for key in &run.assignment.dependencies {
+        let mut completed = false;
+        let mut failed = false;
+        for dependency in runs.iter().filter(|r| {
+            r.task_id == run.task_id && &r.assignment.key == key && r.state != "superseded"
+        }) {
+            completed |= dependency.state == "completed";
+            failed |= dependency.state == "failed";
+        }
+        if completed {
+            continue;
+        }
+        if failed {
+            return Err(format!("dependency {key} failed and can never complete"));
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// States in which a launched run's tmux session must still exist.
 const LIVE_STATES: [&str; 4] = ["working", "awaiting-approval", "waiting-for-peer", "reviewing"];
 
@@ -575,12 +600,13 @@ async fn sync_run(
         return Ok(());
     }
     if run.state == "queued" {
-        if !run.assignment.dependencies.iter().all(|key| {
-            runs.iter().any(|r| {
-                r.task_id == run.task_id && &r.assignment.key == key && r.state == "completed"
-            })
-        }) {
-            return Ok(());
+        match dependency_ready(runs, run) {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(reason) => {
+                store.state(&run.id, "failed", &reason)?;
+                return Ok(());
+            }
         }
         let record = agent
             .memory
@@ -691,7 +717,15 @@ async fn sync_run(
             let id = event["id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Peer event ID missing"))?;
-            let payload = json!({"id":id,"source":run.id,"kind":event["payload"]["kind"],"text":format!("Peer {} on {} ({}) says: {}",run.assignment.key,run.assignment.device,event["payload"]["kind"].as_str().unwrap_or("message"),event["payload"]["text"].as_str().unwrap_or(""))});
+            let kind = event["payload"]["kind"].as_str().unwrap_or("message");
+            let text = event["payload"]["text"].as_str().unwrap_or("");
+            let agreement = if kind == "agreement" {
+                Some(match store.record_agreement(&run.id, to, text) {
+                    Ok(digest) => format!(" HACP v2 contract digest: {digest}. Echo this digest in an agreement message to accept."),
+                    Err(error) => format!(" HACP v2 rejected this unilateral change: {error}."),
+                })
+            } else { None };
+            let payload = json!({"id":id,"source":run.id,"kind":kind,"text":format!("Peer {} on {} ({kind}) says: {}{}",run.assignment.key,run.assignment.device,text,agreement.as_deref().unwrap_or(""))});
             if runs.iter().any(|r| r.id == to && r.state != "superseded") {
                 store.message(id, &run.id, to, &payload)?;
             }
@@ -1030,6 +1064,37 @@ mod tests {
         acknowledge(&unacknowledged, &id, &snapshot);
         assert_eq!(store.events(&id, 0).unwrap().len(), 4);
         assert!(idle_now());
+    }
+
+    #[test]
+    fn dependents_never_start_on_a_failed_dependency() {
+        let h = handle();
+        let store = store(&h).unwrap();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[
+            {"key":"a","device":"air","agent":"opencode","model":"zai-coding-plan/glm-5.3","workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]},
+            {"key":"b","device":"air","agent":"claude","model":null,"workspace":"~/hive-workspaces/review","objective":"review","dependencies":["a"],"acceptance_criteria":["verified"]}]})).unwrap();
+        let runs = store.create("task", "chat", &plan).unwrap();
+        let (a, b) = (&runs[0], &runs[1]);
+        // While the dependency works the dependent just waits.
+        store.sync(&a.id, &json!({"metadata":{"state":"working"},"events":[],"approvals":[]})).unwrap();
+        assert_eq!(dependency_ready(&runs, b), Ok(false));
+        // A failed dependency (e.g. 'turn produced no actions') never releases it.
+        store.sync(&a.id, &json!({"metadata":{"state":"failed"},"events":[],"approvals":[]})).unwrap();
+        let runs = store.list().unwrap();
+        let b = runs.iter().find(|r| r.id == b.id).unwrap();
+        match dependency_ready(&runs, b) {
+            Err(reason) => assert!(reason.contains("dependency a failed"), "{reason}"),
+            other => panic!("expected failure reason, got {other:?}"),
+        }
+        // Only a completed dependency releases the dependent.
+        store.state(&a.id, "completed", "").unwrap();
+        let runs = store.list().unwrap();
+        assert_eq!(dependency_ready(&runs, runs.iter().find(|r| r.id == b.id).unwrap()), Ok(true));
+        // An unknown or superseded dependency keeps waiting, never starts.
+        let mut orphan = plan.clone();
+        orphan.assignments[1].dependencies = vec!["missing".into()];
+        let superseded = store.create("task2", "chat", &orphan).unwrap();
+        assert_eq!(dependency_ready(&superseded, &superseded[1]), Ok(false));
     }
 
     #[test]

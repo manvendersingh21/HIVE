@@ -86,6 +86,42 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
                 await adapter.connect(self.assignment, self.j)
             self.assertEqual(adapter.start.call_count, 2)
 
+    async def test_agy_yolo_adds_dangerously_skip_permissions(self):
+        adapter = self.agy()
+        adapter.start = AsyncMock()
+        yolo_assignment = dict(self.assignment, autonomy='yolo')
+        with patch.object(runner, 'executable', return_value='/bin/agy'):
+            await adapter.connect(yolo_assignment, self.j)
+        args = adapter.start.call_args.args[0]
+        self.assertIn('--dangerously-skip-permissions', args)
+
+    async def test_agy_non_yolo_omits_dangerously_skip_permissions(self):
+        adapter = self.agy()
+        adapter.start = AsyncMock()
+        with patch.object(runner, 'executable', return_value='/bin/agy'):
+            await adapter.connect(self.assignment, self.j)
+        args = adapter.start.call_args.args[0]
+        self.assertNotIn('--dangerously-skip-permissions', args)
+
+    async def test_agy_denied_actions_with_empty_response_fails_turn(self):
+        adapter = self.agy()
+        adapter.notifications.put_nowait(dict(event='result', result=dict(
+            conversation_id='native-id', status='SUCCESS',
+            denied_actions=[dict(tool='bash', command='rm -rf /')],
+            response='',
+        )))
+        with self.assertRaisesRegex(RuntimeError, 'denied actions'):
+            await adapter.turn('start')
+
+    async def test_agy_denied_actions_with_nonempty_response_succeeds(self):
+        adapter = self.agy()
+        adapter.notifications.put_nowait(dict(event='result', result=dict(
+            conversation_id='native-id', status='SUCCESS',
+            denied_actions=[dict(tool='bash', command='rm -rf /')],
+            response='partial output',
+        )))
+        await adapter.turn('start')
+
     async def test_agy_hook_denies_then_consumes_only_exact_one_use_grant(self):
         request = dict(toolCall=dict(name='run_command', args=dict(CommandLine='sudo true', Cwd=str(self.workspace))),
                        conversationId='native-id', modelName='model')
@@ -123,6 +159,8 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
             if path == '/provider':
                 return dict(all=[dict(id='offline', models={'unavailable': {}}), dict(id='online', models={'usable': {}})],
                             connected=['online'], default={'offline': 'unavailable', 'online': 'usable'})
+            if path == '/config':
+                return {}
             self.fail('Reconnect must not create a new session: '+path)
         adapter.http = AsyncMock(side_effect=http)
         with patch('socket.socket', return_value=socket), patch.object(runner, 'executable', return_value='/bin/opencode'), \
@@ -131,6 +169,8 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.native, 'ses_existing')
         self.assertEqual(adapter.model, dict(providerID='online', modelID='usable'))
         self.assertEqual(self.j.get('available_models'), ['online/usable'])
+        warnings = [json.loads(row[0]) for row in self.j.db.execute("SELECT payload FROM events WHERE kind='warning'")]
+        self.assertEqual(warnings, [dict(message='No model was assigned; OpenCode model online/usable was chosen automatically', model='online/usable')])
         self.assertEqual(launch.call_args.args[-4:], ('--hostname', '127.0.0.1', '--port', '12345'))
         env = launch.call_args.kwargs['env']
         config = json.loads(env['OPENCODE_CONFIG_CONTENT'])
@@ -152,6 +192,26 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
                 await adapter.connect(dict(self.assignment, model='online/unavailable'), self.j)
         self.assertEqual(adapter.http.call_count, 2)
 
+    async def test_opencode_model_selection_prefers_configured_default_and_skips_qwq_plus(self):
+        providers = dict(all=[dict(id='alibaba', models={'qwq-plus': {}, 'qwen3.5-plus': {}}),
+                              dict(id='zai-coding-plan', models={'glm-5.3': {}})],
+                         connected=['alibaba', 'zai-coding-plan'],
+                         default={'alibaba': 'qwq-plus', 'zai-coding-plan': 'glm-5.3'})
+        available = ['alibaba/qwq-plus', 'alibaba/qwen3.5-plus', 'zai-coding-plan/glm-5.3']
+        choose = runner.OpenCode.choose_model
+        # The provider OpenCode itself marks as default (config "model") wins.
+        self.assertEqual(choose(providers, available, 'zai-coding-plan/glm-5.3'), 'zai-coding-plan/glm-5.3')
+        # Without a configured default the arbitrary per-provider catalog defaults
+        # are ignored and the first tool-capable connected model is chosen.
+        self.assertEqual(choose(providers, available, None), 'alibaba/qwen3.5-plus')
+        # Even an explicitly configured qwq default is never auto-chosen.
+        self.assertEqual(choose(providers, available, 'alibaba/qwq-plus'), 'alibaba/qwen3.5-plus')
+        self.assertEqual(choose(providers, ['zai-coding-plan/qvq-max', 'zai-coding-plan/glm-5.3'], None), 'zai-coding-plan/glm-5.3')
+        only_reasoning = dict(all=[dict(id='alibaba', models={'qwq-plus': {}})], connected=['alibaba'],
+                              default={'alibaba': 'qwq-plus'})
+        with self.assertRaisesRegex(RuntimeError, 'tool-capable'):
+            choose(only_reasoning, ['alibaba/qwq-plus'], 'alibaba/qwq-plus')
+
     async def test_opencode_does_not_finish_on_initial_idle_or_unrelated_result(self):
         adapter = self.opencode()
         message_id, polls = None, 0
@@ -167,7 +227,8 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
             if '?limit=' in path:
                 polls += 1
                 return [dict(info=dict(role='assistant', parentID='msg_other' if polls == 1 else message_id,
-                    modelID='actual', providerID='provider', time={'completed': 1}, finish='stop'), parts=[])]
+                    modelID='actual', providerID='provider', time={'completed': 1}, finish='stop'),
+                    parts=[dict(type='text', text='done')])]
             if path == '/session/status':
                 return {}
             self.fail(path)
@@ -189,6 +250,44 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
             await adapter.turn('implement')
         self.assertEqual(adapter.http.call_count, 1)
 
+    async def test_opencode_reasoning_only_reply_fails_with_turn_produced_no_actions(self):
+        adapter = self.opencode()
+        message_id = None
+        async def http(method, path, body=None):
+            nonlocal message_id
+            if path.endswith('/prompt_async'):
+                message_id = body['messageID']
+                return None
+            if path == '/permission':
+                return []
+            if '?limit=' in path:
+                # The reply reasons at length but never calls a tool or answers.
+                return [dict(info=dict(role='assistant', parentID=message_id, time={'completed': 1}, finish='stop'),
+                             parts=[dict(type='step-start'), dict(type='reasoning', text='thinking about the task'),
+                                    dict(type='reasoning', text='still only thinking')])]
+            if path == '/session/status':
+                return {adapter.native: dict(type='idle')}
+            self.fail(path)
+        adapter.http = AsyncMock(side_effect=http)
+        with patch.object(runner.asyncio, 'sleep', new=AsyncMock()):
+            with self.assertRaisesRegex(RuntimeError, 'turn produced no actions'):
+                await adapter.turn('implement')
+        # The turn itself ended (session idle), so no prompt stays pending.
+        self.assertIsNone(self.j.get('opencode_pending_message'))
+
+    async def test_opencode_no_action_turn_marks_the_run_failed(self):
+        self.j.set('assignment', dict(self.assignment, agent='opencode'))
+        class ReasoningOnly:
+            async def connect(self, assignment, journal):
+                journal.set('native_conversation_id', 'ses_native')
+            async def turn(self, prompt):
+                raise RuntimeError('turn produced no actions')
+        with patch.object(runner, 'OpenCode', ReasoningOnly):
+            await runner.run(dict(self.assignment, agent='opencode'), self.j)
+        self.assertEqual(self.j.get('state'), 'failed')
+        errors = [json.loads(row[0]) for row in self.j.db.execute("SELECT payload FROM events WHERE kind='error'")]
+        self.assertTrue(any(error['message'] == 'turn produced no actions' for error in errors), errors)
+
     async def test_opencode_tool_round_and_busy_status_cannot_complete_turn(self):
         adapter = self.opencode()
         message_id, polls = None, 0
@@ -201,7 +300,8 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
             elif '?limit=' in path:
                 polls += 1
                 return [dict(info=dict(role='assistant', parentID=message_id, time={'completed': 1},
-                    finish='tool-calls' if polls == 1 else 'stop'))]
+                    finish='tool-calls' if polls == 1 else 'stop'),
+                    parts=[dict(type='tool', tool='read', callID='call_1', state=dict(status='completed', input={}))])]
             elif path == '/session/status':
                 return {adapter.native: dict(type='busy' if polls == 2 else 'idle')}
             else:
@@ -233,7 +333,7 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
                     elif path == '/permission/per_1/reply':
                         replies.append(body)
                     elif '?limit=' in path:
-                        return [dict(info=dict(role='assistant', parentID=message_id, time={'completed': 1}, finish='stop'))]
+                        return [dict(info=dict(role='assistant', parentID=message_id, time={'completed': 1}, finish='stop'), parts=[part])]
                     elif path == '/session/status':
                         return {}
                     else:
