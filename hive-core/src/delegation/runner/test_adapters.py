@@ -406,9 +406,167 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
                                     '--trust', '--workspace', str(self.workspace),
                                     '--force', '--model', 'gpt-5.2', '--resume', 'chat-native'])
         self.assertEqual(self.j.get('native_conversation_id'), 'chat-native')
-        self.assertEqual(self.j.get('actual_model'), 'GPT-5.2 Medium')
-        emitted = [json.loads(row['payload']) for row in self.j.db.execute("SELECT payload FROM events WHERE kind='native'")]
-        self.assertEqual(emitted, self.cursor_stream()*2)
+        self.assertEqual(self.j.get('actual_model'), 'gpt-5.2')
+        self.assertEqual(self.native_events(), self.cursor_stream()*2)
+
+    def native_events(self):
+        return [json.loads(row['payload']) for row in self.j.db.execute("SELECT payload FROM events WHERE kind='native' ORDER BY seq")]
+
+    def metadata_writes(self):
+        """Counts journal metadata writes per key from here on."""
+        writes = {}
+        original = self.j.set
+        def counted(key, value):
+            writes[key] = writes.get(key, 0) + 1
+            original(key, value)
+        self.j.set = counted
+        return writes
+
+    def recorded_cursor_turn(self, chat='chat-native'):
+        """Shape of a real cursor-agent 2026.09.26 stream-json turn: every
+        thinking token is its own line, tool calls start and complete, then
+        assistant text arrives in segments before the terminal result."""
+        stamp = dict(session_id=chat)
+        think = lambda text, ms: dict(type='thinking', subtype='delta', text=text, timestamp_ms=ms, **stamp)
+        say = lambda text, call: dict(type='assistant', model_call_id=call, timestamp_ms=1790615951602,
+                                      message=dict(role='assistant', content=[dict(type='text', text=text)]), **stamp)
+        shell = dict(shellToolCall=dict(args=dict(command='ls -la')))
+        init, user = self.cursor_stream(chat=chat)[:2]
+        return [init, user,
+                think('**Exploring', 1), think(' the', 2), think(' workspace**', 3),
+                dict(type='thinking', subtype='completed', timestamp_ms=4, **stamp),
+                dict(type='tool_call', subtype='started', call_id='call_1', tool_call=shell, **stamp),
+                dict(type='tool_call', subtype='completed', call_id='call_1',
+                     tool_call=dict(shellToolCall=dict(shell['shellToolCall'], result=dict(success=dict(exitCode=0, stdout='a\n')))), **stamp),
+                say('Workspace', 'call-a'), say(' is empty.', 'call-b'),
+                think('Done', 5), think('.', 6),
+                say('Finished.', 'call-c'),
+                dict(type='result', subtype='success', is_error=False, result='Workspace is empty.Finished.',
+                     request_id='req-native', **stamp)]
+
+    async def test_cursor_coalesces_text_deltas_and_writes_metadata_once(self):
+        events = self.recorded_cursor_turn()
+        self.cursor_script(events)
+        adapter = runner.Cursor()
+        assignment = dict(self.assignment, agent='cursor', autonomy='yolo', model='gpt-5.2')
+        with patch.object(runner, 'executable', return_value=str(self.root/'cursor-agent')):
+            await adapter.connect(assignment, self.j)
+            writes = self.metadata_writes()
+            await adapter.turn('first prompt')
+            await adapter.turn('follow-up')
+        init, user = events[:2]
+        thinking, completed, started, finished = events[2], events[5], events[6], events[7]
+        assistant = events[8]
+        expected = [
+            init, user,
+            dict(thinking, text='**Exploring the workspace**', coalesced=3),
+            completed, started, finished,
+            dict(assistant, message=dict(role='assistant', content=[dict(type='text', text='Workspace is empty.')]), coalesced=2),
+            dict(events[10], text='Done.', coalesced=2),
+            events[12],
+            events[13],
+        ]
+        self.assertEqual(self.native_events(), expected*2)
+        # Every line carries session_id; the id is written once, never re-written.
+        self.assertEqual(writes, {'native_conversation_id': 1})
+        self.assertEqual(self.j.get('native_conversation_id'), 'chat-native')
+
+    async def test_cursor_init_display_name_is_never_the_verified_model(self):
+        self.j.set('assignment', dict(self.assignment, agent='cursor', autonomy='yolo'))
+        # Evidence recorded by an earlier runner from the init display name.
+        self.j.set('actual_model', 'GPT-5.2 Medium')
+        self.j.set('invocation', dict(model='GPT-5.2 Medium', verified_at=1))
+        self.j.set('available_models', ['GPT-5.2 Medium', 'gpt-5.2'])
+        self.cursor_script(self.cursor_stream())
+        with patch.object(runner, 'executable', return_value=str(self.root/'cursor-agent')), \
+                patch.object(runner.asyncio, 'sleep', new=AsyncMock(side_effect=asyncio.CancelledError)):
+            # The run idles on an empty inbox after the first turn completes.
+            with self.assertRaises(asyncio.CancelledError):
+                await runner.run(dict(self.assignment, agent='cursor', autonomy='yolo'), self.j)
+        self.assertEqual(self.native_events()[0]['model'], 'GPT-5.2 Medium')
+        self.assertEqual(self.j.get('actual_model'), 'auto')
+        self.assertEqual(self.j.get('invocation')['model'], 'auto')
+        self.assertEqual(self.j.get('available_models'), ['gpt-5.2'])
+        adapter = runner.Cursor()
+        self.j.set('invocation', dict(model='GPT-5.2 Medium', verified_at=1))
+        await adapter.connect(dict(self.assignment, agent='cursor', autonomy='yolo', model='gpt-5.2'), self.j)
+        self.assertIsNone(self.j.get('invocation'))
+        self.assertEqual(self.j.get('actual_model'), 'gpt-5.2')
+
+    async def test_cursor_rejected_model_error_yields_available_models(self):
+        adapter = runner.Cursor()
+        assignment = dict(self.assignment, agent='cursor', autonomy='yolo', model='not-a-real-model')
+        # Verbatim shape of cursor-agent's stderr for a rejected --model (list shortened).
+        error = 'Cannot use this model: not-a-real-model. Available models: auto, gpt-5.3-codex, gpt-5.2, composer-2.5, claude-opus-4-8-high'
+        self.cursor_script([], exit_code=1, stderr=error)
+        with patch.object(runner, 'executable', return_value=str(self.root/'cursor-agent')):
+            await adapter.connect(assignment, self.j)
+            with self.assertRaisesRegex(RuntimeError, 'Cannot use this model'):
+                await adapter.turn('work')
+        self.assertEqual(self.j.get('available_models'), ['auto', 'gpt-5.3-codex', 'gpt-5.2', 'composer-2.5', 'claude-opus-4-8-high'])
+        self.assertIsNone(self.j.get('invocation'))
+
+    async def test_agy_coalesces_response_deltas_and_writes_conversation_once(self):
+        adapter = self.agy()
+        step = lambda **fields: dict(event='step_update', step_update=dict(conversation_id='native-id', **fields))
+        delta = lambda index, text: step(state='ACTIVE', step_index=index, step_type='agent_response', text_delta=text)
+        tool = step(state='ACTIVE', step_index=3, step_type='tool', tool_name='run_command',
+                    tool_info=dict(name='run_command', parameters=dict(CommandLine='ls')))
+        stream = [dict(event='init', conversation_id='native-id', init=dict(model='available-model')),
+                  delta(2, '### Plan'), delta(2, '\n\nInspect'), delta(2, ' first.'), tool,
+                  dict(tool, step_update=dict(tool['step_update'], state='DONE', duration_seconds=0.2)),
+                  delta(4, 'Done'), delta(5, 'Next'),
+                  step(state='DONE', step_index=5, step_type='agent_response', duration_seconds=1.0, usage={}),
+                  dict(event='result', result=dict(conversation_id='native-id', status='SUCCESS', response='Done'))]
+        for event in stream:
+            adapter.notifications.put_nowait(event)
+        writes = self.metadata_writes()
+        await adapter.turn('start')
+        self.assertEqual(self.native_events(), [
+            stream[0],
+            dict(delta(2, '### Plan\n\nInspect first.'), coalesced=3),
+            stream[4], stream[5], stream[6], stream[7], stream[8], stream[9],
+        ])
+        self.assertEqual(writes, {'native_conversation_id': 1, 'actual_model': 1})
+
+    async def test_opencode_journals_each_message_revision_once_across_turns(self):
+        adapter = self.opencode()
+        message_id, polls = None, 0
+        def reply(parent, ident, text, completed=False, parts=()):
+            info = dict(id=ident, role='assistant', parentID=parent, modelID='actual', providerID='provider',
+                        time=dict(created=1, **({'completed': 2} if completed else {})), finish='stop' if completed else None)
+            return dict(info=info, parts=[dict(type='text', text=text), *parts])
+        history = []
+        async def http(method, path, body=None):
+            nonlocal message_id, polls
+            if path.endswith('/prompt_async'):
+                message_id, polls = body['messageID'], 0
+            elif path == '/permission':
+                return []
+            elif '?limit=' in path:
+                polls += 1
+                ident = 'msg_reply_'+message_id
+                tool = [dict(type='tool', tool='read', callID='c', state=dict(status='running', input={}))] if polls > 2 else []
+                current = reply(message_id, ident, 'do'+'ne'*polls, completed=polls == 4, parts=tool)
+                return history+[current]
+            elif path == '/session/status':
+                return {adapter.native: dict(type='idle')}
+            else:
+                self.fail(path)
+        adapter.http = AsyncMock(side_effect=http)
+        with patch.object(runner.asyncio, 'sleep', new=AsyncMock()):
+            await adapter.turn('first')
+            first = self.native_events()
+            history.append(first[-1])
+            await adapter.turn('second')
+        # Growing text alone is not journaled; a new tool part and completion are.
+        self.assertEqual([(e['parts'][0]['text'], len(e['parts'])) for e in first],
+                         [('done', 1), ('donenene', 2), ('donenenene', 2)])
+        # The prior turn's messages are in every later message list; never again.
+        self.assertEqual(len(self.native_events()), 6)
+        restarted = self.opencode()
+        restarted.j = self.j
+        self.assertEqual(restarted.journaled(), adapter.revisions)
 
     async def test_cursor_omits_model_and_resume_before_they_apply(self):
         self.cursor_script(self.cursor_stream())

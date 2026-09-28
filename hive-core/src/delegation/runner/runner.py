@@ -156,6 +156,11 @@ class Journal:
         row = self.db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
         return json.loads(row[0]) if row else default
 
+    def update(self, key, value):
+        # Stream handlers see the same value on every line; write only changes.
+        if self.get(key) != value:
+            self.set(key, value)
+
     def emit(self, kind, payload, event_id=None):
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO events(id,kind,payload) VALUES (?,?,?)', (event_id or str(uuid.uuid4()), kind, encode(payload)))
@@ -398,6 +403,33 @@ async def permission(journal, tool, args, workspace):
             journal.state('working')
             return decision == 'continue'
         await asyncio.sleep(0.5)
+
+
+class Coalescer:
+    """Journals a run of contiguous streaming text fragments as one event.
+
+    `key` returns a block identity for a fragment, or None for any other event
+    (tool calls, results, ...), which flushes the block and is emitted as is.
+    A different key also flushes; `merge` turns two or more fragments into one.
+    """
+
+    def __init__(self, journal, key, merge):
+        self.j, self.key, self.merge = journal, key, merge
+        self.block = []
+
+    def add(self, event):
+        key = self.key(event)
+        if key is None or (self.block and self.key(self.block[0]) != key):
+            self.flush()
+        if key is None:
+            self.j.emit('native', event)
+        else:
+            self.block.append(event)
+
+    def flush(self):
+        if self.block:
+            self.j.emit('native', self.block[0] if len(self.block) == 1 else self.merge(self.block))
+            self.block = []
 
 
 class JsonProcess:
@@ -792,27 +824,48 @@ class Agy(JsonProcess):
             args += ['--conversation', journal.get('native_conversation_id')]
         await self.start(args, assignment['workspace'])
 
+    DELTA_FIELDS = {'conversation_id', 'state', 'step_index', 'step_type', 'text_delta'}
+
+    @staticmethod
+    def delta_block(event):
+        """AGY streams each response as ACTIVE step_updates of a few characters."""
+        step = event.get('step_update')
+        if (event.get('event') == 'step_update' and isinstance(step, dict) and set(step) <= Agy.DELTA_FIELDS
+                and step.get('state') == 'ACTIVE' and step.get('step_type') == 'agent_response'
+                and isinstance(step.get('text_delta'), str)):
+            return step.get('step_index')
+        return None
+
+    @staticmethod
+    def merge_deltas(block):
+        step = dict(block[0]['step_update'], text_delta=''.join(e['step_update']['text_delta'] for e in block))
+        return dict(block[0], step_update=step, coalesced=len(block))
+
     async def turn(self, prompt):
         await self.send(dict(event='user', message=dict(content=prompt)))
-        while True:
-            event = await self.notifications.get()
-            if 'disconnected' in event:
-                raise RuntimeError(event['disconnected'])
-            self.j.emit('native', event)
-            payload = event.get(event.get('event'), {})
-            conversation_id = event.get('conversation_id') or payload.get('conversation_id')
-            if conversation_id:
-                self.j.set('native_conversation_id', conversation_id)
-            if event.get('event') == 'init' and payload.get('model'):
-                self.j.set('actual_model', payload['model'])
-            if event.get('event') == 'result':
-                denied = payload.get('denied_actions') or []
-                response = payload.get('response') or payload.get('output') or ''
-                if denied and not response:
-                    raise RuntimeError('AGY turn denied with no response; denied actions: '+encode(denied))
-                if payload.get('status') != 'SUCCESS':
-                    raise RuntimeError('AGY '+str(payload.get('status', 'missing result status'))+': '+payload.get('error', 'Turn did not complete successfully'))
-                return
+        stream = Coalescer(self.j, self.delta_block, self.merge_deltas)
+        try:
+            while True:
+                event = await self.notifications.get()
+                if 'disconnected' in event:
+                    raise RuntimeError(event['disconnected'])
+                stream.add(event)
+                payload = event.get(event.get('event'), {})
+                conversation_id = event.get('conversation_id') or payload.get('conversation_id')
+                if conversation_id:
+                    self.j.update('native_conversation_id', conversation_id)
+                if event.get('event') == 'init' and payload.get('model'):
+                    self.j.set('actual_model', payload['model'])
+                if event.get('event') == 'result':
+                    denied = payload.get('denied_actions') or []
+                    response = payload.get('response') or payload.get('output') or ''
+                    if denied and not response:
+                        raise RuntimeError('AGY turn denied with no response; denied actions: '+encode(denied))
+                    if payload.get('status') != 'SUCCESS':
+                        raise RuntimeError('AGY '+str(payload.get('status', 'missing result status'))+': '+payload.get('error', 'Turn did not complete successfully'))
+                    return
+        finally:
+            stream.flush()
 
 
 class Cursor:
@@ -839,11 +892,50 @@ class Cursor:
         self.a, self.j = assignment, journal
         if assignment.get('autonomy') != 'yolo':
             raise RuntimeError('Cursor has no approval bridge yet; delegated Cursor assignments require yolo autonomy')
+        # The init event's `model` is a display name ("GPT-5.2 Medium") that
+        # --model rejects. Only ids contain no space; drop names stored earlier.
+        if ' ' in str(journal.get('actual_model') or ''):
+            journal.set('actual_model', None)
+        if ' ' in str((journal.get('invocation') or {}).get('model') or ''):
+            journal.set('invocation', None)
+        available = journal.get('available_models')
+        if isinstance(available, list) and any(' ' in str(model) for model in available):
+            journal.set('available_models', [model for model in available if ' ' not in str(model)])
+        journal.update('actual_model', assignment.get('model') or 'auto')
+
+    @staticmethod
+    def delta_block(event):
+        kind = event.get('type')
+        if kind == 'thinking' and event.get('subtype') == 'delta' and isinstance(event.get('text'), str):
+            return 'thinking'
+        content = (event.get('message') or {}).get('content') if kind == 'assistant' else None
+        if content and all(part.get('type') == 'text' and isinstance(part.get('text'), str) for part in content):
+            return 'assistant'
+        return None
+
+    @staticmethod
+    def merge_deltas(block):
+        if block[0]['type'] == 'thinking':
+            return dict(block[0], text=''.join(e['text'] for e in block), coalesced=len(block))
+        text = ''.join(part['text'] for e in block for part in e['message']['content'])
+        return dict(block[0], message=dict(block[0]['message'], content=[dict(type='text', text=text)]),
+                    coalesced=len(block))
+
+    @staticmethod
+    def available_models(errors):
+        """`--model` rejections list the ids: "... Available models: auto, gpt-5.2, ..."."""
+        for text in reversed(errors):
+            match = re.search(r'Available models:\s*(.+)', text)
+            if match:
+                return [model.strip() for model in match.group(1).split(',')
+                        if model.strip() and ' ' not in model.strip()]
+        return []
 
     async def turn(self, prompt):
         self.proc = await asyncio.create_subprocess_exec(*self.command(prompt), cwd=self.a['workspace'],
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=4*1024*1024)
         errors, result = [], None
+        stream = Coalescer(self.j, self.delta_block, self.merge_deltas)
 
         async def drain_stderr():
             while True:
@@ -863,18 +955,20 @@ class Cursor:
                     event = json.loads(raw)
                 except ValueError:
                     continue
-                self.j.emit('native', event)
+                stream.add(event)
                 kind = event.get('type')
                 if kind == 'error':
                     errors.append(str(event.get('message') or event.get('error') or encode(event)))
-                elif kind == 'system' and event.get('subtype') == 'init' and event.get('model'):
-                    self.j.set('actual_model', event['model'])
                 if event.get('session_id'):
-                    self.j.set('native_conversation_id', event['session_id'])
+                    self.j.update('native_conversation_id', event['session_id'])
                 if kind == 'result':
                     result = event
+            stream.flush()
             code = await self.proc.wait()
             await drained
+            available = self.available_models(errors)
+            if available:
+                self.j.set('available_models', available)
             detail = errors[-1][:2000] if errors else ''
             if code != 0:
                 raise RuntimeError('Cursor exited '+str(code)+(': '+detail if detail else ' without an error message'))
@@ -885,6 +979,7 @@ class Cursor:
             if result.get('is_error') or result.get('subtype') != 'success':
                 raise RuntimeError('Cursor turn ended with '+str(result.get('subtype'))+': '+str(result.get('error') or result.get('result', ''))[:2000])
         finally:
+            stream.flush()
             if self.proc.returncode is None:
                 self.proc.kill()
                 await self.proc.wait()
@@ -932,6 +1027,30 @@ class OpenCode:
         if not usable:
             raise RuntimeError('OpenCode has no connected tool-capable model; qwq/qvq reasoning models never call tools')
         return usable[0]
+
+    @staticmethod
+    def revision(message):
+        """What must change before a polled message is journaled again.
+
+        Streaming text grows on every poll; an unfinished message is journaled
+        again only when a part starts or changes status (tool call, result),
+        a completed or failed one whenever any of it changes.
+        """
+        info = message.get('info') or {}
+        if info.get('time', {}).get('completed') or info.get('error'):
+            return hashlib.sha256(encode(message).encode()).hexdigest()
+        return encode([[part.get('type'), (part.get('state') or {}).get('status')] for part in message.get('parts', [])])
+
+    def journaled(self):
+        # The message list always returns the whole history; a new turn or a
+        # restarted runner must not journal it again.
+        revisions = {}
+        for (payload,) in self.j.db.execute("SELECT payload FROM events WHERE kind='native' ORDER BY seq"):
+            message = json.loads(payload)
+            ident = (message.get('info') or {}).get('id') if isinstance(message, dict) else None
+            if ident:
+                revisions[ident] = self.revision(message)
+        return revisions
 
     async def http(self, method, path, body=None):
         import urllib.request
@@ -1004,7 +1123,8 @@ class OpenCode:
         # this prompt: the server may already be executing it.
         await self.http('POST', '/session/'+self.native+'/prompt_async',
                         dict(messageID=message_id, model=self.model, parts=[dict(type='text', text=prompt)]))
-        seen = set()
+        if not hasattr(self, 'revisions'):
+            self.revisions = self.journaled()
         actions = set()
         while True:
             for request in await self.http('GET', '/permission'):
@@ -1041,17 +1161,18 @@ class OpenCode:
             messages = await self.http('GET', '/session/'+self.native+'/message?limit=100')
             terminal = []
             for message in messages:
-                digest = hashlib.sha256(encode(message).encode()).hexdigest()
-                if digest not in seen:
-                    seen.add(digest)
-                    self.j.emit('native', message)
                 info = message.get('info', {})
+                ident = info.get('id') or hashlib.sha256(encode(message).encode()).hexdigest()
+                revision = self.revision(message)
+                if self.revisions.get(ident) != revision:
+                    self.revisions[ident] = revision
+                    self.j.emit('native', message)
                 if info.get('parentID') != message_id or info.get('role') != 'assistant':
                     continue
                 if info.get('error'):
                     raise RuntimeError(encode(info['error']))
                 if info.get('providerID') and info.get('modelID'):
-                    self.j.set('actual_model', info['providerID']+'/'+info['modelID'])
+                    self.j.update('actual_model', info['providerID']+'/'+info['modelID'])
                 for part in message.get('parts', []):
                     if part.get('type') == 'tool' or (part.get('type') == 'text' and part.get('text', '').strip()):
                         actions.add(part['type'])
