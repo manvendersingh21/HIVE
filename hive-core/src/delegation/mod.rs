@@ -700,10 +700,12 @@ fn coordinator_note(agent: &MasterAgent) -> String {
         agent.master_name())
 }
 
+/// `conversation_id` only labels warnings about a malformed answer.
 pub async fn plan(
     agent: &MasterAgent,
     request: &str,
     history: &str,
+    conversation_id: Option<&str>,
 ) -> anyhow::Result<DelegationPlan> {
     agent.refresh_machine_graph().await?;
     inventory::refresh_stale(agent, 120, 45).await?;
@@ -747,23 +749,36 @@ pub async fn plan(
         "owned_paths":{"type":"array","items":{"type":"string"}},
         "required_capabilities":{"type":"array","items":{"type":"string"}}
     }}}}});
+    // One retry in total, whether the answer was malformed JSON or a plan
+    // that failed validation. Both attempts share the caller's deadline.
     for attempt in 0..2 {
         let response = agent
             .llm
             .complete_json_with(&prompt, hive_common::AiProvider::Local, &schema)
             .await?;
-        let parsed = serde_json::from_str::<DelegationPlan>(&response.text)
-            .map_err(anyhow::Error::from)
-            .and_then(|mut p| {
-                repair_workspaces(&mut p);
-                repair_models(&mut p, agent)?;
-                validate(&p, agent)?;
-                validate_explicit(request, &p, agent)?;
-                validate_coordinator(request, &p, agent)?;
-                validate_container_request(request, &p)?;
-                Ok(p)
-            });
-        match parsed {
+        let plan = match serde_json::from_str::<DelegationPlan>(&response.text) {
+            Ok(plan) => plan,
+            Err(e) => {
+                let failure = crate::llm::JsonReplyError::new(&response.text, &e);
+                failure.warn("delegation plan", conversation_id);
+                if attempt == 0 {
+                    prompt.push_str(&failure.retry_instruction());
+                    continue;
+                }
+                return Err(failure.after_retry());
+            }
+        };
+        let validated = (|| {
+            let mut p = plan;
+            repair_workspaces(&mut p);
+            repair_models(&mut p, agent)?;
+            validate(&p, agent)?;
+            validate_explicit(request, &p, agent)?;
+            validate_coordinator(request, &p, agent)?;
+            validate_container_request(request, &p)?;
+            Ok(p)
+        })();
+        match validated {
             Ok(plan) => return Ok(plan),
             Err(error) if attempt == 0 => prompt.push_str(&format!("\nThe previous proposed plan was rejected before execution: {error}. Correct that error and return the complete plan. Keep explicit user placements.")),
             Err(error) => return Err(error),

@@ -407,6 +407,7 @@ impl LlmRouter {
                 // would poison the lock if this task is cancelled mid-hold.
                 let client = self.zai.read().unwrap().clone();
                 match client {
+                    Some(client) if schema.is_some() => client.complete_json(cloud_prompt).await,
                     Some(client) => client.complete(cloud_prompt).await,
                     None => Err(anyhow::anyhow!(
                         "Z.AI is not configured (set Z_AI or [llm.zai] in hive.toml, or select it from the master-agent settings with an API key)"
@@ -468,6 +469,150 @@ fn extract_json(text: &str) -> String {
     }
 }
 
+/// Bytes of model output kept on each side of a JSON failure position.
+const EXCERPT_RADIUS: usize = 100;
+
+/// A structured answer that was not valid JSON or did not match the expected
+/// shape. Carries only a bounded, redacted excerpt, never the full answer.
+#[derive(Debug, Clone)]
+pub struct JsonReplyError {
+    /// The parser's message, which names the line and column.
+    pub error: String,
+    pub line: usize,
+    pub column: usize,
+    pub excerpt: String,
+}
+
+impl JsonReplyError {
+    pub fn new(text: &str, error: &serde_json::Error) -> Self {
+        let offset = byte_offset(text, error.line(), error.column());
+        let start = floor_boundary(text, offset.saturating_sub(EXCERPT_RADIUS));
+        let end = ceil_boundary(text, (offset + EXCERPT_RADIUS).min(text.len()));
+        let offset = floor_boundary(text, offset).max(start);
+        let window = &text[start..end];
+        let redacted = redact_secrets(window);
+        // A marker inside a secret could split it past the redaction rules,
+        // so the position is only marked when nothing needed redacting.
+        let body = if redacted == window {
+            format!("{}⟨here⟩{}", &text[start..offset], &text[offset..end])
+        } else {
+            redacted
+        };
+        Self {
+            error: error.to_string(),
+            line: error.line(),
+            column: error.column(),
+            excerpt: format!(
+                "{}{body}{}",
+                if start > 0 { "…" } else { "" },
+                if end < text.len() { "…" } else { "" },
+            ),
+        }
+    }
+
+    /// Record the failure at warn level so a malformed answer is diagnosable.
+    pub fn warn(&self, what: &str, conversation_id: Option<&str>) {
+        tracing::warn!(
+            conversation_id = %conversation_id.unwrap_or("none"),
+            line = self.line,
+            column = self.column,
+            excerpt = ?self.excerpt,
+            error = %self.error,
+            "{what} was not valid JSON"
+        );
+    }
+
+    /// Appended to the prompt for the single corrective retry.
+    pub fn retry_instruction(&self) -> String {
+        format!(
+            "\n\nYour previous answer was invalid JSON at line {} column {}: {}. \
+             The text around that position was: {:?}. \
+             Return the complete answer again as one valid JSON object. Inside JSON strings, \
+             escape every double quote as \\\" and write every newline as \\n.",
+            self.line, self.column, self.error, self.excerpt
+        )
+    }
+
+    /// The user-facing error once the retry was also invalid.
+    pub fn after_retry(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "the model returned invalid JSON twice, including after one corrective retry \
+             (last error: {} near {:?}). No commands were executed; please resend the message, \
+             or shorten it if this keeps happening",
+            self.error,
+            self.excerpt
+        )
+    }
+}
+
+impl std::fmt::Display for JsonReplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for JsonReplyError {}
+
+/// serde_json positions are 1-based lines and 1-based byte columns.
+fn byte_offset(text: &str, line: usize, column: usize) -> usize {
+    if line == 0 {
+        return 0;
+    }
+    let line_start: usize = text
+        .split_inclusive('\n')
+        .take(line - 1)
+        .map(str::len)
+        .sum();
+    (line_start + column.saturating_sub(1)).min(text.len())
+}
+
+fn floor_boundary(text: &str, mut i: usize) -> usize {
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_boundary(text: &str, mut i: usize) -> usize {
+    while !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Masks credential-shaped text before model output reaches a log.
+pub fn redact_secrets(text: &str) -> String {
+    use std::sync::LazyLock;
+    static ASSIGNED: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)((?:api[_-]?key|access[_-]?key|secret|token|password|passwd|credential|authorization)s?["']?\s*[:=]\s*["']?)[^"'\s,}]+"#,
+        )
+        .expect("static pattern")
+    });
+    static BEARER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+").expect("static pattern")
+    });
+    static PREFIXED: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"\b(?:sk-|sk_|ghp_|gho_|ghs_|github_pat_|glpat-|xox[abpr]-|nvapi-|AKIA)[A-Za-z0-9_-]{8,}",
+        )
+        .expect("static pattern")
+    });
+    static OPAQUE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"[A-Za-z0-9_+/=-]{32,}").expect("static pattern"));
+    let text = BEARER.replace_all(text, "Bearer [redacted]");
+    let text = ASSIGNED.replace_all(&text, "${1}[redacted]");
+    let text = PREFIXED.replace_all(&text, "[redacted]");
+    OPAQUE
+        .replace_all(&text, |c: &regex::Captures| {
+            let token = &c[0];
+            let mixed = token.chars().any(|ch| ch.is_ascii_digit())
+                && token.chars().any(|ch| ch.is_ascii_alphabetic());
+            if mixed { "[redacted]".to_string() } else { token.to_string() }
+        })
+        .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +646,65 @@ mod tests {
         assert_eq!(extract_json("Here is the plan: {\"a\":{\"b\":2}} done"), "{\"a\":{\"b\":2}}");
         assert_eq!(extract_json("  {\"a\":1}  "), "{\"a\":1}");
         assert_eq!(extract_json("no json here"), "no json here");
+    }
+
+    fn json_failure(text: &str) -> JsonReplyError {
+        let error = serde_json::from_str::<serde_json::Value>(text).unwrap_err();
+        JsonReplyError::new(text, &error)
+    }
+
+    #[test]
+    fn json_failure_excerpt_is_bounded_around_the_failing_column() {
+        let text = format!(
+            "{{\"objective\":\"FAR_AWAY_START{}\"said \"hi\" then{}\"}}",
+            "a".repeat(4900),
+            "b".repeat(400)
+        );
+        let failure = json_failure(&text);
+        assert_eq!(failure.line, 1);
+        assert!(failure.column > 4900, "{}", failure.column);
+        assert!(failure.error.contains("column"), "{}", failure.error);
+        assert!(failure.excerpt.contains("\"⟨here⟩said \"hi"), "{}", failure.excerpt);
+        assert!(!failure.excerpt.contains("FAR_AWAY_START"));
+        assert!(failure.excerpt.starts_with('…') && failure.excerpt.ends_with('…'));
+        assert!(
+            failure.excerpt.chars().count() <= 2 * EXCERPT_RADIUS + 10,
+            "{} chars",
+            failure.excerpt.chars().count()
+        );
+        let retry = failure.retry_instruction();
+        assert!(retry.contains(&format!("invalid JSON at line 1 column {}", failure.column)));
+        assert!(retry.contains("said \\\"hi"), "{retry}");
+    }
+
+    #[test]
+    fn json_failure_positions_handle_multiple_lines_and_multibyte_text() {
+        let text = format!("{{\n  \"a\": \"{}\",\n  \"b\": oops\n}}", "é".repeat(150));
+        let failure = json_failure(&text);
+        assert_eq!(failure.line, 3);
+        assert!(failure.excerpt.contains("\"b\": ⟨here⟩oops"), "{}", failure.excerpt);
+        // Truncated on a character boundary without panicking.
+        assert!(failure.excerpt.starts_with('…'));
+    }
+
+    #[test]
+    fn json_failure_excerpts_never_carry_secrets() {
+        for secret in [
+            "\"api_key\": \"zai-0123456789abcdef\"",
+            "Authorization: Bearer abc.def-ghi",
+            "sk-proj-ABCDEFGH12345678",
+            "nvapi-ABCDEFGH12345678",
+            "token=hunter2hunter2",
+            "Z7x9Q2m4K8p1R5t3W6y0U2i4O6a8S0d2F4",
+        ] {
+            let failure = json_failure(&format!("{{\"x\": \"{secret}\" \"broken\"}}"));
+            for leaked in ["0123456789abcdef", "abc.def-ghi", "ABCDEFGH12345678", "hunter2", "Z7x9Q2m4K8p1"] {
+                assert!(!failure.excerpt.contains(leaked), "{secret} leaked: {}", failure.excerpt);
+                assert!(!failure.retry_instruction().contains(leaked));
+            }
+            assert!(failure.excerpt.contains("[redacted]"), "{}", failure.excerpt);
+        }
+        assert_eq!(redact_secrets("plain words and a uuid-free path /tmp/x"), "plain words and a uuid-free path /tmp/x");
     }
 
     #[test]

@@ -178,12 +178,26 @@ impl AgentHandle {
 
     pub fn enabled(agent: Arc<MasterAgent>, master_name: String) -> anyhow::Result<Self> {
         let history = ChatStore::new(agent.memory.graph.shared_conn())?;
-        history.recover_interrupted()?;
-        Ok(Self {
+        let recovery = history.recover_interrupted()?;
+        let handle = Self {
             agent: Some(agent),
             history: Some(history),
             master_name,
-        })
+        };
+        handle.restart_planning(recovery.restarted);
+        Ok(handle)
+    }
+
+    /// Plan again the turns a restart interrupted while they were planning.
+    /// Planning has no side effects, so nothing can be replayed by this.
+    pub(crate) fn restart_planning(&self, turns: Vec<SavedTurn>) {
+        for turn in turns {
+            info!(conversation_id = %turn.conversation_id, turn_id = %turn.id, "restarting planning interrupted by a restart");
+            let h = self.clone();
+            tokio::spawn(async move {
+                process_chat(h, turn).await;
+            });
+        }
     }
 
     pub(crate) fn require(&self) -> Result<&Arc<MasterAgent>, Response> {
@@ -576,7 +590,7 @@ async fn process_chat(h: AgentHandle, turn: SavedTurn) -> Response {
         Err(e) => return save_failure(store, &turn, storage_error(e)).await,
     };
     let plan = match plan_with_retry(
-        || agent.plan_chat_run(&turn.user_input, history.clone()),
+        || agent.plan_chat_run(&turn.user_input, history.clone(), &turn.conversation_id),
         PLANNING_TIMEOUT,
     )
     .await
@@ -739,7 +753,12 @@ async fn drive_workflow(
         let next = loop {
             let proposed = bounded_plan(
                 &PLANNER_SLOTS,
-                agent.continue_run(&reply.run, &reply.result, reply.workflow.as_ref().unwrap()),
+                agent.continue_run(
+                    &reply.run,
+                    &reply.result,
+                    reply.workflow.as_ref().unwrap(),
+                    &turn.conversation_id,
+                ),
                 CONTINUATION_TIMEOUT,
             )
             .await.and_then(|next| {
@@ -1744,6 +1763,68 @@ mod deadline_tests {
         assert!(std::str::from_utf8(&body)
             .unwrap()
             .contains("NVIDIA request deadline exceeded"));
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use hive_core::memory::chats::PLANNING_RESTARTED;
+
+    fn handle() -> AgentHandle {
+        let agent = Arc::new(MasterAgent::new(
+            hive_core::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            hive_core::workers::WorkerPool::new(vec![]),
+            hive_core::skills::SkillRegistry::new(),
+            hive_core::memory::MemorySystem::new(),
+        ));
+        AgentHandle::enabled(agent, "test".into()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_turn_interrupted_while_planning_is_planned_again() {
+        let h = handle();
+        let store = h.history.as_ref().unwrap();
+        let chat = store.create(None).unwrap();
+        store.begin(&chat.id, "held", "plan after restart").unwrap();
+
+        let recovery = store.recover_interrupted().unwrap();
+        assert_eq!(recovery.restarted.len(), 1);
+        assert_eq!(store.messages(&chat.id).unwrap()[1].content, PLANNING_RESTARTED);
+        h.restart_planning(recovery.restarted);
+
+        // The model is unreachable, so the re-run planning attempt fails; the
+        // turn only leaves `planning` because planning actually ran again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let turn = loop {
+            let turn = store.turn("held").unwrap().unwrap();
+            if turn.status != "planning" {
+                break turn;
+            }
+            assert!(std::time::Instant::now() < deadline, "planning was never restarted");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(turn.status, "failed");
+        let message = &store.messages(&chat.id).unwrap()[1].content;
+        assert!(message.starts_with("planning failed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_interrupted_while_executing_is_not_run_again() {
+        let h = handle();
+        let store = h.history.as_ref().unwrap();
+        let chat = store.create(None).unwrap();
+        store.begin(&chat.id, "running", "run once").unwrap();
+        store.executing("running", "run-1").unwrap();
+
+        let recovery = store.recover_interrupted().unwrap();
+        assert_eq!(recovery.interrupted, 1);
+        assert!(recovery.restarted.is_empty());
+        h.restart_planning(recovery.restarted);
+        tokio::task::yield_now().await;
+        let message = &store.messages(&chat.id).unwrap()[1];
+        assert_eq!(message.status.as_deref(), Some("interrupted"));
+        assert!(message.content.contains("Some commands may have run"));
     }
 }
 
