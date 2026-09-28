@@ -282,6 +282,15 @@ impl Journal {
 
 /// OS-backed exclusive writer ownership: automatically released on process death.
 /// A stale PID file is never used as evidence that another coordinator is alive.
+///
+/// An `flock` is owned by the *open file description*, not by the descriptor and not
+/// by the process, so a child forked while the lock is held inherits it. Two rules
+/// keep the lock's lifetime equal to this value's: the descriptor is close-on-exec,
+/// so a child that reaches `exec` cannot keep it, and `Drop` releases the lock
+/// explicitly, so a child that never gets there cannot either. Without the second
+/// rule a coordinator's exit does not end its lock: the next `acquire` on the same
+/// run fails with `EWOULDBLOCK` while an unrelated child is still alive, and a run
+/// that legitimately launched one is reported as owned by a coordinator that left.
 pub struct RunLock(std::fs::File);
 
 impl RunLock {
@@ -289,10 +298,17 @@ impl RunLock {
     pub fn acquire(root: &Path) -> anyhow::Result<Self> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
+        // `O_CLOEXEC` is requested rather than assumed. std happens to add it to every
+        // open today; HIVE depends on it, so it states the dependency and checks it.
         let file = std::fs::OpenOptions::new().read(true).write(true).create(true)
-            .truncate(false).mode(0o600).open(root.join("runtime.lock"))?;
-        // SAFETY: valid owned fd; flock does not read or write caller memory.
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            .truncate(false).mode(0o600).custom_flags(libc::O_CLOEXEC)
+            .open(root.join("runtime.lock"))?;
+        let fd = file.as_raw_fd();
+        // SAFETY: valid owned fd; fcntl and flock read no caller memory.
+        anyhow::ensure!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0,
+            "run lock descriptor is not close-on-exec; child processes would inherit the lock");
+        // SAFETY: as above.
+        let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
         anyhow::ensure!(result == 0, "another coordinator owns this run: {}", std::io::Error::last_os_error());
         Ok(Self(file))
     }
@@ -302,6 +318,16 @@ impl Drop for RunLock {
     fn drop(&mut self) {
         // Reading the member documents that its lifetime, not its pathname, is the lock.
         let _ = &self.0;
+        // Closing the descriptor releases the lock only once *every* descriptor onto the
+        // open file description is closed, and a forked child holds one from the moment
+        // it is created until it execs. `LOCK_UN` releases the lock itself, so the next
+        // coordinator can take the run while such a child is still running.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: valid owned fd; flock does not read or write caller memory.
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 }
 
@@ -342,6 +368,128 @@ mod tests {
         assert!(RunLock::acquire(&dir.dir).is_err());
         drop(first);
         assert!(RunLock::acquire(&dir.dir).is_ok());
+    }
+
+    /// A run that launched a child must be resumable as soon as its coordinator is
+    /// gone, not when the last descendant happens to exit. `flock` lives on the open
+    /// file description, so a child forked while the lock was held still owns it
+    /// until it execs; `pre_exec` is the deterministic stand-in for that window,
+    /// because it hands the child a second descriptor onto the *same* description.
+    /// Closing the coordinator's own descriptor does not end the lock in that case.
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_inherited_the_lock_never_keeps_the_run_locked() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        /// Reaps the inheriting child even when the assertions below unwind. A child
+        /// left holding a run lock outlives the process that started it, which is the
+        /// failure this test is about and must not also be the cause of another one.
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = crate::runtime::Scratch::new("run-lock-inherit");
+        let first = RunLock::acquire(&dir.dir).unwrap();
+        let inherited = first.0.as_raw_fd();
+        let mut child = std::process::Command::new("sleep");
+        child.arg("30");
+        // SAFETY: duplicating an inherited descriptor and reporting failure through
+        // `io::Error` are async-signal-safe; nothing here allocates or takes a lock.
+        unsafe {
+            child.pre_exec(move || {
+                if libc::fcntl(inherited, libc::F_DUPFD, 64) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = Reaped(child.spawn().expect("the inheriting child must start"));
+        drop(first); // the coordinator leaves while its child is still running
+
+        let second = RunLock::acquire(&dir.dir)
+            .expect("a live child must not hold a run whose coordinator has already gone");
+        assert!(RunLock::acquire(&dir.dir).is_err(), "the new coordinator owns the run exclusively");
+        drop(second);
+
+        let _ = child.0.kill();
+        assert!(child.0.wait().unwrap().signal().is_some(), "the child must still have been running");
+        assert!(RunLock::acquire(&dir.dir).is_ok(), "the run is free once nothing holds it");
+    }
+
+    /// Acquire, refuse a second owner, release, repeat: a coordinator that is resumed
+    /// many times in one process must not spend a descriptor per attempt. The refused
+    /// acquisitions are the ones that could leak, and the budget is enforced by the
+    /// kernel rather than by counting, so a leak fails as `EMFILE` and nothing else.
+    ///
+    /// The count has to be taken where nothing else is running, so the child process
+    /// does the work: the fixture runs beside every other test in this binary, and
+    /// their pipes and journals would be indistinguishable from a leak.
+    #[test]
+    #[cfg(unix)]
+    fn releasing_a_run_lock_repeatedly_never_exhausts_the_descriptor_table() {
+        let scratch = crate::runtime::Scratch::new("run-lock-descriptors");
+        let root = scratch.dir.clone();
+        let marker = scratch.join("result");
+        // SAFETY: the child below runs only async-signal-safe calls — `close`,
+        // `setrlimit`, `open`, `flock`, `write`, `_exit` — because a fork of this
+        // multithreaded test binary may land holding a lock no other thread can take.
+        // `setrlimit` applies to the child alone, so it cannot affect the parent.
+        unsafe {
+            let pid = libc::fork();
+            match pid {
+                -1 => panic!("could not fork: {}", std::io::Error::last_os_error()),
+                0 => {
+                    // This child holds a copy of every descriptor the test binary had
+                    // open, including the run locks of tests running beside this one.
+                    // Closing them first is async-signal-safe and keeps the measurement
+                    // from measuring somebody else's run.
+                    for fd in 3..1024 {
+                        libc::close(fd);
+                    }
+                    let mut limit = libc::rlimit { rlim_cur: 24, rlim_max: 24 };
+                    let verdict = if libc::setrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                        let mut failure = None;
+                        for _ in 0..64 {
+                            match RunLock::acquire(&root) {
+                                Ok(held) => {
+                                    if RunLock::acquire(&root).is_ok() {
+                                        failure = Some("a second coordinator took the same run".to_string());
+                                    }
+                                    drop(held);
+                                }
+                                Err(e) => { failure = Some(format!("run lock did not survive 64 cycles: {e}")); break; }
+                            }
+                        }
+                        failure
+                    } else { Some(format!("could not set a descriptor budget: {}", std::io::Error::last_os_error())) };
+                    if let Some(text) = verdict.as_deref() {
+                        let _ = std::fs::write(&marker, text);
+                    }
+                    libc::_exit(if verdict.is_some() { 1 } else { 0 });
+                }
+                _ => {
+                    let mut status: libc::c_int = 0;
+                    for _ in 0..600 {
+                        match libc::waitpid(pid, &mut status, libc::WNOHANG) {
+                            0 => std::thread::sleep(std::time::Duration::from_millis(10)),
+                            found => {
+                                assert_eq!(found, pid, "reaped the wrong child");
+                                let reported = std::fs::read_to_string(&marker).unwrap_or_default();
+                                assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                                    "releasing a run lock leaked descriptors: {reported}");
+                                return;
+                            }
+                        }
+                    }
+                    let _ = libc::kill(pid, libc::SIGKILL);
+                    panic!("the descriptor-budget child never finished");
+                }
+            }
+        }
     }
 
     #[test]
