@@ -11,14 +11,31 @@ pub use claude::ClaudeClient;
 pub use gemini::GeminiClient;
 pub use local::OllamaClient;
 pub use openai::OpenAiClient;
-pub use zai::ZaiClient;
+pub use zai::{ZaiClient, ZaiQuotaError};
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use hive_common::config::LlmConfig;
 use hive_common::{AiProvider, Complexity};
 use serde::{Deserialize, Serialize};
+
+/// How long Z.AI is skipped, and its requests answered by the local model,
+/// after Z.AI reports a quota error.
+pub const ZAI_QUOTA_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+/// Source of the current time for the Z.AI quota cooldown.
+pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
+/// An active Z.AI quota cooldown: until `until`, Z.AI requests go to the
+/// local model.
+#[derive(Debug, Clone)]
+pub struct ZaiFallback {
+    pub until: DateTime<Utc>,
+    pub error: ZaiQuotaError,
+}
 
 /// Env var NVIDIA's client resolves its key from (see `nvidia::NvidiaClient::for_reasoning`).
 const NVIDIA_KEY_ENV: &str = "NVIDIA_API_KEY_FLASH";
@@ -81,12 +98,15 @@ pub struct LlmResponse {
 ///
 /// In legacy mode, missing cloud providers fall back to the local model.
 /// Single-provider mode overrides every recommendation and skill override,
-/// and propagates errors without switching providers.
+/// and propagates errors without switching providers — except a Z.AI quota
+/// error, which is answered locally for [`ZAI_QUOTA_COOLDOWN`] in every mode.
 pub struct LlmRouter {
     /// When set, overrides all routing and disables provider fallback.
     /// Runtime-mutable so the master-agent settings API can switch it
     /// without a restart.
     single_provider: RwLock<Option<AiProvider>>,
+    zai_fallback: RwLock<Option<ZaiFallback>>,
+    clock: Clock,
     nvidia: nvidia::NvidiaClient,
     models: RwLock<HashMap<AiProvider, String>>,
     local: OllamaClient,
@@ -104,6 +124,8 @@ impl LlmRouter {
         Self {
             models: RwLock::new([(AiProvider::Local, local_model.clone())].into()),
             single_provider: RwLock::new(None),
+            zai_fallback: RwLock::new(None),
+            clock: Arc::new(Utc::now),
             nvidia: nvidia::NvidiaClient::for_reasoning(&Default::default()),
             local: OllamaClient::new(local_url, local_model),
             gemini: None,
@@ -173,6 +195,8 @@ impl LlmRouter {
         }
         Self {
             single_provider: RwLock::new(cfg.single_provider),
+            zai_fallback: RwLock::new(None),
+            clock: Arc::new(Utc::now),
             nvidia: nvidia::NvidiaClient::for_reasoning(&cfg.nvidia),
             models: RwLock::new(models),
             local,
@@ -180,6 +204,78 @@ impl LlmRouter {
             claude,
             codex,
             zai: RwLock::new(zai),
+        }
+    }
+
+    /// Replace the clock that times the Z.AI quota cooldown.
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The Z.AI quota cooldown in effect now, if any.
+    pub fn zai_fallback(&self) -> Option<ZaiFallback> {
+        let now = (self.clock)();
+        self.zai_fallback
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|f| now < f.until)
+    }
+
+    /// The provider that actually answers the master agent right now: the
+    /// selected one, or `Local` while a Z.AI quota cooldown is in effect.
+    pub fn active_provider(&self) -> AiProvider {
+        let current = self.current_provider();
+        if current == AiProvider::Zai && self.zai_fallback().is_some() {
+            AiProvider::Local
+        } else {
+            current
+        }
+    }
+
+    /// Start the cooldown for `error`. Returns false when a concurrent
+    /// request already started one, so the switch is logged only once.
+    fn start_zai_fallback(&self, error: ZaiQuotaError) -> (DateTime<Utc>, bool) {
+        let now = (self.clock)();
+        let mut state = self.zai_fallback.write().unwrap();
+        if let Some(active) = state.as_ref().filter(|f| now < f.until) {
+            return (active.until, false);
+        }
+        let cooldown = chrono::Duration::from_std(ZAI_QUOTA_COOLDOWN).expect("constant fits");
+        let until = now + cooldown;
+        *state = Some(ZaiFallback { until, error });
+        (until, true)
+    }
+
+    fn local_response(&self, text: String) -> LlmResponse {
+        LlmResponse {
+            text,
+            provider: AiProvider::Local,
+            model: self
+                .models
+                .read()
+                .unwrap()
+                .get(&AiProvider::Local)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Answer a Z.AI request locally during the cooldown; if the local model
+    /// fails too, the caller sees the quota error that started the cooldown.
+    async fn local_during_zai_cooldown(
+        &self,
+        prompt: &str,
+        schema: Option<&serde_json::Value>,
+        quota: ZaiQuotaError,
+    ) -> anyhow::Result<LlmResponse> {
+        match self.local_formatted(prompt, schema).await {
+            Ok(text) => Ok(self.local_response(text)),
+            Err(e) => {
+                tracing::debug!("local model failed during the Z.AI quota cooldown: {e}");
+                Err(quota.into())
+            }
         }
     }
 
@@ -275,9 +371,10 @@ impl LlmRouter {
     /// Any other provider is rejected: those are routed automatically by
     /// task complexity, not selectable as the master agent's sole provider.
     ///
-    /// Once set, this disables fallback to the local model for every other
-    /// provider (see `complete_formatted`) — the caller has explicitly
-    /// opted out of ever silently running the local Qwen model again.
+    /// Once set, this disables fallback to the local model on ordinary
+    /// errors (see `complete_formatted`). Only a Z.AI quota error still
+    /// fails over to the local model, for [`ZAI_QUOTA_COOLDOWN`]. A newly
+    /// supplied Z.AI key ends any running cooldown.
     pub fn set_provider(
         &self,
         provider: AiProvider,
@@ -288,6 +385,7 @@ impl LlmRouter {
             AiProvider::Zai => {
                 if let Some(key) = api_key {
                     *self.zai.write().unwrap() = Some(Arc::new(ZaiClient::with_key(key)));
+                    *self.zai_fallback.write().unwrap() = None;
                 }
                 if self.zai.read().unwrap().is_none() {
                     anyhow::bail!("Z.AI API key required");
@@ -403,6 +501,11 @@ impl LlmRouter {
                 )),
             },
             AiProvider::Zai => {
+                if let Some(fallback) = self.zai_fallback() {
+                    return self
+                        .local_during_zai_cooldown(prompt, schema, fallback.error)
+                        .await;
+                }
                 // Clone the Arc and drop the read guard before the await —
                 // holding a std::sync::RwLock guard across an await point
                 // would poison the lock if this task is cancelled mid-hold.
@@ -430,22 +533,33 @@ impl LlmRouter {
                     .cloned()
                     .unwrap_or_default(),
             }),
+            Err(e) if provider == AiProvider::Zai && e.is::<ZaiQuotaError>() => {
+                let quota = e.downcast::<ZaiQuotaError>().expect("checked above");
+                let (until, started) = self.start_zai_fallback(quota.clone());
+                let local = self.local_formatted(prompt, schema).await;
+                if started {
+                    match &local {
+                        Ok(_) => tracing::warn!(
+                            "{quota}; answering from the local model and skipping Z.AI until {}",
+                            until.to_rfc3339()
+                        ),
+                        Err(local_err) => tracing::warn!(
+                            "{quota}; the local model failed too ({local_err}); skipping Z.AI until {}",
+                            until.to_rfc3339()
+                        ),
+                    }
+                }
+                match local {
+                    Ok(text) => Ok(self.local_response(text)),
+                    Err(_) => Err(quota.into()),
+                }
+            }
             Err(e) if provider != AiProvider::Local && single_provider.is_none() => {
                 tracing::warn!(
                     "Provider {provider} unavailable ({e}), falling back to local model"
                 );
                 let text = self.local_formatted(prompt, schema).await?;
-                Ok(LlmResponse {
-                    text,
-                    provider: AiProvider::Local,
-                    model: self
-                        .models
-                        .read()
-                        .unwrap()
-                        .get(&AiProvider::Local)
-                        .cloned()
-                        .unwrap_or_default(),
-                })
+                Ok(self.local_response(text))
             }
             Err(e) => Err(e),
         }
@@ -783,24 +897,33 @@ mod tests {
         assert_eq!(zai.api_key(), "file-key");
     }
 
-    // The core "turn off local qwen" invariant: once Z.AI is the sole
-    // provider, a request never silently falls back to the local model —
-    // even when no Z.AI client is actually configured to serve it. A
-    // regression here would mean the master agent quietly keeps running
-    // local Qwen after the user asked to shift fully to Z.AI.
+    // Once Z.AI is the sole provider, only a Z.AI quota error fails over to
+    // the local model. Every other failure — here "not configured" — is
+    // returned as is, even though a working local model is right there, and
+    // starts no cooldown.
     #[tokio::test]
     async fn selecting_zai_disables_fallback_to_local_even_when_unconfigured() {
+        let (local_url, local_requests, local_task) = nvidia::tests::server(vec![(
+            200,
+            serde_json::json!({"message":{"content":"local answer"}}),
+            std::time::Duration::ZERO,
+        )])
+        .await;
         let mut cfg = base_config();
         cfg.single_provider = Some(AiProvider::Zai);
-        // Unreachable on purpose: if this were ever hit, the test would hang
-        // or fail with a connection error instead of the expected message.
-        cfg.local.base_url = "http://127.0.0.1:1".into();
+        cfg.local.base_url = local_url;
         let router = LlmRouter::from_config(&cfg);
         assert!(!router.zai_configured());
 
-        let result = router.complete_with("hello", AiProvider::Claude).await;
-        let err = result
-            .expect_err("must not silently fall back to local when Z.AI is the sole provider");
+        let err = router
+            .complete_with("hello", AiProvider::Claude)
+            .await
+            .expect_err("only quota errors fail over to local when Z.AI is the sole provider");
         assert!(err.to_string().contains("Z.AI is not configured"), "{err}");
+        assert!(!err.is::<ZaiQuotaError>());
+        local_task.abort();
+        assert!(local_requests.lock().unwrap().is_empty(), "local model was not called");
+        assert!(router.zai_fallback().is_none());
+        assert_eq!(router.active_provider(), AiProvider::Zai);
     }
 }
