@@ -1012,6 +1012,13 @@ pub struct MasterAgentSettings {
     pub options: Vec<ProviderOption>,
     pub local_model: String,
     pub local_available: bool,
+    /// The provider answering right now: `provider`, or `local` while a
+    /// Z.ai quota cooldown is in effect.
+    pub active_provider: &'static str,
+    /// When the Z.ai quota cooldown ends; absent when none is in effect.
+    pub fallback_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// The Z.ai quota error that started the cooldown.
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1050,7 +1057,11 @@ fn parse_provider_id(id: &str) -> Result<hive_common::AiProvider, Response> {
 }
 
 async fn master_agent_settings_view(agent: &MasterAgent) -> MasterAgentSettings {
+    let fallback = agent.llm.zai_fallback();
     MasterAgentSettings {
+        active_provider: provider_id(agent.llm.active_provider()),
+        fallback_until: fallback.as_ref().map(|f| f.until),
+        fallback_reason: fallback.map(|f| f.error.to_string()),
         provider: provider_id(agent.llm.current_provider()),
         options: vec![
             ProviderOption {
@@ -1905,6 +1916,81 @@ mod master_agent_state_tests {
         }
     }
 
+    /// Answers one HTTP request with a Z.ai 429 quota error.
+    async fn zai_quota_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn settings_view_reports_the_zai_quota_fallback() {
+        let (url, task) = zai_quota_server().await;
+        let mut cfg = quiet_llm_config();
+        cfg.single_provider = Some(hive_common::AiProvider::Zai);
+        cfg.local.base_url = "http://127.0.0.1:1".into();
+        cfg.zai = Some(CloudLlmConfig {
+            api_key: Some("test-key".into()),
+            model: "glm-test".into(),
+            base_url: Some(url),
+            ..CloudLlmConfig::default()
+        });
+        let agent = MasterAgent::new(
+            LlmRouter::from_config(&cfg),
+            hive_core::workers::WorkerPool::new(vec![]),
+            hive_core::skills::SkillRegistry::new(),
+            hive_core::memory::MemorySystem::new(),
+        );
+
+        let before = master_agent_settings_view(&agent).await;
+        assert_eq!((before.provider, before.active_provider), ("zai", "zai"));
+        assert!(before.fallback_until.is_none() && before.fallback_reason.is_none());
+
+        let err = agent
+            .llm
+            .complete_with("hello", hive_common::AiProvider::Claude)
+            .await
+            .expect_err("local is unreachable, so the quota error comes back");
+        assert!(err.is::<hive_core::llm::ZaiQuotaError>(), "{err}");
+        task.await.unwrap();
+
+        let during = master_agent_settings_view(&agent).await;
+        assert_eq!(during.provider, "zai", "the selection is unchanged");
+        assert_eq!(during.active_provider, "local");
+        let until = during.fallback_until.expect("cooldown end reported");
+        let remaining = until - chrono::Utc::now();
+        assert!(
+            remaining > chrono::Duration::minutes(29) && remaining <= chrono::Duration::minutes(30),
+            "{remaining}"
+        );
+        let reason = during.fallback_reason.as_deref().expect("reason reported");
+        assert!(reason.contains("1308") && reason.contains("Usage limit"), "{reason}");
+
+        let json = serde_json::to_value(&during).unwrap();
+        assert_eq!(json["active_provider"], "local");
+        assert!(json["fallback_until"].is_string(), "{json}");
+        assert!(json["fallback_reason"].is_string(), "{json}");
+    }
+
     #[test]
     fn save_roundtrips_atomically_and_privately_via_the_env_override() {
         let _env = ENV_LOCK.lock().unwrap();
@@ -2160,6 +2246,7 @@ mod master_agent_state_tests {
             incidents: crate::incidents::IncidentReview::new(
                 hive_core::watchdog::incidents::IncidentStore::in_memory().unwrap(),
             ),
+            db_ok: true,
         };
         let static_dir =
             std::env::temp_dir().join(format!("hive-web-settings-{}", uuid::Uuid::new_v4()));
