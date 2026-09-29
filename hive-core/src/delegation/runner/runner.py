@@ -1747,6 +1747,23 @@ def reconcile(journal, request):
     return dict(resuming=True, recovery_id=recovery_id, native_conversation_id=native, tmux_name=pane['tmux_name'])
 
 
+def initial_prompt(assignment):
+    peers = assignment.get('peers', [])
+    return ('You are the real worker for this Hive assignment. Work only on your assigned device and workspace. '
+            'Implement, test, and verify the acceptance criteria. Keep services independent of this process. '
+            'Use the native hive peer tool when available, otherwise the peer command below, for questions, answers, interface agreements, and deployment results; '
+            'never impersonate peers or SSH into their machines. After a peer question, end this turn briefly if a reply is needed; Hive delivers it into this same session. Do not sleep or poll for peer replies. '
+            'Never leave background processes attached to the tool\'s stdout/stderr: the tool call cannot finish while one holds its output open. '
+            'Start them with nohup or setsid and `>file 2>&1 </dev/null`, or avoid background loops. '
+            'Include evidence and actual commands in your final response.\n\n'
+            'Planner objective:\n'+assignment.get('objective', '')+'\n\n'
+            'User brief:\n'+assignment.get('user_brief', '')+'\n\n'
+            'Assignment metadata:\n'+encode(assignment)+'\n'
+            'Peer command: '+shlex.join([sys.executable, str(Path(__file__).resolve()), 'peer', '--run-id', assignment['id']])
+            +' --to PEER_RUN_ID --kind question|answer|agreement|deployment --body "message"\n'
+            'Team (peer roles, owned paths, status and dependencies): '+encode(peers))
+
+
 async def run(assignment, journal):
     # Holding a filesystem lock for the process lifetime prevents duplicate owners.
     import fcntl
@@ -1781,16 +1798,7 @@ async def run(assignment, journal):
     adapter.credential = journal.issue_credential()
     try:
         await adapter.connect(assignment, journal)
-        peers = assignment.get('peers', [])
-        prompt = ('You are the real worker for this Hive assignment. Work only on your assigned device and workspace. '
-                  'Implement, test, and verify the acceptance criteria. Keep services independent of this process. '
-                  'Use the native hive peer tool when available, otherwise the peer command below, for questions, answers, interface agreements, and deployment results; '
-                  'never impersonate peers or SSH into their machines. After a peer question, end this turn briefly if a reply is needed; Hive delivers it into this same session. Do not sleep or poll for peer replies. '
-                  'Never leave background processes attached to the tool\'s stdout/stderr: the tool call cannot finish while one holds its output open. '
-                  'Start them with nohup or setsid and `>file 2>&1 </dev/null`, or avoid background loops. '
-                  'Include evidence and actual commands in your final response.\n'
-                  + encode(assignment)+'\nPeer command: '+shlex.join([sys.executable, str(Path(__file__).resolve()), 'peer', '--run-id', assignment['id']])
-                  +' --to PEER_RUN_ID --kind question|answer|agreement|deployment --body "message"\nTeam (peer roles, owned paths, status and dependencies): '+encode(peers))
+        prompt = initial_prompt(assignment)
         if not journal.db.execute("SELECT 1 FROM inbox WHERE id='initial'").fetchone():
             journal.enqueue(dict(id='initial', text=prompt))
         recovery_message = 'recovery-'+authorization['id'] if authorization else None

@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='hive-remote-sessions-') as tmp:
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
-    env = dict(os.environ, HIVE_CONFIG_ROOT=tmp, HIVE_WEB_ADDR=f'127.0.0.1:{port}',
+    env = dict(os.environ, HOME=tmp, HIVE_CONFIG_ROOT=tmp, HIVE_WEB_ADDR=f'127.0.0.1:{port}',
                HIVE_WEB_PASSWORD='sessions-test-password', HIVE_WEB_STATIC=str(ROOT / 'hive-web/static'))
     name = 'hive-session-check-' + uuid.uuid4().hex[:12]
     created = []

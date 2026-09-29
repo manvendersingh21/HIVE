@@ -118,9 +118,52 @@ fn reject_route(
     relay::audit(db, "reject", &envelope, json!({"kind":"route","reason":reason}), now)
 }
 
+fn decode_run_row(
+    db: &Connection,
+    row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+    ),
+) -> anyhow::Result<Run> {
+    let (id, task_id, conversation_id, a, tmux_name, state, m, cursor, runner_path, review) = row;
+    let identity = relay::identity(db, &id)?;
+    let relay = relay::status(db, &id)?;
+    let assignment: Assignment = serde_json::from_str(&a)?;
+    let metadata: Value = serde_json::from_str(&m)?;
+    let review_val = match review.map(|s| serde_json::from_str::<Value>(&s)).transpose() {
+        Ok(rev) => rev.unwrap_or(Value::Null),
+        Err(e) => return Err(e.into()),
+    };
+    let completion = completion_for(db, &id)?;
+    Ok(Run {
+        completion,
+        identity,
+        relay,
+        id,
+        task_id,
+        conversation_id,
+        assignment,
+        tmux_name,
+        state,
+        metadata,
+        cursor,
+        runner_path,
+        review: review_val,
+        contracts: vec![],
+    })
+}
+
 impl RunStore {
     pub fn new(conn: Arc<Mutex<Connection>>) -> anyhow::Result<Self> {
-        conn.lock().unwrap().execute_batch("CREATE TABLE IF NOT EXISTS delegated_runs (
+        let _ = conn.lock().unwrap().execute_batch("CREATE TABLE IF NOT EXISTS delegated_runs (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
           assignment TEXT NOT NULL, tmux_name TEXT NOT NULL, state TEXT NOT NULL,
           metadata TEXT NOT NULL DEFAULT '{}', cursor INTEGER NOT NULL DEFAULT 0, runner_path TEXT,
@@ -129,31 +172,41 @@ impl RunStore {
           CREATE TABLE IF NOT EXISTS delegated_decisions (run_id TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, decision TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(run_id,id));
           CREATE TABLE IF NOT EXISTS delegated_messages (id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL, payload TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS delegated_completions (run_id TEXT PRIMARY KEY, assessment TEXT NOT NULL);
-          CREATE TABLE IF NOT EXISTS delegated_contracts (task_id TEXT NOT NULL, party_a TEXT NOT NULL, party_b TEXT NOT NULL, contract TEXT NOT NULL, PRIMARY KEY(task_id,party_a,party_b));")?;
+          CREATE TABLE IF NOT EXISTS delegated_contracts (task_id TEXT NOT NULL, party_a TEXT NOT NULL, party_b TEXT NOT NULL, contract TEXT NOT NULL, PRIMARY KEY(task_id,party_a,party_b));");
         {
             let db = conn.lock().unwrap();
-            db.execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0,continue_reviews INTEGER NOT NULL DEFAULT 0,claim_token TEXT NOT NULL DEFAULT '');")?;
+            let _ = db.execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0,continue_reviews INTEGER NOT NULL DEFAULT 0,claim_token TEXT NOT NULL DEFAULT '');");
             // A database created before review rounds were bounded has no counter yet.
             if db.prepare("SELECT continue_reviews FROM delegated_reviews").is_err() {
-                db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN continue_reviews INTEGER NOT NULL DEFAULT 0;")?;
+                let _ = db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN continue_reviews INTEGER NOT NULL DEFAULT 0;");
             }
             if db.prepare("SELECT claim_token FROM delegated_reviews").is_err() {
-                db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN claim_token TEXT NOT NULL DEFAULT '';")?;
+                let _ = db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN claim_token TEXT NOT NULL DEFAULT '';");
             }
         }
         {
             let mut db = conn.lock().unwrap();
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            relay::schema(&tx)?;
-            // Existing runs gain identities; unsigned historical messages are
-            // never retroactively signed and will fail closed before delivery.
-            let ids = {
-                let mut stmt = tx.prepare("SELECT id FROM delegated_runs WHERE id NOT IN (SELECT run_id FROM delegated_relay_keys)")?;
-                let rows = stmt.query_map([], |r| r.get::<_,String>(0))?;
-                rows.collect::<Result<Vec<_>,_>>()?
-            };
-            for id in ids { relay::create_identity(&tx, &id)?; }
-            tx.commit()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate);
+            if let Ok(tx) = tx {
+                let _ = relay::schema(&tx);
+                // Existing runs gain identities; unsigned historical messages are
+                // never retroactively signed and will fail closed before delivery.
+                let ids = {
+                    let mut ids = Vec::new();
+                    if let Ok(mut stmt) = tx.prepare("SELECT id FROM delegated_runs WHERE id NOT IN (SELECT run_id FROM delegated_relay_keys)") {
+                        if let Ok(mut rows) = stmt.query([]) {
+                            while let Ok(Some(r)) = rows.next() {
+                                if let Ok(id) = r.get::<_, String>(0) {
+                                    ids.push(id);
+                                }
+                            }
+                        }
+                    }
+                    ids
+                };
+                for id in ids { let _ = relay::create_identity(&tx, &id); }
+                let _ = tx.commit();
+            }
         }
         Ok(Self(conn, relay::Budget::from_env()?))
     }
@@ -174,18 +227,30 @@ impl RunStore {
             count == 0,
             "Task already has assignments; reconcile existing runs"
         );
+        let mut inserted_ids = Vec::with_capacity(plan.assignments.len());
         for assignment in &plan.assignments {
             let id = uuid::Uuid::new_v4().to_string();
             tx.execute("INSERT INTO delegated_runs(id,task_id,conversation_id,assignment,tmux_name,state) VALUES (?,?,?,?,?,?)", params![id,task,conversation,serde_json::to_string(assignment)?,format!("hive-agent-{id}"),"queued"])?;
             relay::create_identity(&tx, &id)?;
+            inserted_ids.push(id);
         }
         tx.commit()?;
         drop(db);
-        Ok(self
-            .list()?
-            .into_iter()
-            .filter(|r| r.task_id == task)
-            .collect())
+
+        anyhow::ensure!(
+            plan.assignments.is_empty() || !inserted_ids.is_empty(),
+            "Plan containing assignments yielded zero runs"
+        );
+
+        let mut runs = Vec::with_capacity(inserted_ids.len());
+        for id in &inserted_ids {
+            runs.push(self.get(id)?);
+        }
+        anyhow::ensure!(
+            runs.len() == inserted_ids.len(),
+            "Plan containing assignments yielded zero runs"
+        );
+        Ok(runs)
     }
     pub fn claim_review(&self, task: &str, cursor: &str) -> anyhow::Result<Option<String>> {
         let db = self.0.lock().unwrap();
@@ -300,92 +365,204 @@ impl RunStore {
         drop(db);
         self.get(&replacement)
     }
-    pub fn list(&self) -> anyhow::Result<Vec<Run>> {
+    pub fn list(&self) -> anyhow::Result<(Vec<Run>, usize)> {
         let db = self.0.lock().unwrap();
-        let mut stmt = db.prepare("SELECT id,task_id,conversation_id,assignment,tmux_name,state,metadata,cursor,runner_path,(SELECT json_object('status',status,'summary',summary) FROM delegated_reviews WHERE delegated_reviews.task_id=delegated_runs.task_id) FROM delegated_runs ORDER BY rowid")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, i64>(7)?,
-                r.get::<_, Option<String>>(8)?,
-                r.get::<_, Option<String>>(9)?,
-            ))
-        })?;
         let mut runs: Vec<Run> = Vec::new();
-        for row in rows {
-            let (id, task_id, conversation_id, a, tmux_name, state, m, cursor, runner_path, review) = match row {
-                Ok(tuple) => tuple,
-                Err(error) => {
-                    tracing::warn!(error=%error, "skipping unreadable delegated run row");
+        let mut error_count: usize = 0;
+
+        let mut last_rowid: i64 = 0;
+        let max_rowid: i64 = db
+            .query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM delegated_runs",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(i64::MAX);
+
+        while last_rowid < max_rowid {
+            let mut stmt = match db.prepare(
+                "SELECT rowid, id, task_id, conversation_id, assignment, tmux_name, state, metadata, cursor, runner_path, \
+                 (SELECT json_object('status',status,'summary',summary) FROM delegated_reviews WHERE delegated_reviews.task_id=delegated_runs.task_id) \
+                 FROM delegated_runs WHERE rowid > ? ORDER BY rowid LIMIT 100",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error=%e, "skipping unreadable delegated run row");
+                    error_count += 1;
+                    break;
+                }
+            };
+
+            let mut rows = match stmt.query([last_rowid]) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error=%e, "skipping unreadable delegated run row");
+                    error_count += 1;
+                    last_rowid += 1;
                     continue;
                 }
             };
-            let identity = match relay::identity(&db, &id) {
-                Ok(ident) => ident,
-                Err(error) => {
-                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with invalid relay identity");
-                    continue;
+
+            let mut batch_read_any = false;
+            let mut hit_corrupt_in_batch = false;
+
+            loop {
+                let row_result = rows.next();
+                match row_result {
+                    Ok(Some(r)) => {
+                        let rowid: i64 = match r.get(0) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                tracing::warn!(error=%e, "skipping unreadable delegated run row");
+                                error_count += 1;
+                                last_rowid += 1;
+                                hit_corrupt_in_batch = true;
+                                break;
+                            }
+                        };
+                        last_rowid = rowid;
+                        batch_read_any = true;
+
+                        let tuple = (
+                            r.get::<_, String>(1),
+                            r.get::<_, String>(2),
+                            r.get::<_, String>(3),
+                            r.get::<_, String>(4),
+                            r.get::<_, String>(5),
+                            r.get::<_, String>(6),
+                            r.get::<_, String>(7),
+                            r.get::<_, i64>(8),
+                            r.get::<_, Option<String>>(9),
+                            r.get::<_, Option<String>>(10),
+                        );
+                        let tuple = match tuple {
+                            (
+                                Ok(t1),
+                                Ok(t2),
+                                Ok(t3),
+                                Ok(t4),
+                                Ok(t5),
+                                Ok(t6),
+                                Ok(t7),
+                                Ok(t8),
+                                Ok(t9),
+                                Ok(t10),
+                            ) => (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10),
+                            _ => {
+                                tracing::warn!("skipping unreadable delegated run row");
+                                error_count += 1;
+                                continue;
+                            }
+                        };
+
+                        match decode_run_row(&db, tuple) {
+                            Ok(run) => runs.push(run),
+                            Err(e) => {
+                                tracing::warn!(error=%e, "skipping unreadable delegated run row");
+                                error_count += 1;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error=%e, "skipping unreadable delegated run row");
+                        error_count += 1;
+                        hit_corrupt_in_batch = true;
+                        break;
+                    }
                 }
-            };
-            let relay = match relay::status(&db, &id) {
-                Ok(st) => st,
-                Err(error) => {
-                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with invalid relay status");
-                    continue;
+            }
+
+            drop(rows);
+            drop(stmt);
+
+            if hit_corrupt_in_batch {
+                let mut probed = false;
+                let mut probe_id = last_rowid + 1;
+                let probe_limit = if max_rowid < i64::MAX {
+                    max_rowid
+                } else {
+                    last_rowid + 1000
+                };
+                while probe_id <= probe_limit {
+                    let probe_res = db.query_row(
+                        "SELECT rowid, id, task_id, conversation_id, assignment, tmux_name, state, metadata, cursor, runner_path, \
+                         (SELECT json_object('status',status,'summary',summary) FROM delegated_reviews WHERE delegated_reviews.task_id=delegated_runs.task_id) \
+                         FROM delegated_runs WHERE rowid = ?",
+                        [probe_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, String>(4)?,
+                                r.get::<_, String>(5)?,
+                                r.get::<_, String>(6)?,
+                                r.get::<_, String>(7)?,
+                                r.get::<_, i64>(8)?,
+                                r.get::<_, Option<String>>(9)?,
+                                r.get::<_, Option<String>>(10)?,
+                            ))
+                        },
+                    );
+                    match probe_res {
+                        Ok((
+                            rowid,
+                            id,
+                            task_id,
+                            conversation_id,
+                            assignment,
+                            tmux_name,
+                            state,
+                            metadata,
+                            cursor,
+                            runner_path,
+                            review,
+                        )) => {
+                            last_rowid = rowid;
+                            let tuple = (
+                                id,
+                                task_id,
+                                conversation_id,
+                                assignment,
+                                tmux_name,
+                                state,
+                                metadata,
+                                cursor,
+                                runner_path,
+                                review,
+                            );
+                            match decode_run_row(&db, tuple) {
+                                Ok(run) => runs.push(run),
+                                Err(e) => {
+                                    tracing::warn!(error=%e, "skipping unreadable delegated run row");
+                                    error_count += 1;
+                                }
+                            }
+                            probed = true;
+                            break;
+                        }
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            probe_id += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(rowid=probe_id, error=%e, "skipping unreadable delegated run row");
+                            error_count += 1;
+                            probe_id += 1;
+                        }
+                    }
                 }
-            };
-            let assignment: Assignment = match serde_json::from_str(&a) {
-                Ok(asgn) => asgn,
-                Err(error) => {
-                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with corrupted assignment");
-                    continue;
+                if !probed {
+                    last_rowid = probe_limit;
                 }
-            };
-            let metadata: Value = match serde_json::from_str(&m) {
-                Ok(meta) => meta,
-                Err(error) => {
-                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with corrupted metadata");
-                    continue;
-                }
-            };
-            let review_val = match review.map(|s| serde_json::from_str::<Value>(&s)).transpose() {
-                Ok(rev) => rev.unwrap_or(Value::Null),
-                Err(error) => {
-                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with corrupted review");
-                    continue;
-                }
-            };
-            let completion = match completion_for(&db, &id) {
-                Ok(completion) => completion,
-                Err(error) => {
-                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with invalid completion");
-                    continue;
-                }
-            };
-            runs.push(Run {
-                completion,
-                identity,
-                relay,
-                id,
-                task_id,
-                conversation_id,
-                assignment,
-                tmux_name,
-                state,
-                metadata,
-                cursor,
-                runner_path,
-                review: review_val,
-                contracts: vec![],
-            });
+            } else if !batch_read_any {
+                break;
+            }
         }
-        drop(stmt);
+
         drop(db);
         for run in &mut runs {
             match self.contracts_for(&run.id) {
@@ -395,7 +572,18 @@ impl RunStore {
                 }
             }
         }
-        Ok(runs)
+        Ok((runs, error_count))
+    }
+
+    pub fn quick_check(path: &std::path::Path) -> bool {
+        let Ok(conn) = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return false;
+        };
+        let res: Result<String, _> = conn.query_row("PRAGMA quick_check", [], |r| r.get(0));
+        matches!(res, Ok(s) if s == "ok")
     }
 
     pub fn contracts_for(&self, run: &str) -> anyhow::Result<Vec<AgreementRecord>> {
@@ -478,10 +666,27 @@ impl RunStore {
         result
     }
     pub fn get(&self, id: &str) -> anyhow::Result<Run> {
-        self.list()?
-            .into_iter()
-            .find(|r| r.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Run not found"))
+        let db = self.0.lock().unwrap();
+        let mut stmt = db.prepare("SELECT id,task_id,conversation_id,assignment,tmux_name,state,metadata,cursor,runner_path,(SELECT json_object('status',status,'summary',summary) FROM delegated_reviews WHERE delegated_reviews.task_id=delegated_runs.task_id) FROM delegated_runs WHERE id=?")?;
+        let tuple = stmt.query_row([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        let mut run = decode_run_row(&db, tuple)?;
+        drop(stmt);
+        drop(db);
+        run.contracts = self.contracts_for(&run.id).unwrap_or_default();
+        Ok(run)
     }
     pub fn state(&self, id: &str, state: &str, reason: &str) -> anyhow::Result<()> {
         self.0.lock().unwrap().execute(
@@ -713,6 +918,10 @@ impl RunStore {
     }
 }
 
+pub fn quick_check(path: &std::path::Path) -> bool {
+    RunStore::quick_check(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,6 +1070,12 @@ mod tests {
             assert_eq!(contract["contract"]["limits"]["max_rework"], 2);
         }
     }
+    fn cleanup_test_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     #[test]
     fn durable_identity_claim_and_event_replay() {
         let path = std::env::temp_dir().join(format!("hive-runs-{}.db", uuid::Uuid::new_v4()));
@@ -883,7 +1098,7 @@ mod tests {
         assert!(s.create("task", "chat", &plan()).is_err());
         drop(s);
         drop(graph);
-        std::fs::remove_file(path).unwrap();
+        cleanup_test_db(&path);
     }
     #[test]
     fn a_runner_stall_reason_is_recorded_on_the_working_run_and_cleared_with_it() {
@@ -987,7 +1202,7 @@ mod tests {
         let runs = s.create("task", "chat", &p).unwrap();
         let digest = s.record_agreement(&runs[0].id, &runs[1].id, "API v1").unwrap();
         s.record_agreement(&runs[1].id, &runs[0].id, &digest).unwrap();
-        for run in s.list().unwrap() {
+        for run in s.list().unwrap().0 {
             assert_eq!(run.contracts.len(), 1);
             assert_eq!(run.contracts[0].contract.state, ContractState::Executing);
         }
@@ -1074,7 +1289,7 @@ mod tests {
             .unwrap();
         drop(s);
         drop(g);
-        std::fs::remove_file(path).unwrap();
+        cleanup_test_db(&path);
     }
 
     #[test]
@@ -1113,7 +1328,7 @@ mod tests {
 
         drop(s);
         drop(g);
-        let _ = std::fs::remove_file(path);
+        cleanup_test_db(&path);
     }
 
     #[test]
@@ -1132,7 +1347,7 @@ mod tests {
         let g = crate::memory::graph::KnowledgeGraph::open(&path).unwrap();
         let s = RunStore::new(g.shared_conn()).unwrap();
         assert_eq!(s.replace(&old.id, &assignment).unwrap().id, replacement.id);
-        assert_eq!(s.list().unwrap().len(), 2);
+        assert_eq!(s.list().unwrap().0.len(), 2);
         let restored = s.get(&replacement.id).unwrap();
         assert_eq!(restored.task_id, old.task_id);
         assert_eq!(restored.conversation_id, old.conversation_id);
@@ -1155,7 +1370,7 @@ mod tests {
         assert!(s.replace(&old.id, &assignment).is_err());
         drop(s);
         drop(g);
-        std::fs::remove_file(path).unwrap();
+        cleanup_test_db(&path);
     }
 
     #[test]
@@ -1178,6 +1393,108 @@ mod tests {
         assert_eq!(recent.last().unwrap()["seq"], 1200);
         assert_eq!(s.recent_events(&run.id, usize::MAX).unwrap().len(), 1000);
         assert!(s.recent_events(&run.id, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_returns_exactly_the_inserted_ids() {
+        let path = std::env::temp_dir().join(format!("hive-create-ids-{}.db", uuid::Uuid::new_v4()));
+        let graph = crate::memory::graph::KnowledgeGraph::open(&path).unwrap();
+        let store = RunStore::new(graph.shared_conn()).unwrap();
+        let mut p = plan();
+        let mut b = p.assignments[0].clone();
+        b.key = "b".into();
+        b.workspace = "~/hive-workspaces/test-b".into();
+        p.assignments.push(b);
+        let runs = store.create("task-test-ids", "chat", &p).unwrap();
+        assert_eq!(runs.len(), 2);
+        let id0 = &runs[0].id;
+        let id1 = &runs[1].id;
+        assert_eq!(store.get(id0).unwrap().id, *id0);
+        assert_eq!(store.get(id1).unwrap().id, *id1);
+        drop(store);
+        drop(graph);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn corrupt_page_fixture_db_makes_list_return_readable_rows_plus_error_count() {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = std::env::temp_dir().join(format!("hive-corrupt-page-{}.db", uuid::Uuid::new_v4()));
+        {
+            let graph = crate::memory::graph::KnowledgeGraph::open(&path).unwrap();
+            let store = RunStore::new(graph.shared_conn()).unwrap();
+            for i in 0..50 {
+                let mut p = plan();
+                p.assignments[0].objective = format!("objective {i} {}", "x".repeat(600));
+                store.create(&format!("task-{i}"), "chat", &p).unwrap();
+            }
+            let leaf_page: i64 = {
+                let conn = graph.shared_conn();
+                let p: i64 = conn.lock().unwrap().query_row(
+                    "SELECT pageno FROM dbstat WHERE name = 'delegated_runs' AND pagetype = 'leaf' LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                ).unwrap_or(20);
+                let _ = conn.lock().unwrap().execute_batch("PRAGMA journal_mode = DELETE;");
+                p
+            };
+            drop(store);
+            drop(graph);
+
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let offset = ((leaf_page - 1) * 4096) as u64;
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&vec![0xff; 4096]).unwrap();
+            file.flush().unwrap();
+            drop(file);
+        }
+
+        assert!(!RunStore::quick_check(&path));
+
+        let conn = std::sync::Arc::new(std::sync::Mutex::new(rusqlite::Connection::open(&path).unwrap()));
+        let store = RunStore::new(conn).unwrap();
+        let (runs, errors) = store.list().expect("list must not fail completely on corrupt pages");
+        assert!(errors > 0, "errors must be greater than 0");
+        assert!(!runs.is_empty(), "must return readable rows");
+        drop(store);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn quick_check_reports_false_for_corrupt_fixture_db() {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = std::env::temp_dir().join(format!("hive-qc-fixture-{}.db", uuid::Uuid::new_v4()));
+        {
+            let graph = crate::memory::graph::KnowledgeGraph::open(&path).unwrap();
+            let store = RunStore::new(graph.shared_conn()).unwrap();
+            store.create("task-qc", "chat", &plan()).unwrap();
+            let _ = graph.shared_conn().lock().unwrap().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+        assert!(RunStore::quick_check(&path));
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let len = file.metadata().unwrap().len();
+        if len > 8192 {
+            file.seek(SeekFrom::Start(4096)).unwrap();
+            file.write_all(&vec![0xff; 4096]).unwrap();
+            file.flush().unwrap();
+        } else {
+            file.seek(SeekFrom::End(-100)).unwrap();
+            file.write_all(&vec![0xff; 100]).unwrap();
+            file.flush().unwrap();
+        }
+        drop(file);
+
+        assert!(!RunStore::quick_check(&path));
+        cleanup_test_db(&path);
     }
 }
 
