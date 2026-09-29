@@ -216,6 +216,15 @@ pub async fn list(State(h): State<AgentHandle>, Query(q): Query<RunQuery>) -> Re
         Err(e) => error(e),
     }
 }
+/// Task-scoped public roster; shares the router's API authentication middleware.
+pub async fn team(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
+    match store(&h).and_then(|s| s.list()) {
+        Ok(runs) => Json(runs.iter().filter(|r| r.task_id == id)
+            .map(delegation::team_profile).collect::<Vec<_>>()).into_response(),
+        Err(e) => error(e),
+    }
+}
+
 pub async fn events(
     State(h): State<AgentHandle>,
     Path(id): Path<String>,
@@ -821,11 +830,12 @@ async fn sync_run(
         transport::control(&worker, runner, "snapshot", &run.id, run.cursor, None).await?;
     let mut snapshot: Value = serde_json::from_str(&raw)?;
     enrich_approvals(&mut snapshot, &store.recent_events(&run.id, 1000)?);
-    let peers=json!(runs.iter().filter(|r|r.task_id==run.task_id && r.id!=run.id && r.state!="superseded").map(|r|json!({"id":r.id,"key":r.assignment.key,"device":r.assignment.device,"agent":r.assignment.agent})).collect::<Vec<_>>());
+    let peers = delegation::team_view(run, runs);
     if snapshot["metadata"]["assignment"].is_object()
         && snapshot["metadata"]["assignment"]["peers"] != peers
     {
         transport::update_peers(&worker, &run.id, &peers).await?;
+        snapshot["metadata"]["assignment"]["peers"] = peers;
     }
 
     sync_peer_snapshot(store, run, runs, &mut snapshot)?;
@@ -1070,6 +1080,56 @@ mod tests {
         let saved = history.turn(&turn.id).unwrap().unwrap();
         assert_eq!(saved.status, "failed");
     }
+    #[tokio::test]
+    async fn team_endpoint_and_prompt_are_scoped_public_projections() {
+        let h = handle();
+        let id = run_with_events(&h, 1);
+        let store = store(&h).unwrap();
+        store.sync(&id, &json!({"metadata":{"state":"working", "secret":"secret-sentinel", "transcript":"transcript-sentinel", "last_seen":"untrusted"}, "events":[], "approvals":[]})).unwrap();
+        let run = store.get(&id).unwrap();
+        let mut peer = run.clone();
+        peer.id = "peer".into();
+        peer.assignment.key = "backend".into();
+        peer.assignment.owned_paths = vec!["src/**".into()];
+        peer.assignment.dependencies = vec!["frontend".into()];
+        peer.metadata = json!({"secret":"never expose", "transcript":"private", "last_seen":"later"});
+        let view = delegation::team_view(&run, &[run.clone(), peer.clone()]);
+        assert_eq!(view[0]["role"], "backend");
+        assert_eq!(view[0]["owned_paths"], json!(["src/**"]));
+        assert_eq!(view[0]["dependencies"], json!(["frontend"]));
+        assert_eq!(view[0]["status"], "working");
+        assert_eq!(delegation::remote_assignment(&run, &[peer.clone()], None)["peers"], view);
+        peer.metadata["last_seen"] = json!("new heartbeat");
+        assert_eq!(delegation::team_view(&run, &[peer.clone()]), view);
+        peer.state = "completed".into();
+        assert_ne!(delegation::team_view(&run, &[peer.clone()]), view);
+        peer.state = "superseded".into();
+        assert_eq!(delegation::team_view(&run, &[peer.clone()]), json!([]));
+        peer.state = "working".into();
+        peer.task_id = "another-task".into();
+        assert_eq!(delegation::team_view(&run, &[peer]), json!([]));
+        assert!(!view.to_string().contains("private"));
+        assert!(!view.to_string().contains("secret"));
+        let response = team(State(h.clone()), Path(run.task_id.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let profiles: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(profiles.len(), 1);
+        let profile = &profiles[0];
+        let mut expected = vec!["agent_id","key","role","agent","model","device","owned_paths","current_task","status","dependencies","last_seen","relay_fingerprint"];
+        expected.sort();
+        assert_eq!(profile.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), expected);
+        assert_eq!(profile["agent_id"], id);
+        assert_eq!(profile["relay_fingerprint"], run.identity.fingerprint);
+        assert!(profile["last_seen"].as_str().is_some());
+        assert_ne!(profile["last_seen"], "untrusted");
+        assert!(!profile.to_string().contains("secret-sentinel"));
+        assert!(!profile.to_string().contains("transcript-sentinel"));
+        let response = team(State(h), Path("other-task".into())).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!([]));
+    }
+
     #[tokio::test]
     async fn relay_audit_api_contains_only_public_evidence() {
         let h = handle();

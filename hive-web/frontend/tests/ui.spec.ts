@@ -88,6 +88,7 @@ async function defaults(page: Page) {
       "/api/chats": [chat],
       "/api/chats/chat-1": { messages: [] },
       "/api/runs": [],
+      "/api/tasks/turn-1/team": [],
       "/api/runs/run-1/audit": { mode: "Relay-attested (HACP Secure degraded mode)", chain_valid: true, entries: [], total_entries: 0, head: { position: 0, digest: "" } },
       "/api/sessions": [session],
       "/api/session-hosts": [
@@ -1473,7 +1474,7 @@ test("live local tmux: browser login, create, command, resize, kill, logout", as
   await page.locator(".xterm-helper-textarea").press("Enter");
   await expect.poll(() => output).toContain("HIVE_UI_OK");
   await page.setViewportSize({ width: 900, height: 620 });
-  await page.screenshot({ path: "/tmp/hive-ui-live-terminal.png" });
+  await page.screenshot({ path: test.info().outputPath("hive-ui-live-terminal.png") });
   await page.getByRole("link", { name: "Back to sessions" }).click();
   page.once("dialog", (dialog) => dialog.accept());
   await page
@@ -1684,7 +1685,7 @@ test("live chat records a command request and shows its real outcome", async ({
   );
   const outcome = await page.locator(".message.assistant").innerText();
   console.log("Live chat outcome:", outcome.slice(0, 2000));
-  await page.screenshot({ path: "/tmp/hive-ui-live-chat.png" });
+  await page.screenshot({ path: test.info().outputPath("hive-ui-live-chat.png") });
   await page.getByRole("link", { name: "Machines", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Machines" })).toBeVisible();
   await page.getByRole("button", { name: "Re-probe" }).click();
@@ -1775,7 +1776,7 @@ test("live named worker and two-machine collaboration", async ({ page }) => {
   expectPeerHandshake(await readLiveEvents(secondCard));
   await expectRuntimeModels(page, peerPlacement);
   await page.screenshot({
-    path: "/tmp/hive-ui-live-two-machine-collaboration.png",
+    path: test.info().outputPath("hive-ui-live-two-machine-collaboration.png"),
     fullPage: true,
   });
 });
@@ -2393,7 +2394,7 @@ test("relay audit exposes degraded attestation, holds and integrity incidents", 
   await expect(page.getByText("cd".repeat(32), { exact: true })).toBeVisible();
   await page.getByText("Recent audit events (1)", { exact: true }).click();
   await expect(page.getByText("Signature mismatch", { exact: true })).toBeVisible();
-  await page.screenshot({ path: "/tmp/wp-a-relay-session.png", fullPage: true });
+  await page.screenshot({ path: test.info().outputPath("wp-a-relay-session.png"), fullPage: true });
 });
 
 test("relay audit shows a broken chain and an unavailable audit without claiming verification", async ({ page }) => {
@@ -2410,4 +2411,41 @@ test("relay audit shows a broken chain and an unavailable audit without claiming
   await page.reload();
   await expect(page.getByText(/Audit unavailable:/)).toBeVisible();
   await expect(page.getByText("Audit chain verified", { exact: true })).toHaveCount(0);
+});
+
+
+test("Team panel shows ownership, dependencies, live status and session links", async ({ page }) => {
+  await defaults(page);
+  const peer = { ...run, id: "run-2", assignment: { ...run.assignment, key: "backend" } };
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [run, peer] }));
+  await page.route("**/api/runs/*/events?*", (route) => route.fulfill({ json: [] }));
+  let status = "working";
+  await page.route("**/api/tasks/turn-1/team", (route) => route.fulfill({ json: [
+    { agent_id: run.id, key: "frontend", role: "frontend", agent: "codex", device: "worker-a", owned_paths: [], dependencies: [], status: "working" },
+    { agent_id: peer.id, key: "backend", role: "backend", agent: "claude", device: "worker-b", owned_paths: ["hive-core/**"], dependencies: ["frontend"], status },
+  ] }));
+  await page.goto("/session/?run=run-1");
+  const team = page.getByRole("region", { name: "Team", exact: true });
+  await expect(team).toContainText("hive-core/**");
+  await expect(team).toContainText("None assigned");
+  const backend = team.getByRole("article").filter({ has: page.getByRole("link", { name: "backend", exact: true }) });
+  await expect(backend).toContainText("Dependenciesfrontend");
+  await expect(backend).toContainText("working");
+  status = "completed";
+  await expect(backend).toContainText("completed", { timeout: 10000 });
+  await expect(team.getByRole("link", { name: "backend", exact: true })).toHaveAttribute("href", "/session/?run=run-2");
+  await team.getByRole("link", { name: "backend", exact: true }).click();
+  await expect(page).toHaveURL(/run=run-2/);
+  await expect(team.getByRole("link", { name: "backend", exact: true })).toHaveAttribute("aria-current", "page");
+});
+
+test("Team panel handles empty and unavailable rosters", async ({ page }) => {
+  await defaults(page);
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [run] }));
+  await page.route("**/api/runs/*/events?*", (route) => route.fulfill({ json: [] }));
+  await page.goto("/session/?run=run-1");
+  const team = page.getByRole("region", { name: "Team", exact: true });
+  await expect(team).toContainText("No teammates.");
+  await page.route("**/api/tasks/turn-1/team", (route) => route.fulfill({ status: 503, body: "Roster unavailable" }));
+  await expect(team.getByRole("alert")).toContainText("Roster unavailable", { timeout: 10000 });
 });

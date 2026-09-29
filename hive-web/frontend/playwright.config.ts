@@ -7,7 +7,7 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   workers: 3,
   reporter: "list",
-  outputDir: "/tmp/hive-ui-test-results",
+  outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR || "/tmp/hive-ui-test-results",
   use: {
     baseURL: "http://127.0.0.1:18081",
     // CI uses Playwright's pinned Chromium; locally, the installed Chrome.

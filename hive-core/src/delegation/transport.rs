@@ -179,26 +179,31 @@ pub async fn control(
     .await
 }
 
+// Compare and enqueue in one transaction: retries are no-ops, while returning
+// to an earlier roster is a new transition and must produce a fresh message.
+const UPDATE_PEERS_SCRIPT: &str = r#"import sqlite3,json,pathlib,sys,uuid
+v=json.load(sys.stdin)
+p=pathlib.Path.home()/'.hive'/'runs'/v['id']/'journal.db'
+c=sqlite3.connect(str(p),timeout=30)
+with c:
+ c.execute('BEGIN IMMEDIATE')
+ a=json.loads(c.execute("SELECT value FROM metadata WHERE key='assignment'").fetchone()[0])
+ if a.get('peers') != v['peers']:
+  a['peers']=v['peers']
+  s=json.dumps(v['peers'],sort_keys=True)
+  id='topology-'+str(uuid.uuid4())
+  message=json.dumps({'id':id,'text':'Hive updated the task team (roles, owned paths, status and dependencies). Continue your same workspace and conversation. Superseded peers will not reply. Use these current peer run IDs: '+s})
+  c.execute("UPDATE metadata SET value=? WHERE key='assignment'",(json.dumps(a),))
+  c.execute("INSERT INTO inbox(id,payload) VALUES (?,?)",(id,message))
+"#;
+
 /// Update peer topology without replacing the native conversation or replaying
 /// its original prompt. This control operation is compatible with v1 journals.
 pub async fn update_peers(worker: &WorkerInfo, id: &str, peers: &Value) -> anyhow::Result<()> {
     uuid::Uuid::parse_str(id)?;
-    let script = r#"import sqlite3,json,pathlib,sys,hashlib
-v=json.load(sys.stdin)
-p=pathlib.Path.home()/'.hive'/'runs'/v['id']/'journal.db'
-c=sqlite3.connect(str(p),timeout=30)
-a=json.loads(c.execute("SELECT value FROM metadata WHERE key='assignment'").fetchone()[0])
-a['peers']=v['peers']
-s=json.dumps(v['peers'],sort_keys=True)
-id='topology-'+hashlib.sha256(s.encode()).hexdigest()
-message=json.dumps({'id':id,'text':'Hive updated the task peers. Continue your same workspace and conversation. Superseded peers will not reply. Use these current peer run IDs: '+s})
-with c:
- c.execute("UPDATE metadata SET value=? WHERE key='assignment'",(json.dumps(a),))
- c.execute("INSERT OR IGNORE INTO inbox(id,payload) VALUES (?,?)",(id,message))
-"#;
     ssh(
         worker,
-        &format!("python3 -c {}", quote(script)),
+        &format!("python3 -c {}", quote(UPDATE_PEERS_SCRIPT)),
         Some(&json!({"id":id,"peers":peers})),
     )
     .await?;
@@ -208,6 +213,36 @@ with c:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roster_transition_queues_exactly_one_prompt_refresh() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let path = std::env::temp_dir().join(format!("hive-team-{}.db", uuid::Uuid::new_v4()));
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE inbox(id TEXT PRIMARY KEY,payload TEXT); INSERT INTO metadata VALUES ('assignment','{\"peers\":[]}');").unwrap();
+        let script = UPDATE_PEERS_SCRIPT.replace(
+            "pathlib.Path.home()/'.hive'/'runs'/v['id']/'journal.db'",
+            &format!("pathlib.Path({})", serde_json::to_string(&path).unwrap()),
+        );
+        let update = |peers: Value| {
+            let mut child = Command::new("python3").args(["-c", &script])
+                .stdin(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(json!({"peers":peers}).to_string().as_bytes()).unwrap();
+            assert!(child.wait().unwrap().success());
+        };
+        let peers = json!([{"id":"peer", "role":"backend", "owned_paths":["src/**"], "status":"working", "dependencies":[]}]);
+        update(peers.clone());
+        update(peers.clone()); // Lost reply / repeated synchronization.
+        assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        let prompt: String = db.query_row("SELECT payload FROM inbox", [], |r| r.get(0)).unwrap();
+        assert!(prompt.contains("backend") && prompt.contains("src/**") && prompt.contains("working"));
+        update(json!([]));
+        update(peers); // A -> B -> A is another change, not a duplicate.
+        assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 3);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn coordinator() -> WorkerInfo {
         WorkerInfo {

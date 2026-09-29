@@ -283,6 +283,7 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         )
         .route("/api/chat", post(chat::chat))
         .route("/api/chat/{run_id}/approve", post(chat::approve))
+        .route("/api/tasks/{id}/team", get(delegation::team))
         .route("/api/runs", get(delegation::list))
         .route("/api/runs/{id}/events", get(delegation::events))
         .route("/api/runs/{id}/audit", get(delegation::audit))
@@ -408,6 +409,7 @@ mod router_tests {
             "/api/sessions",
             "/api/incidents",
             "/api/runs/example/audit",
+            "/api/tasks/example/team",
             "/api/machines",
             "/ws/test",
         ] {

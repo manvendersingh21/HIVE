@@ -23,6 +23,22 @@ class RunnerTests(unittest.TestCase):
         self.j.db.close()
         self.temp.cleanup()
 
+    def test_initial_prompt_contains_compact_team_view(self):
+        observed = []
+        class Adapter:
+            async def connect(inner, assignment, journal):
+                pass
+            async def turn(inner, prompt):
+                observed.append(prompt)
+                raise RuntimeError('end test after initial prompt')
+        peer = dict(id='peer', key='backend', role='backend', agent='claude',
+                    device='worker', owned_paths=['src/**'], status='working', dependencies=['frontend'])
+        with patch.object(runner, 'Codex', Adapter):
+            asyncio.run(runner.run(dict(id='run', agent='codex', peers=[peer]), self.j))
+        self.assertEqual(len(observed), 1)
+        team = observed[0].split('Team (peer roles, owned paths, status and dependencies): ')[1]
+        self.assertEqual(json.loads(team), [peer])
+
     def test_service_panes_drop_hive_variables_from_the_tmux_environment(self):
         tmux_env = 'HIVE_WEB_PASSWORD=secret\nPATH=/bin\nHIVE_WORKER_TOKEN=t\n-HIVE_REMOVED'
         with patch.object(runner, 'capture', return_value=(0, tmux_env)):

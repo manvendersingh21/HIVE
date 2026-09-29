@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { api } from "../../lib/api";
 import { TERMINAL_STATES } from "../../lib/runEvents";
+import { TeamPanel } from "../../components/TeamPanel";
 import { RelayAudit } from "../../components/RelayAudit";
 import { Shell } from "../../components/Nav";
 import { usePoll } from "../../lib/poll";
@@ -93,6 +94,7 @@ export default function SessionPage() {
               <RunComposer run={run} refresh={load} />
             </section>
             <aside className="session-side">
+              <TeamPanel key={run.task_id} taskId={run.task_id} currentId={run.id} select={setId} />
               <RelayAudit key={run.id} run={run} />
               <div className="card">
                 <h3>Details</h3>

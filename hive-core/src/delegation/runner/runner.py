@@ -1523,7 +1523,7 @@ async def run(assignment, journal):
                   'Use the native hive peer tool when available, otherwise the peer command below, for questions, answers, interface agreements, and deployment results; '
                   'never impersonate peers or SSH into their machines. After a peer question, end this turn briefly if a reply is needed; Hive delivers it into this same session. Do not sleep or poll for peer replies. Include evidence and actual commands in your final response.\n'
                   + encode(assignment)+'\nPeer command: '+shlex.join([sys.executable, str(Path(__file__).resolve()), 'peer', '--run-id', assignment['id']])
-                  +' --to PEER_RUN_ID --kind question|answer|agreement|deployment --body "message"\nPeers: '+encode(peers))
+                  +' --to PEER_RUN_ID --kind question|answer|agreement|deployment --body "message"\nTeam (peer roles, owned paths, status and dependencies): '+encode(peers))
         if not journal.db.execute("SELECT 1 FROM inbox WHERE id='initial'").fetchone():
             journal.enqueue(dict(id='initial', text=prompt))
         recovery_message = 'recovery-'+authorization['id'] if authorization else None
