@@ -1106,6 +1106,19 @@ mod tests {
     fn remote_probe_uses_login_shell() {
         assert!(remote_probe_command().starts_with("bash -lc "));
     }
+
+    #[tokio::test]
+    async fn local_probe_command_uses_login_path() {
+        let expected_path = login_path();
+        let cmd = local_probe_command().await;
+        let std_cmd = cmd.as_std();
+        let env_path = std_cmd
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(env_path, Some(expected_path));
+    }
 }
 
 #[cfg(test)]
