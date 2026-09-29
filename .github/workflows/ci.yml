@@ -19,6 +19,16 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked --no-run
       - run: cargo test --workspace --locked
+      - name: Delegation runner contract suite
+        run: python3 -m unittest test_runner test_adapters
+        working-directory: hive-core/src/delegation/runner
+      - name: Cursor planner test
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked cursor_assignments 2>&1 | tee /tmp/cursor-planner.log
+          grep -q 'cursor_assignments_validate_and_honour_explicit_placements \.\.\. ok' /tmp/cursor-planner.log
+      - name: Cursor acceptance gate
+        run: python3 scripts/check-cursor-agent.py
       - run: python3 scripts/check-nvidia.py
       - run: python3 scripts/check-chat-history.py
       - run: python3 scripts/changelog.py check
