@@ -26,7 +26,15 @@ export default function SessionPage() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    setId(new URLSearchParams(window.location.search).get("run") || "");
+    const fromUrl = () =>
+      setId(new URLSearchParams(window.location.search).get("run") || "");
+    fromUrl();
+    // Sibling and teammate links are client-side navigations inside this very
+    // route, so the page component is never remounted for them. Back and
+    // Forward therefore only reach this page as a popstate, and without a
+    // listener it would keep showing whichever run was last picked.
+    window.addEventListener("popstate", fromUrl);
+    return () => window.removeEventListener("popstate", fromUrl);
   }, []);
   const current = useRef(id);
   current.current = id;

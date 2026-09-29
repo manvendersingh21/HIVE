@@ -125,6 +125,10 @@ export default function AgentPage() {
     setError("");
     setLoadError("");
     setLoading(true);
+    // The URL is the only record of which chat is open, so a reload or a
+    // shared link lands back on it. Replacing keeps Back pointing at whatever
+    // the reader came from rather than at each chat they clicked through.
+    window.history.replaceState(null, "", `?chat=${encodeURIComponent(id)}`);
     try {
       await refresh(id);
       await refreshRuns(id);
@@ -133,6 +137,22 @@ export default function AgentPage() {
     } finally {
       if (activeRef.current === id) setLoading(false);
     }
+  }
+  // The chat the reader asked for is the one the URL names; "New chat" has
+  // none, so the deep link has to go with it.
+  function startNewChat() {
+    activeRef.current = undefined;
+    setActive(undefined);
+    setMessages([]);
+    setRuns([]);
+    setInput("");
+    unqueue();
+    setError("");
+    setLoadError("");
+    setLoading(false);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("chat");
+    window.history.replaceState(null, "", url);
   }
   useEffect(() => {
     void api<{ chat: boolean }>("/api/capabilities")
@@ -285,20 +305,7 @@ export default function AgentPage() {
         <aside className="chat-sidebar">
           <div className="row">
             <strong className="grow">History</strong>
-            <button
-              disabled={busy}
-              onClick={() => {
-                activeRef.current = undefined;
-                setActive(undefined);
-                setMessages([]);
-                setRuns([]);
-                setInput("");
-                unqueue();
-                setError("");
-                setLoadError("");
-                setLoading(false);
-              }}
-            >
+            <button disabled={busy} onClick={startNewChat}>
               New chat
             </button>
           </div>

@@ -125,6 +125,11 @@ input[type="checkbox"] {
   padding: 18px;
   margin-bottom: 14px;
 }
+.card.row {
+  /* Long values in a row card must wrap rather than widen the page. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .row,
 .bar {
   display: flex;
@@ -138,10 +143,16 @@ input[type="checkbox"] {
 .grow {
   flex: 1;
   min-width: 0;
+  /* A long host or command has no break opportunity in it, so the card
+     would otherwise push the whole page wider than a phone. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .muted,
 small {
   color: var(--dim);
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .empty {
   text-align: center;
@@ -218,6 +229,8 @@ summary {
 }
 @media (max-width: 700px) {
   .topbar {
+    /* 24px of side padding plus the links overflowed a 390px phone. */
+    padding: 10px;
     gap: 8px;
     flex-wrap: wrap;
   }
@@ -227,6 +240,8 @@ summary {
   .topbar nav {
     order: 3;
     width: 100%;
+    /* The attention badge makes the row of links wider than a phone. */
+    flex-wrap: wrap;
     justify-content: space-between;
   }
   .topbar > button {
