@@ -449,39 +449,10 @@ pub(crate) mod tests {
         let task = tokio::spawn(async move {
             for (status, body, delay) in replies {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let mut data = vec![];
-                let header_end = loop {
-                    let mut buf = [0; 4096];
-                    let n = stream.read(&mut buf).await.unwrap();
-                    if n == 0 {
-                        return;
-                    }
-                    data.extend_from_slice(&buf[..n]);
-                    if let Some(pos) = data.windows(4).position(|b| b == b"\r\n\r\n") {
-                        break pos + 4;
-                    }
+                let Some(request) = read_request(&mut stream).await else {
+                    return;
                 };
-                let headers = String::from_utf8_lossy(&data[..header_end]).to_string();
-                let len: usize = headers
-                    .lines()
-                    .find_map(|l| {
-                        l.to_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|v| v.trim().parse().unwrap())
-                    })
-                    .unwrap();
-                while data.len() < header_end + len {
-                    let mut buf = [0; 4096];
-                    let n = stream.read(&mut buf).await.unwrap();
-                    if n == 0 {
-                        return;
-                    }
-                    data.extend_from_slice(&buf[..n]);
-                }
-                captured.lock().unwrap().push((
-                    headers,
-                    serde_json::from_slice(&data[header_end..header_end + len]).unwrap(),
-                ));
+                captured.lock().unwrap().push(request);
                 if !delay.is_zero() {
                     let mut eof = [0u8; 1];
                     tokio::select! {
@@ -492,12 +463,72 @@ pub(crate) mod tests {
                         _ = stream.read(&mut eof) => continue,
                     }
                 }
-                let body = body.to_string();
-                let response = format!("HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                let _ = stream.write_all(response.as_bytes()).await;
+                respond(&mut stream, status, &body).await;
             }
         });
         (url, requests, task)
+    }
+
+    /// Like [`server`], but each reply is computed from the request body.
+    pub async fn server_fn(
+        count: usize,
+        reply: impl Fn(&Value) -> (u16, Value) + Send + 'static,
+    ) -> (String, Requests, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests: Requests = Default::default();
+        let captured = requests.clone();
+        let task = tokio::spawn(async move {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some(request) = read_request(&mut stream).await else {
+                    return;
+                };
+                let (status, body) = reply(&request.1);
+                captured.lock().unwrap().push(request);
+                respond(&mut stream, status, &body).await;
+            }
+        });
+        (url, requests, task)
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<(String, Value)> {
+        let mut data = vec![];
+        let header_end = loop {
+            let mut buf = [0; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return None;
+            }
+            data.extend_from_slice(&buf[..n]);
+            if let Some(pos) = data.windows(4).position(|b| b == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&data[..header_end]).to_string();
+        let len: usize = headers
+            .lines()
+            .find_map(|l| {
+                l.to_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .unwrap();
+        while data.len() < header_end + len {
+            let mut buf = [0; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return None;
+            }
+            data.extend_from_slice(&buf[..n]);
+        }
+        Some((headers, serde_json::from_slice(&data[header_end..header_end + len]).unwrap()))
+    }
+
+    async fn respond(stream: &mut tokio::net::TcpStream, status: u16, body: &Value) {
+        let body = body.to_string();
+        let response = format!("HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let _ = stream.write_all(response.as_bytes()).await;
     }
 
     pub fn answer(text: &str) -> Value {
