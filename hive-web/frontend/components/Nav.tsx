@@ -52,7 +52,7 @@ export function Nav() {
         <Link className="brand" href="/">
           🐝 Hive
         </Link>
-        <nav aria-label="Main navigation" style={{ gap: "4px" }}>
+        <nav aria-label="Main navigation">
           {links.map(([href, label]) => (
             <Link
               key={href}
