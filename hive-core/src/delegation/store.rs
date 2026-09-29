@@ -1,6 +1,6 @@
-use super::{coordination::AgreementRecord, Assignment, DelegationPlan};
+use super::{coordination::{self, AgreementRecord, CheckMeasurement, CompletionAssessment, CompletionVerdict}, relay, Assignment, DelegationPlan};
 use hacp::v2::ContractState;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -18,10 +18,32 @@ pub struct Run {
     pub runner_path: Option<String>,
     pub review: Value,
     pub contracts: Vec<AgreementRecord>,
+    pub completion: Option<CompletionAssessment>,
+    pub identity: relay::PublicIdentity,
+    pub relay: Value,
 }
 
+/// A message was refused because its ID already names a different envelope, or
+/// its route is not allowed. The refusal is already recorded as a single
+/// incident, so a sync loop may continue past it.
+#[derive(Debug)]
+pub struct MessageRejected(pub String);
+impl std::fmt::Display for MessageRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for MessageRejected {}
+
 #[derive(Clone)]
-pub struct RunStore(Arc<Mutex<Connection>>);
+pub struct RunStore(Arc<Mutex<Connection>>, relay::Budget);
+
+fn completion_for(db: &Connection, run: &str) -> anyhow::Result<Option<CompletionAssessment>> {
+    let saved: Option<String> = db.query_row(
+        "SELECT assessment FROM delegated_completions WHERE run_id=?", [run], |row| row.get(0)
+    ).optional()?;
+    saved.map(|s| serde_json::from_str(&s).map_err(Into::into)).transpose()
+}
 
 // Message IDs are delivery identities. An exact replay is harmless, but silently
 // accepting a changed envelope could acknowledge work that was never delivered.
@@ -36,7 +58,7 @@ fn insert_message(
         !id.is_empty() && payload["id"].as_str() == Some(id),
         "Message ID must match its payload"
     );
-    db.execute(
+    let inserted = db.execute(
         "INSERT OR IGNORE INTO delegated_messages(id,source,destination,payload) VALUES (?,?,?,?)",
         params![id, source, destination, payload.to_string()],
     )?;
@@ -51,7 +73,49 @@ fn insert_message(
             && serde_json::from_str::<Value>(&existing.2)? == *payload,
         "Message ID already belongs to a different envelope"
     );
+    if inserted == 1 {
+        relay::stage(db, id, source, destination, payload, chrono::Utc::now().timestamp())?;
+    }
     Ok(())
+}
+
+// A forbidden route is refused before storage, so there is no stored message to
+// attribute it to; the caller's routing is recorded instead. Recorded at most once
+// per (message, reason) so a journal replaying the same event on every sync
+// cannot grow the append-only chain.
+fn reject_route(
+    db: &Connection,
+    id: &str,
+    source: &str,
+    destination: &str,
+    task_id: &str,
+    reason: &str,
+    now: i64,
+) -> anyhow::Result<()> {
+    let seen: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM delegated_relay_incidents WHERE message_id=? AND reason=?)",
+        params![id, reason],
+        |r| r.get(0),
+    )?;
+    if seen {
+        return Ok(());
+    }
+    let at = chrono::DateTime::from_timestamp(now, 0)
+        .ok_or_else(|| anyhow::anyhow!("Invalid relay time"))?
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    db.execute("INSERT INTO delegated_relay_incidents(source,destination,message_id,kind,reason,created_at) VALUES(?,?,?,'route',?,?)", params![source, destination, id, reason, at])?;
+    let envelope = relay::Envelope {
+        id: id.into(),
+        task_id: task_id.into(),
+        source: source.into(),
+        destination: destination.into(),
+        kind: String::new(),
+        text_digest: String::new(),
+        seq: 0,
+        staged_at: String::new(),
+    };
+    relay::audit(db, "reject", &envelope, json!({"kind":"route","reason":reason}), now)
 }
 
 impl RunStore {
@@ -64,9 +128,34 @@ impl RunStore {
           CREATE TABLE IF NOT EXISTS delegated_events (run_id TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(run_id,id));
           CREATE TABLE IF NOT EXISTS delegated_decisions (run_id TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, decision TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(run_id,id));
           CREATE TABLE IF NOT EXISTS delegated_messages (id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL, payload TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
+          CREATE TABLE IF NOT EXISTS delegated_completions (run_id TEXT PRIMARY KEY, assessment TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS delegated_contracts (task_id TEXT NOT NULL, party_a TEXT NOT NULL, party_b TEXT NOT NULL, contract TEXT NOT NULL, PRIMARY KEY(task_id,party_a,party_b));")?;
-        conn.lock().unwrap().execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0);")?;
-        Ok(Self(conn))
+        {
+            let db = conn.lock().unwrap();
+            db.execute_batch("CREATE TABLE IF NOT EXISTS delegated_reviews(task_id TEXT PRIMARY KEY,cursor TEXT,status TEXT NOT NULL DEFAULT 'reviewing',summary TEXT NOT NULL DEFAULT '',lock_until INTEGER NOT NULL DEFAULT 0,continue_reviews INTEGER NOT NULL DEFAULT 0,claim_token TEXT NOT NULL DEFAULT '');")?;
+            // A database created before review rounds were bounded has no counter yet.
+            if db.prepare("SELECT continue_reviews FROM delegated_reviews").is_err() {
+                db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN continue_reviews INTEGER NOT NULL DEFAULT 0;")?;
+            }
+            if db.prepare("SELECT claim_token FROM delegated_reviews").is_err() {
+                db.execute_batch("ALTER TABLE delegated_reviews ADD COLUMN claim_token TEXT NOT NULL DEFAULT '';")?;
+            }
+        }
+        {
+            let mut db = conn.lock().unwrap();
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            relay::schema(&tx)?;
+            // Existing runs gain identities; unsigned historical messages are
+            // never retroactively signed and will fail closed before delivery.
+            let ids = {
+                let mut stmt = tx.prepare("SELECT id FROM delegated_runs WHERE id NOT IN (SELECT run_id FROM delegated_relay_keys)")?;
+                let rows = stmt.query_map([], |r| r.get::<_,String>(0))?;
+                rows.collect::<Result<Vec<_>,_>>()?
+            };
+            for id in ids { relay::create_identity(&tx, &id)?; }
+            tx.commit()?;
+        }
+        Ok(Self(conn, relay::Budget::from_env()?))
     }
     pub fn create(
         &self,
@@ -75,7 +164,7 @@ impl RunStore {
         plan: &DelegationPlan,
     ) -> anyhow::Result<Vec<Run>> {
         let mut db = self.0.lock().unwrap();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let count: i64 = tx.query_row(
             "SELECT count(*) FROM delegated_runs WHERE task_id=?",
             [task],
@@ -88,6 +177,7 @@ impl RunStore {
         for assignment in &plan.assignments {
             let id = uuid::Uuid::new_v4().to_string();
             tx.execute("INSERT INTO delegated_runs(id,task_id,conversation_id,assignment,tmux_name,state) VALUES (?,?,?,?,?,?)", params![id,task,conversation,serde_json::to_string(assignment)?,format!("hive-agent-{id}"),"queued"])?;
+            relay::create_identity(&tx, &id)?;
         }
         tx.commit()?;
         drop(db);
@@ -97,22 +187,46 @@ impl RunStore {
             .filter(|r| r.task_id == task)
             .collect())
     }
-    pub fn claim_review(&self, task: &str, cursor: &str) -> anyhow::Result<bool> {
+    pub fn claim_review(&self, task: &str, cursor: &str) -> anyhow::Result<Option<String>> {
         let db = self.0.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
-        Ok(db.execute("INSERT INTO delegated_reviews(task_id,cursor,lock_until) VALUES (?,?,?) ON CONFLICT(task_id) DO UPDATE SET cursor=excluded.cursor,status='reviewing',lock_until=excluded.lock_until WHERE delegated_reviews.lock_until<? AND (delegated_reviews.cursor!=excluded.cursor OR delegated_reviews.status='reviewing')",params![task,cursor,now+240,now])?==1)
+        let token = uuid::Uuid::new_v4().to_string();
+        let changed = db.execute(
+            "INSERT INTO delegated_reviews(task_id,cursor,lock_until,claim_token) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(task_id) DO UPDATE SET cursor=excluded.cursor,status='reviewing',lock_until=excluded.lock_until,claim_token=excluded.claim_token
+             WHERE delegated_reviews.lock_until<?5 AND (delegated_reviews.cursor!=excluded.cursor OR delegated_reviews.status='reviewing')",
+            params![task, cursor, now + 240, token, now],
+        )?;
+        Ok(if changed == 1 { Some(token) } else { None })
+    }
+    /// Consecutive `continue` rounds already spent on a task. Reset whenever a
+    /// review settles the task, so the bound only ever counts real rounds.
+    pub fn continue_reviews(&self, task: &str) -> anyhow::Result<i64> {
+        let db = self.0.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT COALESCE((SELECT continue_reviews FROM delegated_reviews WHERE task_id=?),0)",
+            [task],
+            |row| row.get(0),
+        )?)
     }
     pub fn finish_review(
         &self,
         task: &str,
         cursor: &str,
+        claim_token: &str,
         status: &str,
         summary: &str,
         messages: &[(String, Value)],
     ) -> anyhow::Result<()> {
         let mut db = self.0.lock().unwrap();
-        let tx = db.transaction()?;
-        anyhow::ensure!(tx.execute("UPDATE delegated_reviews SET status=?,summary=?,lock_until=0 WHERE task_id=? AND cursor=?",params![status,summary,task,cursor])?==1,"Review was superseded");
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        anyhow::ensure!(
+            tx.execute(
+                "UPDATE delegated_reviews SET status=?,summary=?,lock_until=0,claim_token='',continue_reviews=CASE WHEN ?='continue' THEN continue_reviews+1 ELSE 0 END WHERE task_id=? AND cursor=? AND claim_token=?",
+                params![status, summary, status, task, cursor, claim_token]
+            )? == 1,
+            "Review was superseded"
+        );
         for (destination, payload) in messages {
             let same_task: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM delegated_runs WHERE id=? AND task_id=? AND state!='superseded')",
@@ -132,11 +246,38 @@ impl RunStore {
         Ok(())
     }
     pub fn retry_setup(&self, id: &str) -> anyhow::Result<()> {
-        let changed=self.0.lock().unwrap().execute("UPDATE delegated_runs SET state='queued' WHERE id=? AND runner_path IS NULL AND state IN ('needs-setup','disconnected')",[id])?;
+        let changed = self.0.lock().unwrap().execute(
+            "UPDATE delegated_runs SET state='queued' WHERE id=? AND runner_path IS NULL AND state IN ('needs-setup','disconnected')",
+            [id],
+        )?;
         anyhow::ensure!(
             changed == 1,
             "Only a run that never launched can retry setup"
         );
+        Ok(())
+    }
+
+    pub fn retry_launching(&self, id: &str, timeout_secs: i64) -> anyhow::Result<()> {
+        let run = self.get(id)?;
+        anyhow::ensure!(
+            run.state == "launching",
+            "Only a launching run can retry setup as launching"
+        );
+        let claimed_at = run
+            .metadata
+            .get("claimed_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let now = chrono::Utc::now().timestamp();
+        anyhow::ensure!(
+            now.saturating_sub(claimed_at) >= timeout_secs,
+            "Launch is still within bounded timeout window; retry refused"
+        );
+        let changed = self.0.lock().unwrap().execute(
+            "UPDATE delegated_runs SET state='queued',runner_path=NULL WHERE id=? AND state='launching'",
+            [id],
+        )?;
+        anyhow::ensure!(changed == 1, "Run is no longer launching");
         Ok(())
     }
     pub fn replace(&self, id: &str, assignment: &Assignment) -> anyhow::Result<Run> {
@@ -151,9 +292,10 @@ impl RunStore {
         }
         let replacement = uuid::Uuid::new_v4().to_string();
         let mut db = self.0.lock().unwrap();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         anyhow::ensure!(tx.execute("UPDATE delegated_runs SET state='superseded',metadata=json_set(metadata,'$.replacement_id',?) WHERE id=? AND state!='superseded'",params![replacement,id])?==1,"Assignment already replaced");
         tx.execute("INSERT INTO delegated_runs(id,task_id,conversation_id,assignment,tmux_name,state) VALUES (?,?,?,?,?,'queued')",params![replacement,old.task_id,old.conversation_id,serde_json::to_string(assignment)?,format!("hive-agent-{replacement}")])?;
+        relay::create_identity(&tx, &replacement)?;
         tx.commit()?;
         drop(db);
         self.get(&replacement)
@@ -175,29 +317,84 @@ impl RunStore {
                 r.get::<_, Option<String>>(9)?,
             ))
         })?;
-        let mut runs: Vec<Run> = rows.map(|row| {
-            let (id, task_id, conversation_id, a, tmux_name, state, m, cursor, runner_path, review) = row?;
-            Ok(Run {
+        let mut runs: Vec<Run> = Vec::new();
+        for row in rows {
+            let (id, task_id, conversation_id, a, tmux_name, state, m, cursor, runner_path, review) = match row {
+                Ok(tuple) => tuple,
+                Err(error) => {
+                    tracing::warn!(error=%error, "skipping unreadable delegated run row");
+                    continue;
+                }
+            };
+            let identity = match relay::identity(&db, &id) {
+                Ok(ident) => ident,
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with invalid relay identity");
+                    continue;
+                }
+            };
+            let relay = match relay::status(&db, &id) {
+                Ok(st) => st,
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with invalid relay status");
+                    continue;
+                }
+            };
+            let assignment: Assignment = match serde_json::from_str(&a) {
+                Ok(asgn) => asgn,
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with corrupted assignment");
+                    continue;
+                }
+            };
+            let metadata: Value = match serde_json::from_str(&m) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with corrupted metadata");
+                    continue;
+                }
+            };
+            let review_val = match review.map(|s| serde_json::from_str::<Value>(&s)).transpose() {
+                Ok(rev) => rev.unwrap_or(Value::Null),
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with corrupted review");
+                    continue;
+                }
+            };
+            let completion = match completion_for(&db, &id) {
+                Ok(completion) => completion,
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with invalid completion");
+                    continue;
+                }
+            };
+            runs.push(Run {
+                completion,
+                identity,
+                relay,
                 id,
                 task_id,
                 conversation_id,
-                assignment: serde_json::from_str(&a)?,
+                assignment,
                 tmux_name,
                 state,
-                metadata: serde_json::from_str(&m)?,
+                metadata,
                 cursor,
                 runner_path,
-                review: review
-                    .map(|s| serde_json::from_str(&s))
-                    .transpose()?
-                    .unwrap_or(Value::Null),
+                review: review_val,
                 contracts: vec![],
-            })
-        })
-        .collect::<anyhow::Result<_>>()?;
+            });
+        }
         drop(stmt);
         drop(db);
-        for run in &mut runs { run.contracts = self.contracts_for(&run.id)?; }
+        for run in &mut runs {
+            match self.contracts_for(&run.id) {
+                Ok(contracts) => run.contracts = contracts,
+                Err(error) => {
+                    tracing::warn!(run_id=%run.id, error=%error, "failed to load contracts for run");
+                }
+            }
+        }
         Ok(runs)
     }
 
@@ -208,10 +405,60 @@ impl RunStore {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
+    /// Commit the coordinator's measurements once per settled native turn.
+    /// The verdict and any rework message share one transaction, so a restart
+    /// neither loses feedback nor consumes the same rework round twice.
+    pub fn assess_completion(&self, id: &str, turn_seq: i64, measurements: &[CheckMeasurement]) -> anyhow::Result<bool> {
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, metadata, assignment): (String, String, String) = tx.query_row(
+            "SELECT state,metadata,assignment FROM delegated_runs WHERE id=?", [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let metadata: Value = serde_json::from_str(&metadata)?;
+        if state != "verifying" || metadata["acceptance_turn"].as_i64() != Some(turn_seq) {
+            return Ok(false);
+        }
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM delegated_messages WHERE destination=? AND delivered=0 AND id NOT IN (SELECT message_id FROM delegated_relay_envelopes WHERE rejected=1))",
+            [id], |r| r.get(0))?;
+        if pending {
+            return Ok(false);
+        }
+        let previous = completion_for(&tx, id)?;
+        if previous.as_ref().is_some_and(|a| a.turn_seq >= turn_seq || a.record.verdict == CompletionVerdict::NoAgreement) {
+            return Ok(false);
+        }
+        let assignment: Assignment = serde_json::from_str(&assignment)?;
+        let mut record = previous.map(|a| a.record).unwrap_or_default();
+        let corroboration = coordination::corroborate_checks(&assignment.acceptance_checks, measurements);
+        record.assess_with_limits(serde_json::to_string(&json!({"turn_seq":turn_seq,"measurements":measurements,"corroboration":corroboration}))?,
+            &corroboration, &coordination::limits(assignment.max_rework));
+        let state = match record.verdict {
+            CompletionVerdict::Accept => "completed",
+            CompletionVerdict::Rework => "reviewing",
+            CompletionVerdict::NoAgreement => "no_agreement",
+        };
+        if let Some(followup) = &record.followup {
+            let message_id = format!("acceptance-{id}-{turn_seq}");
+            let payload = json!({"id":message_id,"source":"coordinator","text":format!(
+                "{followup}\nRework round {}/{}. Repair the failed checks in this same workspace and conversation. The coordinator will measure them again after your next final turn.", record.rework_rounds, assignment.max_rework)});
+            insert_message(&tx, &message_id, "coordinator", id, &payload)?;
+        }
+        let assessment = CompletionAssessment { turn_seq, record, measurements: measurements.to_vec() };
+        tx.execute("INSERT INTO delegated_completions(run_id,assessment) VALUES (?,?) ON CONFLICT(run_id) DO UPDATE SET assessment=excluded.assessment",
+            params![id, serde_json::to_string(&assessment)?])?;
+        tx.execute("UPDATE delegated_runs SET state=? WHERE id=?", params![state,id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Apply a peer agreement to one durable bilateral HACP v2 contract.
     pub fn record_agreement(&self, source: &str, destination: &str, text: &str) -> anyhow::Result<String> {
         let from = self.get(source)?;
         let to = self.get(destination)?;
+        if to.state == "no_agreement" {
+            return Err(MessageRejected("Run reached terminal no_agreement; create a new assignment to continue".into()).into());
+        }
         anyhow::ensure!(from.task_id == to.task_id, "Peer agreement crosses task boundary");
         let (party_a, party_b) = if source < destination { (source, destination) } else { (destination, source) };
         let db = self.0.lock().unwrap();
@@ -238,17 +485,21 @@ impl RunStore {
     }
     pub fn state(&self, id: &str, state: &str, reason: &str) -> anyhow::Result<()> {
         self.0.lock().unwrap().execute(
-            "UPDATE delegated_runs SET state=?,metadata=json_set(metadata,'$.reason',?) WHERE id=? AND state!='superseded'",
+            "UPDATE delegated_runs SET state=?,metadata=json_set(metadata,'$.reason',?) WHERE id=? AND state NOT IN ('superseded','no_agreement')",
             params![state, reason, id],
         )?;
         Ok(())
     }
     pub fn claim(&self, id: &str, runner: &str) -> anyhow::Result<bool> {
-        Ok(self.0.lock().unwrap().execute("UPDATE delegated_runs SET state='launching',runner_path=? WHERE id=? AND state='queued'",params![runner,id])? == 1)
+        let now = chrono::Utc::now().timestamp();
+        Ok(self.0.lock().unwrap().execute(
+            "UPDATE delegated_runs SET state='launching',runner_path=?,metadata=json_set(metadata,'$.claimed_at',?) WHERE id=? AND state='queued'",
+            params![runner, now, id],
+        )? == 1)
     }
     pub fn sync(&self, id: &str, snapshot: &Value) -> anyhow::Result<()> {
         let mut db = self.0.lock().unwrap();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut cursor = 0;
         for event in snapshot["events"].as_array().into_iter().flatten() {
             let seq = event["seq"]
@@ -268,10 +519,23 @@ impl RunStore {
         }
         let mut metadata = snapshot["metadata"].clone();
         metadata["approvals"] = snapshot["approvals"].clone();
-        let state = metadata["state"]
+        // Coordinator-observed contact time, never trusted from a worker.
+        metadata["last_seen"] = json!(chrono::Utc::now().to_rfc3339());
+        let reported_state = metadata["state"]
             .as_str()
-            .unwrap_or("disconnected")
-            .to_string();
+            .unwrap_or("disconnected");
+        let completion = completion_for(&tx, id)?;
+        let state = if completion.as_ref().is_some_and(|a| a.record.verdict == CompletionVerdict::NoAgreement) {
+            "no_agreement"
+        } else if reported_state == "completed" {
+            match completion.as_ref().filter(|a| Some(a.turn_seq) == metadata["acceptance_turn"].as_i64()) {
+                Some(a) if a.record.verdict == CompletionVerdict::Accept => "completed",
+                Some(_) => "reviewing",
+                None => "verifying",
+            }
+        } else {
+            reported_state
+        };
         tx.execute(
             "UPDATE delegated_runs SET metadata=?,state=?,cursor=max(cursor,?) WHERE id=? AND state!='superseded'",
             params![metadata.to_string(), state, cursor, id],
@@ -361,26 +625,91 @@ impl RunStore {
         payload: &Value,
     ) -> anyhow::Result<()> {
         let to = self.get(destination)?;
-        if source != "user" {
-            anyhow::ensure!(
-                self.get(source)?.task_id == to.task_id,
-                "Peer message crosses task boundary"
-            );
+        if to.state == "no_agreement" {
+            return Err(MessageRejected("Run reached terminal no_agreement; create a new assignment to continue".into()).into());
         }
-        insert_message(&self.0.lock().unwrap(), id, source, destination, payload)
+        if source != "user" && self.get(source)?.task_id != to.task_id {
+            let reason = "Peer message crosses task boundary";
+            let mut db = self.0.lock().unwrap();
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            reject_route(&tx, id, source, destination, &to.task_id, reason, chrono::Utc::now().timestamp())?;
+            tx.commit()?;
+            return Err(MessageRejected(reason.into()).into());
+        }
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = insert_message(&tx, id, source, destination, payload);
+        match result {
+            Ok(()) => { tx.commit()?; Ok(()) }
+            Err(error) => {
+                tx.rollback()?;
+                // Preserve evidence even when rejecting a changed delivered ID.
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM delegated_messages WHERE id=?)", [id], |r| r.get(0))?;
+                if exists { relay::incident(&tx, id, "Message ID reused with a different envelope", chrono::Utc::now().timestamp())?; }
+                tx.commit()?;
+                if exists {
+                    return Err(MessageRejected(error.to_string()).into());
+                }
+                Err(error)
+            }
+        }
+    }
+    pub fn has_pending_messages(&self, run: &str) -> anyhow::Result<bool> {
+        Ok(self.0.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM delegated_messages WHERE destination=? AND delivered=0 AND id NOT IN (SELECT message_id FROM delegated_relay_envelopes WHERE rejected=1))", [run], |row| row.get(0))?)
     }
     pub fn pending_messages(&self, run: &str) -> anyhow::Result<Vec<Value>> {
         let db = self.0.lock().unwrap();
-        let mut stmt=db.prepare("SELECT payload FROM delegated_messages WHERE destination=? AND delivered=0 ORDER BY rowid")?;
+        let mut stmt=db.prepare("SELECT payload FROM delegated_messages WHERE destination=? AND delivered=0 AND id NOT IN (SELECT message_id FROM delegated_relay_envelopes WHERE rejected=1) ORDER BY rowid")?;
         let rows = stmt.query_map([run], |r| r.get::<_, String>(0))?;
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }
-    pub fn message_delivered(&self, id: &str) -> anyhow::Result<()> {
-        self.0
-            .lock()
-            .unwrap()
-            .execute("UPDATE delegated_messages SET delivered=1 WHERE id=?", [id])?;
+    pub fn next_delivery(&self, run: &str) -> anyhow::Result<Option<relay::Delivery>> {
+        self.next_delivery_at(run, chrono::Utc::now().timestamp())
+    }
+    fn next_delivery_at(&self, run: &str, now: i64) -> anyhow::Result<Option<relay::Delivery>> {
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let delivery = relay::next(&tx, run, self.1, now)?;
+        tx.commit()?;
+        Ok(delivery)
+    }
+    pub fn message_delivered(&self, delivery: &relay::Delivery) -> anyhow::Result<()> {
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        relay::delivered(&tx, delivery, chrono::Utc::now().timestamp())?;
+        tx.commit()?;
         Ok(())
+    }
+    pub fn delivery_failed(&self, delivery: &relay::Delivery) -> anyhow::Result<()> {
+        relay::release(&self.0.lock().unwrap(), delivery)
+    }
+    /// Incremental audit: hashes only rows appended since the last verified
+    /// checkpoint and serves the cached validity otherwise.
+    pub fn audit(&self, run: &str) -> anyhow::Result<Value> {
+        self.audit_with(run, false)
+    }
+    /// Full audit from genesis; detects removed or modified old rows.
+    pub fn audit_full(&self, run: &str) -> anyhow::Result<Value> {
+        self.audit_with(run, true)
+    }
+    fn audit_with(&self, run: &str, full: bool) -> anyhow::Result<Value> {
+        self.get(run)?;
+        self.audit_report(run, full)
+    }
+    /// Re-verifies the whole chain and refreshes the checkpoint (startup).
+    pub fn verify_audit_chain(&self) -> anyhow::Result<bool> {
+        Ok(self.audit_report("", true)?["chain_valid"] == true)
+    }
+    fn audit_report(&self, run: &str, full: bool) -> anyhow::Result<Value> {
+        let mut db = self.0.lock().unwrap();
+        // Read the chain and its head from one SQLite snapshot even when a
+        // second coordinator connection is appending audit records; IMMEDIATE
+        // because the verified checkpoint is written in the same transaction.
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let report = relay::audit_report(&tx, run, full)?;
+        tx.commit()?;
+        Ok(report)
     }
 }
 
@@ -389,6 +718,148 @@ mod tests {
     use super::*;
     fn plan() -> DelegationPlan {
         serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"claude","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap()
+    }
+
+    fn checked_run(store: &RunStore) -> (Run, CheckMeasurement) {
+        let check = coordination::AcceptanceCheck::FileExists { path: "result.txt".into() };
+        let mut plan = plan();
+        plan.assignments[0].acceptance_checks = vec![check.clone()];
+        let run = store.create("task", "chat", &plan).unwrap().remove(0);
+        (run, CheckMeasurement { check, passed: true, detail: "file exists".into() })
+    }
+
+    fn completed_snapshot(turn: i64) -> Value {
+        json!({"metadata":{"state":"completed","acceptance_turn":turn,"native_conversation_id":"same-conversation"},"events":[],"approvals":[]})
+    }
+
+    #[test]
+    fn completion_requires_measurements_and_each_new_turn_is_checked() {
+        let graph = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let store = RunStore::new(graph.shared_conn()).unwrap();
+        let (run, measurement) = checked_run(&store);
+        store.sync(&run.id, &completed_snapshot(1)).unwrap();
+        assert_eq!(store.get(&run.id).unwrap().state, "verifying");
+        assert!(!store.assess_completion(&run.id, 0, &[measurement.clone()]).unwrap());
+        assert!(store.assess_completion(&run.id, 1, &[measurement.clone()]).unwrap());
+        assert_eq!(store.get(&run.id).unwrap().state, "completed");
+        store.sync(&run.id, &completed_snapshot(1)).unwrap();
+        assert_eq!(store.get(&run.id).unwrap().state, "completed");
+        assert!(!store.assess_completion(&run.id, 1, &[]).unwrap());
+        store.sync(&run.id, &completed_snapshot(2)).unwrap();
+        assert_eq!(store.get(&run.id).unwrap().state, "verifying");
+        store.assess_completion(&run.id, 2, &[measurement]).unwrap();
+        let accepted = store.get(&run.id).unwrap().completion.unwrap();
+        assert_eq!(accepted.record.verdict, CompletionVerdict::Accept);
+        assert_eq!(accepted.record.evidence.len(), 2);
+        assert!(store.pending_messages(&run.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_measurements_are_durable_bounded_and_never_replayed() {
+        let graph = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let store = RunStore::new(graph.shared_conn()).unwrap();
+        let (run, mut measurement) = checked_run(&store);
+        measurement.passed = false;
+        measurement.detail = "result.txt missing".into();
+        for turn in 1..=3 {
+            store.sync(&run.id, &completed_snapshot(turn)).unwrap();
+            assert!(store.assess_completion(&run.id, turn, &[measurement.clone()]).unwrap());
+            // Re-opening the store and replaying the same snapshot cannot spend
+            // another round or duplicate its durable feedback message.
+            let reopened = RunStore::new(graph.shared_conn()).unwrap();
+            reopened.sync(&run.id, &completed_snapshot(turn)).unwrap();
+            assert!(!reopened.assess_completion(&run.id, turn, &[measurement.clone()]).unwrap());
+            assert_eq!(reopened.pending_messages(&run.id).unwrap().len(), usize::from(turn < 3));
+            if let Some(delivery) = reopened.next_delivery(&run.id).unwrap() {
+                reopened.message_delivered(&delivery).unwrap();
+            }
+            assert_eq!(reopened.get(&run.id).unwrap().metadata["native_conversation_id"], "same-conversation");
+        }
+        let result = store.get(&run.id).unwrap();
+        assert_eq!(result.state, "no_agreement");
+        let result = result.completion.unwrap();
+        assert_eq!(result.record.rework_rounds, 2);
+        assert_eq!(result.record.evidence.len(), 3);
+        assert!(result.record.evidence.iter().all(|s| s.contains("result.txt missing")));
+        let messages: i64 = graph.shared_conn().lock().unwrap().query_row(
+            "SELECT count(*) FROM delegated_messages WHERE destination=?", [&run.id], |r| r.get(0)).unwrap();
+        assert_eq!(messages, 2);
+        assert!(store.message("late", "user", &run.id, &json!({"id":"late","text":"revive"})).is_err());
+        store.state(&run.id, "disconnected", "late transport error").unwrap();
+        assert_eq!(store.get(&run.id).unwrap().state, "no_agreement");
+        for state in ["completed", "working", "paused-quota"] {
+            let mut snapshot = completed_snapshot(4);
+            snapshot["metadata"]["state"] = json!(state);
+            store.sync(&run.id, &snapshot).unwrap();
+            assert_eq!(store.get(&run.id).unwrap().state, "no_agreement");
+            assert!(!store.assess_completion(&run.id, 4, &[]).unwrap());
+        }
+    }
+
+    #[test]
+    fn quota_and_peer_waits_preserve_acceptance_budget() {
+        let graph = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let store = RunStore::new(graph.shared_conn()).unwrap();
+        let (run, _) = checked_run(&store);
+        for state in ["paused-quota", "waiting-for-peer", "awaiting-approval", "working"] {
+            let mut snapshot = completed_snapshot(1);
+            snapshot["metadata"]["state"] = json!(state);
+            store.sync(&run.id, &snapshot).unwrap();
+            assert!(!store.assess_completion(&run.id, 1, &[]).unwrap());
+            assert_eq!(store.get(&run.id).unwrap().state, state);
+            assert!(store.get(&run.id).unwrap().completion.is_none());
+        }
+        store.sync(&run.id, &completed_snapshot(1)).unwrap();
+        store.assess_completion(&run.id, 1, &[]).unwrap();
+        assert_eq!(store.get(&run.id).unwrap().completion.unwrap().record.rework_rounds, 1);
+    }
+
+    #[test]
+    fn legacy_assignments_without_checks_cannot_accept_claims() {
+        let graph = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let store = RunStore::new(graph.shared_conn()).unwrap();
+        let mut plan = plan();
+        plan.assignments[0].max_rework = 0;
+        let run = store.create("task", "chat", &plan).unwrap().remove(0);
+        store.sync(&run.id, &completed_snapshot(0)).unwrap();
+        store.assess_completion(&run.id, 0, &[]).unwrap();
+        assert_eq!(store.get(&run.id).unwrap().state, "no_agreement");
+        assert!(store.pending_messages(&run.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_followups_prevent_accepting_an_older_turn() {
+        let graph = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let store = RunStore::new(graph.shared_conn()).unwrap();
+        let (run, measurement) = checked_run(&store);
+        store.sync(&run.id, &completed_snapshot(1)).unwrap();
+        store.message("new-request", "user", &run.id, &json!({"id":"new-request","text":"more work"})).unwrap();
+        assert!(!store.assess_completion(&run.id, 1, &[measurement]).unwrap());
+        assert!(store.get(&run.id).unwrap().completion.is_none());
+    }
+
+    #[test]
+    fn both_participants_serialize_the_same_frozen_digest_during_amendment() {
+        let graph = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let store = RunStore::new(graph.shared_conn()).unwrap();
+        let mut plan = plan();
+        let mut peer = plan.assignments[0].clone();
+        peer.key = "b".into();
+        plan.assignments.push(peer);
+        let runs = store.create("task", "chat", &plan).unwrap();
+        let terms = store.record_agreement(&runs[0].id, &runs[1].id, "API v1").unwrap();
+        let frozen = store.record_agreement(&runs[1].id, &runs[0].id, &terms).unwrap();
+        assert_ne!(terms, frozen, "proposal and frozen revision have different canonical identities");
+        let pending = store.record_agreement(&runs[0].id, &runs[1].id, "API v2").unwrap();
+        for run in &runs {
+            let wire = serde_json::to_value(store.get(&run.id).unwrap()).unwrap();
+            let contract = &wire["contracts"][0];
+            assert_eq!(contract["contract"]["revisions"][0]["digest"], frozen);
+            assert_eq!(contract["contract"]["revisions"][0]["content"]["agreement"], "API v1");
+            assert_eq!(contract["proposed_digest"], pending);
+            assert_eq!(contract["contract"]["state"], "amending");
+            assert_eq!(contract["contract"]["limits"]["max_rework"], 2);
+        }
     }
     #[test]
     fn durable_identity_claim_and_event_replay() {
@@ -413,6 +884,21 @@ mod tests {
         drop(s);
         drop(graph);
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn a_runner_stall_reason_is_recorded_on_the_working_run_and_cleared_with_it() {
+        let g = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let s = RunStore::new(g.shared_conn()).unwrap();
+        let r = s.create("task", "chat", &plan()).unwrap().remove(0);
+        let stall = json!({"tool":"bash","command":"cargo build","silent_since":1_790_000_000,"silent_minutes":10,"reason":"Stalled: cargo build silent for 10 min"});
+        let events = json!([{"id":"stalled","seq":1,"kind":"stalled","payload":stall}]);
+        s.sync(&r.id, &json!({"metadata":{"state":"working","stall":stall},"events":events,"approvals":[]})).unwrap();
+        let run = s.get(&r.id).unwrap();
+        assert_eq!(run.state, "working");
+        assert_eq!(run.metadata["stall"]["reason"], "Stalled: cargo build silent for 10 min");
+        assert_eq!(s.events(&r.id, 0).unwrap().len(), 1);
+        s.sync(&r.id, &json!({"metadata":{"state":"working","stall":null},"events":[],"approvals":[]})).unwrap();
+        assert!(s.get(&r.id).unwrap().metadata["stall"].is_null());
     }
     #[test]
     fn decisions_are_exact_durable_and_nonreplaceable() {
@@ -440,6 +926,25 @@ mod tests {
     }
 
     #[test]
+    fn repeated_cross_task_peer_sync_records_one_incident_and_one_reject() {
+        let g = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let s = RunStore::new(g.shared_conn()).unwrap();
+        let a = s.create("a", "chat", &plan()).unwrap().remove(0);
+        let b = s.create("b", "chat", &plan()).unwrap().remove(0);
+        let payload = json!({"id":"cross","source":a.id,"text":"bad"});
+        for _ in 0..3 {
+            let error = s.message("cross", &a.id, &b.id, &payload).unwrap_err();
+            assert!(error.is::<MessageRejected>());
+        }
+        let count = |sql: &str| -> i64 { s.0.lock().unwrap().query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM delegated_messages WHERE id='cross'"), 0);
+        assert_eq!(count("SELECT count(*) FROM delegated_relay_incidents WHERE message_id='cross'"), 1);
+        assert_eq!(count("SELECT count(*) FROM delegated_relay_audit WHERE json_extract(record,'$.event')='reject' AND json_extract(record,'$.message_id')='cross'"), 1);
+        assert_eq!(s.audit_full(&a.id).unwrap()["chain_valid"], true);
+        assert!(s.pending_messages(&b.id).unwrap().is_empty());
+    }
+
+    #[test]
     fn message_replay_rejects_changed_envelopes_and_preserves_acknowledgment() {
         let g = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
         let s = RunStore::new(g.shared_conn()).unwrap();
@@ -464,7 +969,8 @@ mod tests {
             )
             .is_err());
         assert!(s.message("different-id", a, b, &payload).is_err());
-        s.message_delivered("message").unwrap();
+        let delivery = s.next_delivery(b).unwrap().unwrap();
+        s.message_delivered(&delivery).unwrap();
         let reopened = RunStore::new(g.shared_conn()).unwrap();
         reopened.message("message", a, b, &payload).unwrap();
         assert!(reopened.pending_messages(b).unwrap().is_empty());
@@ -499,9 +1005,9 @@ mod tests {
         let s = RunStore::new(g.shared_conn()).unwrap();
         let run = s.create("task", "chat", &plan()).unwrap().remove(0);
         let other = s.create("other", "chat", &plan()).unwrap().remove(0);
-        assert!(s.claim_review("task", "cursor-1").unwrap());
-        assert!(!s.claim_review("task", "cursor-1").unwrap());
-        assert!(!s.claim_review("task", "cursor-2").unwrap());
+        let token1 = s.claim_review("task", "cursor-1").unwrap().unwrap();
+        assert!(s.claim_review("task", "cursor-1").unwrap().is_none());
+        assert!(s.claim_review("task", "cursor-2").unwrap().is_none());
         // Simulate coordinator recovery after the existing review lease expires.
         g.shared_conn()
             .lock()
@@ -511,14 +1017,15 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(s.claim_review("task", "cursor-2").unwrap());
+        let token2 = s.claim_review("task", "cursor-2").unwrap().unwrap();
         assert!(s
-            .finish_review("task", "cursor-1", "complete", "old result", &[])
+            .finish_review("task", "cursor-1", &token1, "complete", "old result", &[])
             .is_err());
         let message = json!({"id":"review-message","text":"verify hashes"});
         s.finish_review(
             "task",
             "cursor-2",
+            &token2,
             "continue",
             "verification required",
             &[(run.id.clone(), message.clone())],
@@ -533,8 +1040,8 @@ mod tests {
             "verification required"
         );
         assert_eq!(s.pending_messages(&run.id).unwrap(), vec![message.clone()]);
-        assert!(!s.claim_review("task", "cursor-2").unwrap());
-        assert!(s.claim_review("task", "cursor-3").unwrap());
+        assert!(s.claim_review("task", "cursor-2").unwrap().is_none());
+        let token3 = s.claim_review("task", "cursor-3").unwrap().unwrap();
         let valid = (run.id.clone(), json!({"id":"valid","text":"one"}));
         let changed = (
             run.id.clone(),
@@ -544,6 +1051,7 @@ mod tests {
             .finish_review(
                 "task",
                 "cursor-3",
+                &token3,
                 "continue",
                 "must roll back",
                 &[valid.clone(), changed]
@@ -555,17 +1063,57 @@ mod tests {
             .finish_review(
                 "task",
                 "cursor-3",
+                &token3,
                 "continue",
                 "wrong task",
                 &[valid, (other.id, json!({"id":"cross-task","text":"bad"}))]
             )
             .is_err());
         assert_eq!(s.pending_messages(&run.id).unwrap(), vec![message]);
-        s.finish_review("task", "cursor-3", "complete", "verified", &[])
+        s.finish_review("task", "cursor-3", &token3, "complete", "verified", &[])
             .unwrap();
         drop(s);
         drop(g);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn two_claims_of_same_cursor_with_first_expiring_increments_continue_reviews_once() {
+        let path = std::env::temp_dir().join(format!("hive-review-claim-{}.db", uuid::Uuid::new_v4()));
+        let g = crate::memory::graph::KnowledgeGraph::open(&path).unwrap();
+        let s = RunStore::new(g.shared_conn()).unwrap();
+        let _run = s.create("task", "chat", &plan()).unwrap().remove(0);
+
+        // First claim of cursor-1
+        let token1 = s.claim_review("task", "cursor-1").unwrap().expect("first claim must succeed");
+        assert_eq!(s.continue_reviews("task").unwrap(), 0);
+
+        // Simulate lease expiration of the first claim
+        g.shared_conn()
+            .lock()
+            .unwrap()
+            .execute("UPDATE delegated_reviews SET lock_until=0 WHERE task_id='task'", [])
+            .unwrap();
+
+        // Second claim of the same cursor-1 succeeds with a new token
+        let token2 = s.claim_review("task", "cursor-1").unwrap().expect("second claim must succeed");
+        assert_ne!(token1, token2);
+
+        // Both finish:
+        // First claim finishes, but its token was superseded so it must be rejected
+        let res1 = s.finish_review("task", "cursor-1", &token1, "continue", "expired review result", &[]);
+        assert!(res1.is_err(), "superseded claim token must be rejected");
+
+        // Second claim finishes as the current token holder
+        let res2 = s.finish_review("task", "cursor-1", &token2, "continue", "active review result", &[]);
+        assert!(res2.is_ok(), "current claim token holder must succeed");
+
+        // continue_reviews increased by exactly 1
+        assert_eq!(s.continue_reviews("task").unwrap(), 1);
+
+        drop(s);
+        drop(g);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -632,3 +1180,7 @@ mod tests {
         assert!(s.recent_events(&run.id, 0).unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "relay_tests.rs"]
+mod relay_tests;

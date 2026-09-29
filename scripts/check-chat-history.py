@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -96,6 +97,15 @@ threading.Thread(target=model.serve_forever, daemon=True).start()
 
 with tempfile.TemporaryDirectory(prefix='hive-chat-history-') as tmp:
     root = Path(tmp)
+    # Inventory refresh runs independently of chat. Keep this mock integration
+    # fixture from invoking installed agents whose auth/version probes may
+    # spawn children and write caches after the fixture server has exited.
+    agent_bin = root/'.local/bin'
+    agent_bin.mkdir(parents=True)
+    for name in ('claude', 'codex', 'opencode', 'agy', 'cursor-agent'):
+        stub = agent_bin/name
+        stub.write_text('#!/bin/sh\nexit 1\n')
+        stub.chmod(0o700)
     (root/'config').mkdir()
     (root/'config/workers.toml').write_text('workers = []\n')
     config = (ROOT/'config/hive.toml').read_text().replace('http://localhost:11434', f'http://127.0.0.1:{model.server_port}').replace('path = "~/.hive/hive.db"', f'path = "{root / "history.db"}"').replace('directory = "~/.hive/skills"', f'directory = "{root / "skills"}"')
@@ -122,7 +132,7 @@ with tempfile.TemporaryDirectory(prefix='hive-chat-history-') as tmp:
 
     def start():
         global web, cookie
-        web = subprocess.Popen([str(ROOT/'target/debug/hive-web')], cwd=tmp, env=env, stdout=log, stderr=log)
+        web = subprocess.Popen([str(ROOT/'target/debug/hive-web')], cwd=tmp, env=env, stdout=log, stderr=log, start_new_session=True)
         for _ in range(100):
             try:
                 c = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
@@ -137,7 +147,18 @@ with tempfile.TemporaryDirectory(prefix='hive-chat-history-') as tmp:
     def stop():
         global web
         if web:
-            web.terminate(); web.wait(timeout=10); web=None
+            # Inventory probes can have children still writing into this test's
+            # temporary HOME after hive-web exits. Own the whole fixture group
+            # and reap it before TemporaryDirectory removes its files.
+            try:
+                try: os.killpg(web.pid, signal.SIGTERM)
+                except ProcessLookupError: pass
+                web.wait(timeout=10)
+            finally:
+                try: os.killpg(web.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                web.wait(timeout=10)
+                web = None
 
     def create(): return api('POST','/api/chats',{},201)['id']
     def send(chat, text, request_id=None, expected=200):
@@ -232,9 +253,21 @@ with tempfile.TemporaryDirectory(prefix='hive-chat-history-') as tmp:
         interrupted=create();gate.clear()
         c=http.client.HTTPConnection('127.0.0.1',port)
         c.request('POST','/api/chat',json.dumps({'message':'hold fixture','conversation_id':interrupted}),{'Content-Type':'application/json','Cookie':cookie})
-        wait_status(interrupted,'planning');stop();c.close();gate.set();start()
-        assert detail(interrupted)['messages'][-1]['status']=='interrupted'
-        print('PASS: interrupted work stays recorded without automatic execution',flush=True)
+        wait_status(interrupted,'planning');stop();c.close();start()
+        # Still gated: the restarted plan waits in the fake model.
+        restarted=wait_status(interrupted,'planning')['messages'][-1]
+        assert restarted['content']=='Planning was interrupted by a restart and has been restarted.', restarted
+        stop();start()
+        again=detail(interrupted)['messages'][-1]
+        assert again['status']=='interrupted' and 'already been restarted once' in again['content'], again
+        assert 'Some commands may have run' not in again['content'], again
+        gate.set()
+        resumed=create();gate.clear()
+        c=http.client.HTTPConnection('127.0.0.1',port)
+        c.request('POST','/api/chat',json.dumps({'message':'hold fixture','conversation_id':resumed}),{'Content-Type':'application/json','Cookie':cookie})
+        wait_status(resumed,'planning');stop();c.close();gate.set();start()
+        wait_status(resumed,'completed')
+        print('PASS: planning interrupted by a restart is re-run once, and never twice',flush=True)
 
         failed=create()
         c=http.client.HTTPConnection('127.0.0.1',port)

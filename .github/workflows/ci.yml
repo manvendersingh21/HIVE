@@ -21,6 +21,7 @@ jobs:
       - run: cargo test --workspace --locked
       - run: python3 scripts/check-nvidia.py
       - run: python3 scripts/check-chat-history.py
+      - run: python3 scripts/changelog.py check
       - run: git diff --check
   frontend:
     runs-on: ubuntu-latest

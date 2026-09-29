@@ -21,6 +21,16 @@ pub struct ZaiClient {
 struct ChatCompletionsRequest<'a> {
     model: &'a str,
     messages: Vec<Message<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
+}
+
+/// Z.AI's JSON mode guarantees syntactically valid JSON; the shape still
+/// comes from the schema instructions in the prompt.
+#[derive(Serialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -70,6 +80,13 @@ impl ZaiClient {
         &self.model
     }
 
+    /// Same-crate tests assert key precedence (env/config vs. the persisted
+    /// state file); production code must never read the key back out.
+    #[cfg(test)]
+    pub(crate) fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
     /// Build a client from config, resolving the API key from config or
     /// the `Z_AI` environment variable. Fails if no key is available anywhere.
     pub fn new(cfg: &CloudLlmConfig) -> anyhow::Result<Self> {
@@ -100,6 +117,21 @@ impl ZaiClient {
 
     /// Send a single-turn completion request.
     pub async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+        self.send(prompt, None).await
+    }
+
+    /// Send a single-turn completion request in JSON mode, for structured
+    /// (schema) calls. Plain chat must use [`Self::complete`].
+    pub async fn complete_json(&self, prompt: &str) -> anyhow::Result<String> {
+        self.send(prompt, Some(ResponseFormat { kind: "json_object" }))
+            .await
+    }
+
+    async fn send(
+        &self,
+        prompt: &str,
+        response_format: Option<ResponseFormat>,
+    ) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let req = ChatCompletionsRequest {
             model: &self.model,
@@ -107,6 +139,7 @@ impl ZaiClient {
                 role: "user",
                 content: prompt,
             }],
+            response_format,
         };
 
         let resp = self
@@ -255,6 +288,62 @@ mod tests {
         let text = client.complete("hi").await.unwrap();
         assert_eq!(text, "full answer");
         task.await.unwrap();
+    }
+
+    fn zai_router(url: String) -> crate::llm::LlmRouter {
+        crate::llm::LlmRouter::from_config(&hive_common::config::LlmConfig {
+            single_provider: Some(hive_common::AiProvider::Zai),
+            nvidia: Default::default(),
+            local: hive_common::config::LocalLlmConfig {
+                base_url: "http://127.0.0.1:1".into(),
+                ..Default::default()
+            },
+            gemini: None,
+            claude: None,
+            codex: None,
+            zai: Some(cfg(url)),
+        })
+    }
+
+    #[tokio::test]
+    async fn json_mode_is_requested_for_schema_calls_only() {
+        let ok = |text: &str| {
+            (
+                200,
+                json!({"choices":[{"finish_reason":"stop","message":{"content":text}}]}),
+                Duration::ZERO,
+            )
+        };
+        let (url, requests, task) = server(vec![ok("{\"a\":1}"), ok("hello")]).await;
+        let router = zai_router(url);
+        let schema = json!({"type":"object","properties":{"a":{"type":"integer"}}});
+        let structured = router
+            .complete_json_with("give json", hive_common::AiProvider::Claude, &schema)
+            .await
+            .unwrap();
+        assert_eq!(structured.text, "{\"a\":1}");
+        let plain = router
+            .complete_with("say hi", hive_common::AiProvider::Claude)
+            .await
+            .unwrap();
+        assert_eq!(plain.text, "hello");
+        task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let (headers, body) = &requests[0];
+        assert!(headers.starts_with("POST /v1/chat/completions"), "{headers}");
+        assert_eq!(body["response_format"], json!({"type":"json_object"}));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("give json"));
+        let (_, body) = &requests[1];
+        assert!(
+            body.get("response_format").is_none(),
+            "plain chat must not request JSON mode: {body}"
+        );
+        assert_eq!(body["messages"][0]["content"], "say hi");
     }
 
     /// Hits the real Z.AI coding-plan API. Run with:

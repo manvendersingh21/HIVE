@@ -9,7 +9,7 @@ use axum::{
 use hive_core::{
     delegation::{
         self, inventory,
-        store::{Run, RunStore},
+        store::{MessageRejected, Run, RunStore},
         transport,
     },
     memory::chats::SavedTurn,
@@ -31,27 +31,88 @@ fn error(e: anyhow::Error) -> Response {
     (StatusCode::BAD_REQUEST, e.to_string()).into_response()
 }
 
+/// Overall deadline for one delegation planning attempt. A deadline failure
+/// is retried once by [`crate::chat::plan_with_retry`]. The planner-slot
+/// wait is bounded by the whole-request budget (PLANNING_DEADLINE + retry),
+/// and NVIDIA's own overall deadline (120s by default) fits inside this budget.
+const PLANNING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
+
 pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
-    let result=async {
-        let agent=h.agent.as_ref().unwrap();
-        let history=h.history.as_ref().unwrap();
-        let context=history.context(&turn)?;
-        let plan=tokio::time::timeout(std::time::Duration::from_secs(240),delegation::plan(agent,&turn.user_input,&context.join("\n"))).await??;
-        let reply=start_plan(agent,&store(&h)?,&turn.id,&turn.conversation_id,&plan).await?;
-        // A detached run owns its own state. Finishing the receipt keeps this
-        // conversation's composer available while the real agents work.
-        history.finish(&turn.id,"completed",&plan.summary,Some(&reply))?;
-        Ok::<_,anyhow::Error>(reply)
-    }.await;
-    match result {
-        Ok(reply) => Json(reply).into_response(),
+    process_with_deadline_slots(h, turn, PLANNING_DEADLINE, &crate::chat::PLANNER_SLOTS).await
+}
+
+pub(crate) async fn process_with_deadline_slots(
+    h: AgentHandle,
+    turn: SavedTurn,
+    deadline: std::time::Duration,
+    slots: &tokio::sync::Semaphore,
+) -> Response {
+    let agent = match h.agent.as_ref() {
+        Some(a) => a,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "No agent configured").into_response(),
+    };
+    let history = match h.history.as_ref() {
+        Some(hist) => hist,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "No chat store configured").into_response(),
+    };
+    let context = match history.context(&turn) {
+        Ok(c) => c,
         Err(e) => {
-            if let Some(history) = &h.history {
-                let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
-            }
-            error(e)
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation context lookup failed");
+            let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
+            return error(e);
         }
+    };
+    let context_text = context.join("\n");
+    let plan = match crate::chat::plan_with_retry_slots(
+        slots,
+        || delegation::plan(agent, &turn.user_input, &context_text, Some(&turn.conversation_id)),
+        deadline,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(response) => {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&body).to_string();
+            // Every planning failure is recorded with the conversation it
+            // belongs to, so a lost plan is traceable from the logs alone.
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, status = %status, error = %text, "delegation planning failed");
+            let _ = history.finish(&turn.id, "failed", &text, None);
+            return (status, text).into_response();
+        }
+    };
+    let store = match store(&h) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation store lookup failed");
+            let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
+            return error(e);
+        }
+    };
+    // Creating containers and runs has effects: a restart from here on must
+    // not plan this turn again.
+    if let Err(e) = history.executing(&turn.id, &format!("delegation:{}", turn.id)) {
+        tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation turn could not start executing");
+        return error(e);
     }
+    let reply = match start_plan(agent, &store, &turn.id, &turn.conversation_id, &plan).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation plan startup failed");
+            let _ = history.finish(&turn.id, "failed", &e.to_string(), None);
+            return error(e);
+        }
+    };
+    // A detached run owns its own state. Finishing the receipt keeps this
+    // conversation's composer available while the real agents work.
+    if let Err(e) = history.finish(&turn.id, "completed", &plan.summary, Some(&reply)) {
+        return error(e);
+    }
+    Json(reply).into_response()
 }
 
 /// How long Hive gives one container to be created, image build included.
@@ -155,6 +216,15 @@ pub async fn list(State(h): State<AgentHandle>, Query(q): Query<RunQuery>) -> Re
         Err(e) => error(e),
     }
 }
+/// Task-scoped public roster; shares the router's API authentication middleware.
+pub async fn team(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
+    match store(&h).and_then(|s| s.list()) {
+        Ok(runs) => Json(runs.iter().filter(|r| r.task_id == id)
+            .map(delegation::team_profile).collect::<Vec<_>>()).into_response(),
+        Err(e) => error(e),
+    }
+}
+
 pub async fn events(
     State(h): State<AgentHandle>,
     Path(id): Path<String>,
@@ -171,6 +241,24 @@ pub async fn events(
         Err(e) => error(e),
     }
 }
+#[derive(Deserialize, Default)]
+pub struct AuditQuery {
+    /// `?full=1` re-verifies the whole chain instead of only new rows.
+    #[serde(default)]
+    pub full: Option<String>,
+}
+pub async fn audit(
+    State(h): State<AgentHandle>,
+    Path(id): Path<String>,
+    Query(q): Query<AuditQuery>,
+) -> Response {
+    let full = matches!(q.full.as_deref(), Some("1" | "true"));
+    match store(&h).and_then(|s| if full { s.audit_full(&id) } else { s.audit(&id) }) {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => error(e),
+    }
+}
+
 pub async fn autonomy() -> Json<Value> {
     Json(json!({ "mode": delegation::autonomy() }))
 }
@@ -271,11 +359,61 @@ pub async fn replace(
 }
 
 pub async fn retry_setup(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
-    match store(&h).and_then(|s| s.retry_setup(&id)) {
-        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"saved":true}))).into_response(),
-        Err(e) => error(e),
+    let store = match store(&h) {
+        Ok(s) => s,
+        Err(e) => return error(e),
+    };
+    let run = match store.get(&id) {
+        Ok(r) => r,
+        Err(e) => return error(e),
+    };
+    if run.state == "launching" {
+        let claimed_at = run
+            .metadata
+            .get("claimed_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let now = chrono::Utc::now().timestamp();
+        let timeout = launch_timeout_secs();
+        if now.saturating_sub(claimed_at) < timeout {
+            return error(anyhow::anyhow!(
+                "Launch is still in progress; wait for timeout before retrying setup"
+            ));
+        }
+        let agent = match h.agent.as_ref() {
+            Some(a) => a,
+            None => return error(anyhow::anyhow!("Delegation unavailable")),
+        };
+        let worker = match delegation::target(agent, &run.assignment.device) {
+            Some(w) => w,
+            None => return error(anyhow::anyhow!("Device removed from configured fleet")),
+        };
+        match session_alive(&worker, &run).await {
+            Some(true) => {
+                return error(anyhow::anyhow!(
+                    "Agent session is still running; retry refused to prevent duplicate launch"
+                ));
+            }
+            Some(false) => {
+                match store.retry_launching(&id, timeout) {
+                    Ok(()) => (StatusCode::ACCEPTED, Json(json!({"saved":true}))).into_response(),
+                    Err(e) => error(e),
+                }
+            }
+            None => {
+                return error(anyhow::anyhow!(
+                    "Could not reach device to verify session absence; retry refused"
+                ));
+            }
+        }
+    } else {
+        match store.retry_setup(&id) {
+            Ok(()) => (StatusCode::ACCEPTED, Json(json!({"saved":true}))).into_response(),
+            Err(e) => error(e),
+        }
     }
 }
+
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -320,9 +458,9 @@ async fn recovery_control(
     anyhow::ensure!(
         matches!(
             run.state.as_str(),
-            "failed" | "disconnected" | "needs-setup"
+            "failed" | "disconnected" | "needs-setup" | "launching"
         ),
-        "Only failed or disconnected native runs can be reconciled"
+        "Only failed, disconnected, needs-setup, or launching native runs can be reconciled"
     );
     let runner = run
         .runner_path
@@ -375,22 +513,33 @@ pub async fn reconcile(
 }
 
 pub fn start(h: AgentHandle) {
+    // Full re-verification once per process start; polls are then incremental.
+    match store(&h).and_then(|s| s.verify_audit_chain()) {
+        Ok(true) => {}
+        Ok(false) => tracing::error!("relay audit chain failed full verification"),
+        Err(error) => tracing::warn!(error=%error, "relay audit verification unavailable"),
+    }
     let reviewer = h.clone();
     tokio::spawn(async move {
         loop {
             if let (Some(agent), Ok(store)) = (&reviewer.agent, store(&reviewer)) {
-                if let Ok(runs) = store.list() {
-                    let mut tasks: std::collections::BTreeMap<String, Vec<Run>> =
-                        std::collections::BTreeMap::new();
-                    for run in runs {
-                        if run.state != "superseded" {
-                            tasks.entry(run.task_id.clone()).or_default().push(run);
+                match store.list() {
+                    Ok(runs) => {
+                        let mut tasks: std::collections::BTreeMap<String, Vec<Run>> =
+                            std::collections::BTreeMap::new();
+                        for run in runs {
+                            if run.state != "superseded" {
+                                tasks.entry(run.task_id.clone()).or_default().push(run);
+                            }
+                        }
+                        for runs in tasks.values() {
+                            if let Err(error) = delegation::review::task(agent, &store, runs).await {
+                                tracing::warn!(task_id=%runs[0].task_id,error=%error,"coordinator review incomplete");
+                            }
                         }
                     }
-                    for runs in tasks.values() {
-                        if let Err(error) = delegation::review::task(agent, &store, runs).await {
-                            tracing::warn!(error=%error,"coordinator review incomplete");
-                        }
+                    Err(error) => {
+                        tracing::warn!(error=%error, "failed to list delegated runs for review");
                     }
                 }
             }
@@ -404,38 +553,43 @@ pub fn start(h: AgentHandle) {
         let unacknowledged = Unacknowledged::default();
         loop {
             if let Ok(store) = store(&h) {
-                if let Ok(runs) = store.list() {
-                    // A run that no longer exists can never acknowledge anything.
-                    unacknowledged
-                        .lock()
-                        .unwrap()
-                        .retain(|id, _| runs.iter().any(|run| &run.id == id));
-                    for run in &runs {
-                        if active.get(&run.id).is_some_and(|task| !task.is_finished()) {
-                            continue;
+                match store.list() {
+                    Ok(runs) => {
+                        // A run that no longer exists can never acknowledge anything.
+                        unacknowledged
+                            .lock()
+                            .unwrap()
+                            .retain(|id, _| runs.iter().any(|run| &run.id == id));
+                        for run in &runs {
+                            if active.get(&run.id).is_some_and(|task| !task.is_finished()) {
+                                continue;
+                            }
+                            let (h, store, run, runs, unacknowledged) = (
+                                h.clone(),
+                                store.clone(),
+                                run.clone(),
+                                runs.clone(),
+                                unacknowledged.clone(),
+                            );
+                            active.insert(
+                                run.id.clone(),
+                                tokio::spawn(async move {
+                                    if let Err(error) =
+                                        sync_run(&h, &store, &run, &runs, &unacknowledged).await
+                                    {
+                                        let _ =
+                                            store.state(&run.id, "disconnected", &error.to_string());
+                                        // Holding the task open keeps this run out of the
+                                        // loop, so an unreachable or overloaded worker is
+                                        // not hit with a fresh SSH session every 3s.
+                                        tokio::time::sleep(SYNC_RETRY_BACKOFF).await;
+                                    }
+                                }),
+                            );
                         }
-                        let (h, store, run, runs, unacknowledged) = (
-                            h.clone(),
-                            store.clone(),
-                            run.clone(),
-                            runs.clone(),
-                            unacknowledged.clone(),
-                        );
-                        active.insert(
-                            run.id.clone(),
-                            tokio::spawn(async move {
-                                if let Err(error) =
-                                    sync_run(&h, &store, &run, &runs, &unacknowledged).await
-                                {
-                                    let _ =
-                                        store.state(&run.id, "disconnected", &error.to_string());
-                                    // Holding the task open keeps this run out of the
-                                    // loop, so an unreachable or overloaded worker is
-                                    // not hit with a fresh SSH session every 3s.
-                                    tokio::time::sleep(SYNC_RETRY_BACKOFF).await;
-                                }
-                            }),
-                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(error=%error, "failed to list delegated runs for sync");
                     }
                 }
             }
@@ -453,6 +607,10 @@ fn apply_runtime_evidence(attrs: &mut Value, metadata: &Value) -> bool {
     if metadata["available_models"].is_array() {
         attrs["models"] = metadata["available_models"].clone();
     }
+    // The latest provider usage the run saw is the placement's usage snapshot.
+    if metadata["usage"].is_object() {
+        attrs["usage"] = metadata["usage"].clone();
+    }
     *attrs != before
 }
 
@@ -467,13 +625,17 @@ fn idle(
     run: &Run,
     unacknowledged: &Unacknowledged,
 ) -> anyhow::Result<bool> {
+    if run.state == "no_agreement" {
+        return Ok(true);
+    }
     if run.state == "disconnected" && run.metadata["reason"] == SESSION_ENDED {
         return Ok(true);
     }
     let delivered = unacknowledged.lock().unwrap();
     Ok(run.state == "completed"
+        && run.completion.as_ref().is_some_and(|c| c.record.verdict == delegation::coordination::CompletionVerdict::Accept)
         && store.pending_decisions(&run.id)?.is_empty()
-        && store.pending_messages(&run.id)?.is_empty()
+        && !store.has_pending_messages(&run.id)?
         && delivered.get(&run.id).is_none_or(|ids| ids.is_empty()))
 }
 
@@ -526,6 +688,10 @@ const SESSION_ENDED: &str = "The agent's session has ended, so this run can't co
 /// asking its queued verifier a question could wait forever for its own finish.
 /// Each prerequisite is checked independently; a message cannot bypass another
 /// working or failed prerequisite. `messages` is the dependent's durable inbox.
+///
+/// A dependency paused on its provider quota has not failed: it resumes by
+/// itself after the reset, so its dependents stay queued. If it already handed
+/// its work over, a message naming a branch or commit, they start now.
 fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool, String> {
     let mut ready = true;
     for key in &run.assignment.dependencies {
@@ -535,10 +701,18 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
         for dependency in runs.iter().filter(|r| {
             r.task_id == run.task_id && &r.assignment.key == key && r.state != "superseded"
         }) {
+            let from_dependency = |message: &&Value| message["source"] == dependency.id;
             completed |= dependency.state == "completed";
-            failed |= dependency.state == "failed";
+            failed |= dependency.state == "failed" || dependency.state == "no_agreement";
             waiting_for_us |= dependency.state == "waiting-for-peer"
-                && messages.iter().any(|message| message["source"] == dependency.id);
+                && messages.iter().any(|message| from_dependency(&message));
+            waiting_for_us |= dependency.state == "paused-quota"
+                && messages
+                    .iter()
+                    .filter(from_dependency)
+                    .any(|message| {
+                        delegation::names_handoff(message["text"].as_str().unwrap_or(""))
+                    });
         }
         if completed {
             continue;
@@ -552,7 +726,15 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
 }
 
 /// States in which a launched run's tmux session must still exist.
-const LIVE_STATES: [&str; 4] = ["working", "awaiting-approval", "waiting-for-peer", "reviewing"];
+const LIVE_STATES: [&str; 7] =
+    ["working", "awaiting-approval", "waiting-for-peer", "reviewing", "verifying", "paused-quota", "launching"];
+
+fn launch_timeout_secs() -> i64 {
+    std::env::var("HIVE_LAUNCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
 
 /// Whether the run's tmux session exists. `None` when the device couldn't be
 /// asked: an unreachable machine says nothing about the session.
@@ -599,10 +781,36 @@ async fn sync_run(
     // journal of a runner that no longer exists.
     if run.runner_path.is_some()
         && LIVE_STATES.contains(&run.state.as_str())
-        && session_alive(&worker, run).await == Some(false)
     {
-        store.state(&run.id, "disconnected", SESSION_ENDED)?;
-        return Ok(());
+        if run.state == "launching" {
+            let claimed_at = run
+                .metadata
+                .get("claimed_at")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let now = chrono::Utc::now().timestamp();
+            let timed_out = now.saturating_sub(claimed_at) >= launch_timeout_secs();
+            match session_alive(&worker, run).await {
+                Some(false) if timed_out => {
+                    store.state(
+                        &run.id,
+                        "failed",
+                        "Launch timed out: agent tmux session never appeared",
+                    )?;
+                    return Ok(());
+                }
+                Some(true) => {
+                    // Session is live: left alone by liveness check; ready for snapshot
+                }
+                _ => {
+                    // Within timeout or session unconfirmed: leave alone while launch is pending
+                    return Ok(());
+                }
+            }
+        } else if session_alive(&worker, run).await == Some(false) {
+            store.state(&run.id, "disconnected", SESSION_ENDED)?;
+            return Ok(());
+        }
     }
     if run.state == "queued" {
         match dependency_ready(runs, run, &store.pending_messages(&run.id)?) {
@@ -612,6 +820,19 @@ async fn sync_run(
                 store.state(&run.id, "failed", &reason)?;
                 return Ok(());
             }
+        }
+        // Launching now would only pause at once; the run starts after the reset.
+        if let Some(until) = delegation::placement_quota(agent, &run.assignment)? {
+            let reason = format!(
+                "{}: {} {}",
+                run.assignment.device,
+                run.assignment.agent,
+                delegation::quota_note(until)
+            );
+            if run.metadata["reason"] != reason.as_str() {
+                store.state(&run.id, "queued", &reason)?;
+            }
+            return Ok(());
         }
         let record = agent
             .memory
@@ -688,7 +909,7 @@ async fn sync_run(
             .cloned()
             .collect::<Vec<_>>();
         let assignment = delegation::remote_assignment(run, &peers, executable);
-        transport::control(
+        if let Err(error) = transport::control(
             &worker,
             &runner,
             "launch",
@@ -696,24 +917,32 @@ async fn sync_run(
             0,
             Some(&assignment),
         )
-        .await?;
+        .await {
+            store.state(&run.id, "failed", &format!("Launch failed: {error}"))?;
+            return Err(error);
+        }
         return Ok(());
     }
     let Some(runner) = &run.runner_path else {
         return Ok(());
     };
-    let raw =
-        transport::control(&worker, runner, "snapshot", &run.id, run.cursor, None).await?;
+    let raw = match transport::control(&worker, runner, "snapshot", &run.id, run.cursor, None).await {
+        Ok(raw) => raw,
+        Err(_) if run.state == "launching" => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let mut snapshot: Value = serde_json::from_str(&raw)?;
     enrich_approvals(&mut snapshot, &store.recent_events(&run.id, 1000)?);
-    let peers=json!(runs.iter().filter(|r|r.task_id==run.task_id && r.id!=run.id && r.state!="superseded").map(|r|json!({"id":r.id,"key":r.assignment.key,"device":r.assignment.device,"agent":r.assignment.agent})).collect::<Vec<_>>());
+    let peers = delegation::team_view(run, runs);
     if snapshot["metadata"]["assignment"].is_object()
         && snapshot["metadata"]["assignment"]["peers"] != peers
     {
         transport::update_peers(&worker, &run.id, &peers).await?;
+        snapshot["metadata"]["assignment"]["peers"] = peers;
     }
 
     sync_peer_snapshot(store, run, runs, &mut snapshot)?;
+    verify_completion(store, &worker, runner, &run.id).await?;
     // The journal's report is authoritative, so a message it acknowledged in
     // this snapshot no longer needs a run that keeps syncing for it.
     acknowledge(unacknowledged, &run.id, &snapshot);
@@ -740,9 +969,15 @@ async fn sync_run(
             serde_json::to_string(runner)?,
             transport::RUNNER
         );
+        // The run ID binds the assessment to the run that asked: a peer
+        // command naming any other run is never auto-approved.
         let raw = transport::ssh(
             &worker,
-            &format!("python3 -c {} assess", transport::quote(&source)),
+            &format!(
+                "python3 -c {} assess --run-id {}",
+                transport::quote(&source),
+                transport::quote(&run.id)
+            ),
             Some(&action),
         )
         .await?;
@@ -760,20 +995,22 @@ async fn sync_run(
         transport::control(&worker, runner, "decide", &run.id, 0, Some(&decision)).await?;
         store.decision_delivered(&run.id, decision["id"].as_str().unwrap())?;
     }
-    for message in store.pending_messages(&run.id)? {
-        let id = message["id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Message ID missing"))?
-            .to_string();
-        transport::control(&worker, runner, "enqueue", &run.id, 0, Some(&message)).await?;
-        store.message_delivered(&id)?;
-        deliver(unacknowledged, &run.id, &id);
+    while let Some(delivery) = store.next_delivery(&run.id)? {
+        if let Err(error) = transport::control(&worker, runner, "enqueue", &run.id, 0, Some(&delivery.payload)).await {
+            store.delivery_failed(&delivery)?;
+            return Err(error);
+        }
+        store.message_delivered(&delivery)?;
+        deliver(unacknowledged, &run.id, &delivery.id);
     }
     // Only a completed native invocation proves a model works; the runtime's
     // own catalog is recorded even when that first call failed, so the user
     // can explicitly pick another listed model.
     let metadata = &snapshot["metadata"];
-    if !metadata["invocation"].is_null() || metadata["available_models"].is_array() {
+    if !metadata["invocation"].is_null()
+        || metadata["available_models"].is_array()
+        || metadata["usage"].is_object()
+    {
         let id = hive_core::memory::graph::entity_id(
             "device-agent",
             &format!("{}/{}", run.assignment.device, run.assignment.agent),
@@ -784,6 +1021,34 @@ async fn sync_run(
             }
         }
     }
+    Ok(())
+}
+
+/// Only the coordinator invokes these checks, using the assignment saved at
+/// planning time. A paused or peer-waiting run has no final result to assess.
+async fn verify_completion(
+    store: &RunStore,
+    worker: &hive_common::protocol::WorkerInfo,
+    runner: &str,
+    id: &str,
+) -> anyhow::Result<()> {
+    let run = store.get(id)?;
+    if run.state != "verifying" || store.has_pending_messages(id)? {
+        return Ok(());
+    }
+    let turn_seq = run.metadata["acceptance_turn"].as_i64()
+        .ok_or_else(|| anyhow::anyhow!("Completed snapshot lacks acceptance turn identity"))?;
+    let input = json!({"turn_seq":turn_seq,"workspace":run.assignment.workspace,"checks":run.assignment.acceptance_checks});
+    let raw = transport::control(worker, runner, "acceptance", id, 0, Some(&input)).await?;
+    let response: Value = serde_json::from_str(&raw)?;
+    // A new native turn or quota pause raced measurement. Its next settled
+    // snapshot will be checked; stale evidence cannot consume a rework round.
+    if response["stale"] == true {
+        return Ok(());
+    }
+    anyhow::ensure!(response["turn_seq"].as_i64() == Some(turn_seq), "Acceptance response refers to another turn");
+    let measurements: Vec<delegation::coordination::CheckMeasurement> = serde_json::from_value(response["measurements"].clone())?;
+    store.assess_completion(id, turn_seq, &measurements)?;
     Ok(())
 }
 
@@ -814,7 +1079,15 @@ fn sync_peer_snapshot(
             } else { None };
             let payload = json!({"id":id,"source":run.id,"kind":kind,"text":format!("Peer {} on {} ({kind}) says: {}{}",run.assignment.key,run.assignment.device,text,agreement.as_deref().unwrap_or(""))});
             if runs.iter().any(|r| r.id == to && r.state != "superseded") {
-                store.message(id, &run.id, to, &payload)?;
+                // A rejected event (changed envelope under a reused ID, or a
+                // forbidden route) is recorded once as an incident; skipping it
+                // lets the cursor advance instead of retrying it forever.
+                if let Err(error) = store.message(id, &run.id, to, &payload) {
+                    if !error.is::<MessageRejected>() {
+                        return Err(error);
+                    }
+                    tracing::warn!(run=%run.id, message=%id, error=%error, "peer event rejected");
+                }
             }
         }
     }
@@ -907,6 +1180,119 @@ mod tests {
             master_name: "master".into(),
         }
     }
+
+    fn handle_with_history() -> AgentHandle {
+        let agent = std::sync::Arc::new(hive_core::agent::MasterAgent::new(
+            hive_core::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            hive_core::workers::WorkerPool::new(vec![]),
+            hive_core::skills::SkillRegistry::new(),
+            hive_core::memory::MemorySystem::new(),
+        ));
+        AgentHandle::enabled(agent, "master".into()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn planning_deadline_failure_preserves_504_status() {
+        let h = handle_with_history();
+        let history = h.history.as_ref().unwrap();
+        let chat = history.create(None).unwrap();
+        let start_turn = history.begin(&chat.id, "req-1", "test prompt").unwrap();
+        let turn = match start_turn {
+            hive_core::memory::chats::StartTurn::New(t) => t,
+            _ => unreachable!(),
+        };
+        let slots = tokio::sync::Semaphore::new(2);
+        let response = process_with_deadline_slots(
+            h.clone(),
+            turn.clone(),
+            std::time::Duration::from_millis(20),
+            &slots,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Planning timed out"), "{text}");
+        assert!(text.contains("retry also timed out"), "{text}");
+
+        let saved = history.turn(&turn.id).unwrap().unwrap();
+        assert_eq!(saved.status, "failed");
+    }
+    #[tokio::test]
+    async fn team_endpoint_and_prompt_are_scoped_public_projections() {
+        let h = handle();
+        let id = run_with_events(&h, 1);
+        let store = store(&h).unwrap();
+        store.sync(&id, &json!({"metadata":{"state":"working", "secret":"secret-sentinel", "transcript":"transcript-sentinel", "last_seen":"untrusted"}, "events":[], "approvals":[]})).unwrap();
+        let run = store.get(&id).unwrap();
+        let mut peer = run.clone();
+        peer.id = "peer".into();
+        peer.assignment.key = "backend".into();
+        peer.assignment.owned_paths = vec!["src/**".into()];
+        peer.assignment.dependencies = vec!["frontend".into()];
+        peer.metadata = json!({"secret":"never expose", "transcript":"private", "last_seen":"later"});
+        let view = delegation::team_view(&run, &[run.clone(), peer.clone()]);
+        assert_eq!(view[0]["role"], "backend");
+        assert_eq!(view[0]["owned_paths"], json!(["src/**"]));
+        assert_eq!(view[0]["dependencies"], json!(["frontend"]));
+        assert_eq!(view[0]["status"], "working");
+        assert_eq!(delegation::remote_assignment(&run, &[peer.clone()], None)["peers"], view);
+        peer.metadata["last_seen"] = json!("new heartbeat");
+        assert_eq!(delegation::team_view(&run, &[peer.clone()]), view);
+        peer.state = "completed".into();
+        assert_ne!(delegation::team_view(&run, &[peer.clone()]), view);
+        peer.state = "superseded".into();
+        assert_eq!(delegation::team_view(&run, &[peer.clone()]), json!([]));
+        peer.state = "working".into();
+        peer.task_id = "another-task".into();
+        assert_eq!(delegation::team_view(&run, &[peer]), json!([]));
+        assert!(!view.to_string().contains("private"));
+        assert!(!view.to_string().contains("secret"));
+        let response = team(State(h.clone()), Path(run.task_id.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let profiles: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(profiles.len(), 1);
+        let profile = &profiles[0];
+        let mut expected = vec!["agent_id","key","role","agent","model","device","owned_paths","current_task","status","dependencies","last_seen","relay_fingerprint"];
+        expected.sort();
+        assert_eq!(profile.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), expected);
+        assert_eq!(profile["agent_id"], id);
+        assert_eq!(profile["relay_fingerprint"], run.identity.fingerprint);
+        assert!(profile["last_seen"].as_str().is_some());
+        assert_ne!(profile["last_seen"], "untrusted");
+        assert!(!profile.to_string().contains("secret-sentinel"));
+        assert!(!profile.to_string().contains("transcript-sentinel"));
+        let response = team(State(h), Path("other-task".into())).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!([]));
+    }
+
+    #[tokio::test]
+    async fn relay_audit_api_contains_only_public_evidence() {
+        let h = handle();
+        let id = run_with_events(&h, 0);
+        let store = store(&h).unwrap();
+        store.message("audit-test", "user", &id, &json!({"id":"audit-test","text":"hello"})).unwrap();
+        let response = audit(State(h.clone()), Path(id.clone()), Query(AuditQuery::default())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["chain_valid"], true);
+        assert_eq!(value["entries"][0]["record"]["event"], "stage");
+        let raw = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!raw.contains("seed"));
+        assert!(!raw.contains("secret"));
+        assert!(!raw.contains("hello"));
+        assert!(raw.contains("public_key"));
+        let full = audit(State(h.clone()), Path(id.clone()), Query(AuditQuery { full: Some("1".into()) })).await;
+        let body = axum::body::to_bytes(full.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["verification"], "full");
+        assert_eq!(value["chain_valid"], true);
+        assert_eq!(audit(State(h), Path("unknown".into()), Query(AuditQuery::default())).await.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn run_list_filters_by_state_and_task() {
         let h = handle();
@@ -984,7 +1370,7 @@ mod tests {
     }
     fn run_with_events(h: &AgentHandle, count: i64) -> String {
         let store = store(h).unwrap();
-        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"codex","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"codex","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"],"acceptance_checks":[{"kind":"file_exists","path":"result.txt"}]}]})).unwrap();
         let id = store.create("task", "chat", &plan).unwrap().remove(0).id;
         let events: Vec<Value> = (1..=count)
             .map(|seq| json!({"id":format!("e{seq}"),"seq":seq,"kind":"native","payload":{"seq":seq}}))
@@ -1047,15 +1433,33 @@ mod tests {
     }
 
     #[test]
+    fn placement_inventory_records_the_latest_usage_snapshot() {
+        let mut attrs = json!({"models":["gpt-5.5"],"invocation":null});
+        let first = json!({"usage":{"agent":"codex","used_percent":82,"resets_at":1_790_000_000,"exhausted":false}});
+        assert!(apply_runtime_evidence(&mut attrs, &first));
+        assert_eq!(attrs["usage"]["used_percent"], 82);
+        let exhausted = json!({"usage":{"agent":"codex","used_percent":100,"resets_at":1_790_003_600,"exhausted":true}});
+        assert!(apply_runtime_evidence(&mut attrs, &exhausted));
+        assert_eq!((attrs["usage"]["used_percent"].as_i64(), attrs["usage"]["resets_at"].as_i64()), (Some(100), Some(1_790_003_600)));
+        assert_eq!(delegation::quota_exhausted_until(&attrs, 1_790_000_000), Some(1_790_003_600));
+        // A snapshot without usage keeps the last one.
+        assert!(!apply_runtime_evidence(&mut attrs, &json!({"invocation":null})));
+        assert_eq!(attrs["usage"]["exhausted"], true);
+        assert_eq!(attrs["models"], json!(["gpt-5.5"]));
+    }
+
+    #[test]
     fn completed_runs_are_polled_only_when_something_is_pending() {
         let path = std::env::temp_dir().join(format!("hive-idle-{}.db", uuid::Uuid::new_v4()));
         let graph = hive_core::memory::graph::KnowledgeGraph::open(&path).unwrap();
         let store = RunStore::new(graph.shared_conn()).unwrap();
         let unacknowledged = Unacknowledged::default();
-        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"claude","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[{"key":"a","device":"air","agent":"claude","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"],"acceptance_checks":[{"kind":"file_exists","path":"result.txt"}]}]})).unwrap();
         let id = store.create("task", "chat", &plan).unwrap().remove(0).id;
         assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
         store.state(&id, "completed", "").unwrap();
+        assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
+        accept_test_turn(&store, &id, 0);
         // Nothing queued and nothing delivered: the journal cannot change, so
         // the SSH round trip and remote runner process are skipped.
         assert!(idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
@@ -1063,7 +1467,8 @@ mod tests {
             .message("follow-up", "user", &id, &json!({"id":"follow-up","text":"verify"}))
             .unwrap();
         assert!(!idle(&store, &store.get(&id).unwrap(), &unacknowledged).unwrap());
-        store.message_delivered("follow-up").unwrap();
+        let delivery = store.next_delivery(&id).unwrap().unwrap();
+        store.message_delivered(&delivery).unwrap();
         drop(store);
         drop(graph);
         let _ = std::fs::remove_file(path);
@@ -1075,7 +1480,7 @@ mod tests {
         let store = store(&h).unwrap();
         let unacknowledged = Unacknowledged::default();
         let id = run_with_events(&h, 0);
-        store.state(&id, "completed", "").unwrap();
+        accept_test_turn(&store, &id, 0);
         let wake = |message: &str| {
             store
                 .message(message, "user", &id, &json!({"id":message,"text":"verify"}))
@@ -1087,7 +1492,8 @@ mod tests {
         // turn in the remote inbox.
         wake("first");
         assert!(!idle_now());
-        store.message_delivered("first").unwrap();
+        let delivery = store.next_delivery(&id).unwrap().unwrap();
+        store.message_delivered(&delivery).unwrap();
         deliver(&unacknowledged, &id, "first");
         // The journal has not reported that turn yet, so its acknowledgment and
         // the state it finishes in are still to be imported.
@@ -1095,7 +1501,8 @@ mod tests {
         // A second message revives the run again, and each is tracked on its own.
         wake("second");
         assert!(!idle_now());
-        store.message_delivered("second").unwrap();
+        let delivery = store.next_delivery(&id).unwrap().unwrap();
+        store.message_delivered(&delivery).unwrap();
         deliver(&unacknowledged, &id, "second");
         // Events that acknowledge nothing, and other messages' acknowledgments,
         // leave the run waiting.
@@ -1109,7 +1516,7 @@ mod tests {
         assert!(!idle_now());
         // Syncing the acknowledgment and the later state retires it, and the
         // optimization for truly idle completed runs applies again.
-        let snapshot = json!({"metadata":{"state":"completed"},"approvals":[],"events":[
+        let snapshot = json!({"metadata":{"state":"completed","acceptance_turn":3},"approvals":[],"events":[
             {"id":"ack-1","seq":1,"kind":"acknowledgment","payload":{"message_id":"first"}},
             {"id":"state-1","seq":2,"kind":"state","payload":{"state":"working"}},
             {"id":"ack-2","seq":3,"kind":"acknowledgment","payload":{"message_id":"second"}},
@@ -1117,7 +1524,17 @@ mod tests {
         store.sync(&id, &snapshot).unwrap();
         acknowledge(&unacknowledged, &id, &snapshot);
         assert_eq!(store.events(&id, 0).unwrap().len(), 4);
+        assert!(!idle_now(), "the new turn still needs independent acceptance");
+        accept_test_turn(&store, &id, 3);
         assert!(idle_now());
+    }
+
+    fn accept_test_turn(store: &RunStore, id: &str, turn_seq: i64) {
+        store.sync(id, &json!({"metadata":{"state":"completed","acceptance_turn":turn_seq},"events":[],"approvals":[]})).unwrap();
+        let checks = store.get(id).unwrap().assignment.acceptance_checks.into_iter().map(|check|
+            delegation::coordination::CheckMeasurement { check, passed: true, detail: "fixture measurement: file exists".into() }
+        ).collect::<Vec<_>>();
+        store.assess_completion(id, turn_seq, &checks).unwrap();
     }
 
     #[test]
@@ -1171,5 +1588,143 @@ mod tests {
         let mut unknown = json!({"approvals":[{"action":json!({"tool":"item/fileChange/requestApproval","arguments":{"itemId":"absent"}}).to_string()}]});
         enrich_approvals(&mut unknown, &events);
         assert!(unknown["approvals"][0]["details"].is_null());
+    }
+
+    #[test]
+    fn rejected_peer_event_is_one_incident_and_cursor_advances() {
+        let h = handle();
+        let store = store(&h).unwrap();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[
+            {"key":"a","device":"air","agent":"codex","model":null,"workspace":"~/hive-workspaces/a","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]},
+            {"key":"b","device":"air","agent":"codex","model":null,"workspace":"~/hive-workspaces/b","objective":"review","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+        let runs = store.create("task", "chat", &plan).unwrap();
+        let (a, b) = (&runs[0], &runs[1]);
+        let peer = |seq: i64, text: &str| json!({"metadata":{"state":"working"},"approvals":[],"events":[
+            {"id":"peer-1","seq":seq,"kind":"peer","payload":{"to":b.id,"kind":"message","text":text}}]});
+        sync_peer_snapshot(&store, a, &runs, &mut peer(1, "original")).unwrap();
+        assert_eq!(store.get(&a.id).unwrap().cursor, 1);
+        // The untrusted journal re-emits the same ID with different content.
+        for attempt in 0..5 {
+            sync_peer_snapshot(&store, a, &runs, &mut peer(2 + attempt, "changed")).unwrap();
+        }
+        let run = store.get(&a.id).unwrap();
+        assert_eq!(run.cursor, 6, "cursor advances past the rejected event");
+        assert_eq!(run.relay["incidents"].as_array().unwrap().len(), 1);
+        assert_eq!(run.relay["incidents"][0]["message_id"], "peer-1");
+        let rejects = store.audit_full(&a.id).unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["record"]["event"] == "reject")
+            .count();
+        assert_eq!(rejects, 1);
+        // The original, verified message still reaches its destination.
+        let delivery = store.next_delivery(&b.id).unwrap().unwrap();
+        assert!(delivery.payload["text"].as_str().unwrap().ends_with("says: original"));
+    }
+
+    struct TestTmuxGuard(String);
+    impl Drop for TestTmuxGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &self.0])
+                .output();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_launching_liveness_check_and_retry_setup_guards() {
+        let h = handle();
+        let store = store(&h).unwrap();
+        let unacknowledged = Unacknowledged::default();
+        let device = h.agent.as_ref().unwrap().master_name().to_string();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[
+            {"key":"a","device":device,"agent":"codex","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+
+        // 1. Launching run past timeout with no session becomes failed with clear reason in sync_run
+        let runs = store.create("task-f2-1", "chat", &plan).unwrap();
+        let run_id = runs[0].id.clone();
+        assert!(store.claim(&run_id, "runner.py").unwrap());
+        // Backdate claimed_at past bounded timeout (30s)
+        let past = chrono::Utc::now().timestamp() - 60;
+        h.agent.as_ref().unwrap().memory.graph.shared_conn().lock().unwrap().execute(
+            &format!("UPDATE delegated_runs SET metadata=json_set(metadata,'$.claimed_at',{past}) WHERE id='{run_id}'"),
+            [],
+        ).unwrap();
+        let run = store.get(&run_id).unwrap();
+        let runs_list = store.list().unwrap();
+        sync_run(&h, &store, &run, &runs_list, &unacknowledged).await.unwrap();
+        let failed_run = store.get(&run_id).unwrap();
+        assert_eq!(failed_run.state, "failed");
+        assert_eq!(
+            failed_run.metadata["reason"],
+            "Launch timed out: agent tmux session never appeared"
+        );
+
+        // 2a. Launching run within timeout with no session is left alone in sync_run
+        let runs2 = store.create("task-f2-2", "chat", &plan).unwrap();
+        let run_id2 = runs2[0].id.clone();
+        assert!(store.claim(&run_id2, "runner.py").unwrap());
+        // claimed_at is now, so well within the 30s timeout
+        let run2 = store.get(&run_id2).unwrap();
+        let runs_list2 = store.list().unwrap();
+        sync_run(&h, &store, &run2, &runs_list2, &unacknowledged).await.unwrap();
+        assert_eq!(store.get(&run_id2).unwrap().state, "launching", "run within timeout must be left alone");
+
+        // 2b. Launching run past timeout but with a live session is left alone in sync_run
+        let runs3 = store.create("task-f2-3", "chat", &plan).unwrap();
+        let run_id3 = runs3[0].id.clone();
+        assert!(store.claim(&run_id3, "runner.py").unwrap());
+        h.agent.as_ref().unwrap().memory.graph.shared_conn().lock().unwrap().execute(
+            &format!("UPDATE delegated_runs SET metadata=json_set(metadata,'$.claimed_at',{past}) WHERE id='{run_id3}'"),
+            [],
+        ).unwrap();
+        let run3 = store.get(&run_id3).unwrap();
+        // Create live tmux session for run3
+        let session_created = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &run3.tmux_name, "sleep 30"])
+            .output();
+        if let Ok(output) = session_created {
+            if output.status.success() {
+                let _guard = TestTmuxGuard(run3.tmux_name.clone());
+                let runs_list3 = store.list().unwrap();
+                sync_run(&h, &store, &run3, &runs_list3, &unacknowledged).await.unwrap();
+                assert_eq!(store.get(&run_id3).unwrap().state, "launching", "run with live session must be left alone");
+
+                // 3. retry_setup on a launching run with a live session is refused
+                let resp = retry_setup(State(h.clone()), Path(run_id3.clone())).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let err_msg = String::from_utf8_lossy(&body);
+                assert!(err_msg.contains("Agent session is still running"), "{err_msg}");
+                assert_eq!(store.get(&run_id3).unwrap().state, "launching", "state must remain launching");
+            }
+        }
+
+        // 4. retry_setup on a launching run within timeout is refused
+        let resp2 = retry_setup(State(h.clone()), Path(run_id2.clone())).await;
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let err_msg2 = String::from_utf8_lossy(&body2);
+        assert!(err_msg2.contains("Launch is still in progress"), "{err_msg2}");
+        assert_eq!(store.get(&run_id2).unwrap().state, "launching");
+
+        // 5. retry_setup on a launching run past timeout with no session succeeds
+        let runs5 = store.create("task-f2-5", "chat", &plan).unwrap();
+        let run_id5 = runs5[0].id.clone();
+        assert!(store.claim(&run_id5, "runner.py").unwrap());
+        h.agent.as_ref().unwrap().memory.graph.shared_conn().lock().unwrap().execute(
+            &format!("UPDATE delegated_runs SET metadata=json_set(metadata,'$.claimed_at',{past}) WHERE id='{run_id5}'"),
+            [],
+        ).unwrap();
+        let resp5 = retry_setup(State(h.clone()), Path(run_id5.clone())).await;
+        assert_eq!(resp5.status(), StatusCode::ACCEPTED);
+        let recovered = store.get(&run_id5).unwrap();
+        assert_eq!(recovered.state, "queued");
+        assert!(recovered.runner_path.is_none());
+
+        // 6. retry_setup on a failed run is refused
+        let resp_failed = retry_setup(State(h.clone()), Path(run_id.clone())).await;
+        assert_eq!(resp_failed.status(), StatusCode::BAD_REQUEST);
     }
 }

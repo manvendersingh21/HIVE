@@ -98,7 +98,7 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
         WorkersConfig::from_project_root(root).unwrap_or(WorkersConfig { workers: vec![] });
 
     let llm = LlmRouter::from_config(&config.llm);
-    chat::apply_persisted_master_agent(&llm);
+    chat::apply_persisted_master_agent(&llm, &config.llm);
 
     // History remains readable even when the configured inference server is down.
     if llm.uses_local_startup() && !llm.local_available().await {
@@ -277,11 +277,16 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}", axum::routing::delete(kill_session))
         .route("/api/chats", get(chat::list_chats).post(chat::create_chat))
-        .route("/api/chats/{id}", get(chat::get_chat))
+        .route(
+            "/api/chats/{id}",
+            get(chat::get_chat).delete(chat::delete_chat),
+        )
         .route("/api/chat", post(chat::chat))
         .route("/api/chat/{run_id}/approve", post(chat::approve))
+        .route("/api/tasks/{id}/team", get(delegation::team))
         .route("/api/runs", get(delegation::list))
         .route("/api/runs/{id}/events", get(delegation::events))
+        .route("/api/runs/{id}/audit", get(delegation::audit))
         .route("/api/runs/{id}/decisions", post(delegation::decide))
         .route("/api/runs/{id}/messages", post(delegation::message))
         .route("/api/runs/{id}/replace", post(delegation::replace))
@@ -318,6 +323,9 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         ))
         .with_state(state)
 }
+
+#[cfg(test)]
+mod chat_delete_tests;
 
 #[cfg(test)]
 mod router_tests {
@@ -400,6 +408,8 @@ mod router_tests {
             "/api/chats/example",
             "/api/sessions",
             "/api/incidents",
+            "/api/runs/example/audit",
+            "/api/tasks/example/team",
             "/api/machines",
             "/ws/test",
         ] {

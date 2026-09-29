@@ -6,13 +6,19 @@ import {
   Entry,
   RunEvent,
   TERMINAL_STATES,
+  Quota,
+  Stall,
+  activeStall,
   describeAction,
   lastError,
+  pausedLabel,
+  stalledLabel,
   stateTone,
   transcript,
 } from "../lib/runEvents";
 import { Markdown } from "../lib/markdown";
 import { visible } from "../lib/poll";
+import type { Agreement } from "./Coordination";
 
 export type Approval = {
   id: string;
@@ -39,13 +45,27 @@ export type Run = {
     workspace: string;
     dependencies?: string[];
     acceptance_criteria?: string[];
+    max_rework?: number;
   };
   metadata?: {
     error?: string;
     actual_model?: string;
     approvals?: Approval[];
+    quota?: Quota | null;
+    stall?: Stall | null;
   };
   review?: { status?: string; summary?: string } | null;
+  contracts?: Agreement[];
+  completion?: {
+    record: { verdict: "accept" | "rework" | "no_agreement"; rework_rounds: number; evidence: string[] };
+    measurements: { passed: boolean; detail: string }[];
+  } | null;
+  identity?: { public_key: string; fingerprint: string };
+  relay?: {
+    mode: string;
+    held: { message_id: string; reason: string }[];
+    incidents: { kind: string; message_id: string; reason: string; created_at: string }[];
+  };
 };
 
 export const sessionUrl = (id: string) => `/session/?run=${encodeURIComponent(id)}`;
@@ -54,11 +74,27 @@ const STATE_LABELS: Record<string, string> = {
   "awaiting-approval": "Needs approval",
   "needs-setup": "Needs setup",
   "waiting-for-peer": "Waiting for peer",
+  "paused-quota": "Paused: quota",
+  "verifying": "Checking acceptance",
+  "no_agreement": "No agreement",
 };
-export function StateChip({ state }: { state: string }) {
+// With its run, a quota pause names the agent and when its quota resets, and a
+// stalled tool call names its command.
+export function StateChip({ state, run }: { state: string; run?: Run }) {
+  const stall = run && activeStall(state, run.metadata?.stall);
+  const label = stall
+    ? stalledLabel(stall)
+    : state === "paused-quota" && run
+      ? pausedLabel(run.metadata?.quota || undefined, run.assignment.agent)
+      : STATE_LABELS[state] || state;
   return (
-    <span className={`chip ${stateTone(state)}`} data-state={state}>
-      {STATE_LABELS[state] || state}
+    <span
+      className={`chip ${stall ? "attention" : stateTone(state)}`}
+      data-state={state}
+      data-stalled={stall ? "" : undefined}
+      title={stall ? label : undefined}
+    >
+      {label}
     </span>
   );
 }
@@ -264,6 +300,7 @@ export function RunAttention({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const pending = (run.metadata?.approvals || []).filter((a) => !a.consumed);
+  const stall = activeStall(run.state, run.metadata?.stall);
   const failure =
     run.metadata?.error || (events && run.state === "failed" ? lastError(events) : undefined);
   const waitingOn = (run.assignment.dependencies || []).map((key) => ({
@@ -284,6 +321,16 @@ export function RunAttention({
   }
   return (
     <>
+      {!!run.relay?.incidents.length && <div className="banner bad" role="alert">
+        <strong>Relay integrity incident</strong>
+        {run.relay.incidents.map((incident, i) => <p key={`${incident.message_id}-${i}`}>
+          {incident.reason} <span className="mono small">({incident.message_id})</span>
+        </p>)}
+      </div>}
+      {!!run.relay?.held.length && <div className="banner" role="status">
+        <strong>Peer messages held</strong>
+        {run.relay.held.map((held) => <p key={held.message_id}>{held.reason}</p>)}
+      </div>}
       {pending.map((approval) => (
         <ApprovalCard key={approval.id} run={run} approval={approval} refresh={refresh} />
       ))}
@@ -291,6 +338,26 @@ export function RunAttention({
         <div className="banner bad" role="alert">
           <strong>Why it failed</strong>
           <div>{failure}</div>
+        </div>
+      )}
+      {stall && (
+        <div className="banner" role="status" data-testid="tool-stalled">
+          <strong>{stalledLabel(stall)}</strong>
+          <div>
+            The agent&apos;s {stall.tool || "tool"} call is still running but has produced nothing.
+            A background process left attached to its output can keep it from ever finishing;
+            the run stays working until it does. Message the agent or stop the session.
+          </div>
+        </div>
+      )}
+      {run.state === "paused-quota" && (
+        <div className="banner" role="status" data-testid="quota-paused">
+          <strong>{pausedLabel(run.metadata?.quota || undefined, run.assignment.agent)}</strong>
+          <div>
+            The agent hit its usage limit. Hive continues this conversation automatically
+            after the reset; runs that depend on it stay queued unless it hands over a branch
+            or commit.
+          </div>
         </div>
       )}
       {run.state === "queued" && waitingOn.length > 0 && (
@@ -310,7 +377,7 @@ export function RunAttention({
                 )}{" "}
                 {dep && (
                   <>
-                    (<StateChip state={dep.state} />)
+                    (<StateChip state={dep.state} run={dep} />)
                   </>
                 )}
               </span>
@@ -440,6 +507,8 @@ function EntryView({ entry }: { entry: Entry }) {
       );
     case "error":
       return <div className="t-error">{entry.text}</div>;
+    case "stalled":
+      return <div className="t-state t-stalled">{entry.text}</div>;
     case "result":
       return (
         entry.error ? (
@@ -509,7 +578,7 @@ export function RunComposer({ run, refresh }: { run: Run; refresh: () => Promise
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const closed = run.state === "superseded";
+  const closed = run.state === "superseded" || run.state === "no_agreement";
   async function submit(e: FormEvent) {
     e.preventDefault();
     const draft = text;
@@ -573,7 +642,7 @@ export function RunTitle({ run }: { run: Run }) {
         </strong>
         {model && <span className="pill mono">{model}</span>}
       </div>
-      <StateChip state={run.state} />
+      <StateChip state={run.state} run={run} />
     </div>
   );
 }

@@ -109,6 +109,7 @@ pub struct NvidiaConfig {
     pub model: String,
     pub base_url: String,
     pub timeout_secs: u64,
+    pub stream: bool,
 }
 impl Default for NvidiaConfig {
     fn default() -> Self {
@@ -116,6 +117,7 @@ impl Default for NvidiaConfig {
             model: "nvidia/nemotron-3-ultra-550b-a55b".into(),
             base_url: "https://integrate.api.nvidia.com/v1".into(),
             timeout_secs: 120,
+            stream: false,
         }
     }
 }

@@ -1,5 +1,6 @@
 //! Durable web turns layered over the shared conversation/message tables.
-//! Reading history never executes work. Interrupted runs require a new request.
+//! Reading history never executes work. Interrupted executions require a new
+//! request; a turn interrupted while planning is planned again once at startup.
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
@@ -52,6 +53,20 @@ pub enum ChatError {
     RequestConflict,
 }
 
+/// Shown while a turn interrupted during planning is planned again.
+pub const PLANNING_RESTARTED: &str =
+    "Planning was interrupted by a restart and has been restarted.";
+const PLANNING_INTERRUPTED_AGAIN: &str = "Planning was interrupted by a restart again after it had already been restarted once. No commands were executed. Please resend your message.";
+
+/// What startup recovery did with unfinished turns.
+#[derive(Debug, Default)]
+pub struct Recovery {
+    /// Executing turns, and planning turns already restarted once, now `interrupted`.
+    pub interrupted: usize,
+    /// Planning turns left in `planning` for the caller to plan again.
+    pub restarted: Vec<SavedTurn>,
+}
+
 #[derive(Debug)]
 pub enum StartTurn {
     New(SavedTurn),
@@ -73,17 +88,53 @@ impl ChatStore {
             CREATE UNIQUE INDEX IF NOT EXISTS web_chat_active ON web_chat_turns(conversation_id)
                 WHERE status IN ('planning', 'executing', 'awaiting_approval');",
         )?;
+        {
+            let db = conn.lock().unwrap();
+            let has_restarts: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('web_chat_turns') WHERE name='planning_restarts')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !has_restarts {
+                db.execute(
+                    "ALTER TABLE web_chat_turns ADD COLUMN planning_restarts INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
         Ok(Self { conn })
     }
 
     /// Called once by the server at startup, never by a read endpoint.
-    pub fn recover_interrupted(&self) -> anyhow::Result<usize> {
+    ///
+    /// Planning never runs commands, so a turn that was still planning is
+    /// handed back to be planned again, at most once. A turn that was
+    /// executing may have had effects and is only marked interrupted.
+    pub fn recover_interrupted(&self) -> anyhow::Result<Recovery> {
         let mut db = self.conn.lock().unwrap();
         let tx = db.transaction()?;
-        tx.execute("UPDATE messages SET content = 'The server restarted before this request finished. Some commands may have run. Check their results before submitting again.' WHERE id IN (SELECT assistant_message_id FROM web_chat_turns WHERE status IN ('planning','executing'))", [])?;
-        let n = tx.execute("UPDATE web_chat_turns SET status = 'interrupted' WHERE status IN ('planning','executing')", [])?;
+        // Already restarted once: stop here rather than loop across restarts.
+        tx.execute("UPDATE messages SET content = ?1 WHERE id IN (SELECT assistant_message_id FROM web_chat_turns WHERE status='planning' AND planning_restarts>0)", [PLANNING_INTERRUPTED_AGAIN])?;
+        tx.execute("UPDATE messages SET content = 'The server restarted before this request finished. Some commands may have run. Check their results before submitting again.' WHERE id IN (SELECT assistant_message_id FROM web_chat_turns WHERE status='executing')", [])?;
+        let interrupted = tx.execute("UPDATE web_chat_turns SET status = 'interrupted' WHERE status='executing' OR (status='planning' AND planning_restarts>0)", [])?;
+        tx.execute("UPDATE messages SET content = ?1 WHERE id IN (SELECT assistant_message_id FROM web_chat_turns WHERE status='planning')", [PLANNING_RESTARTED])?;
+        tx.execute(
+            "UPDATE web_chat_turns SET planning_restarts=planning_restarts+1 WHERE status='planning'",
+            [],
+        )?;
+        let ids: Vec<String> = tx
+            .prepare("SELECT id FROM web_chat_turns WHERE status='planning' ORDER BY assistant_message_id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let restarted = ids
+            .iter()
+            .filter_map(|id| find_turn(&tx, id).transpose())
+            .collect::<anyhow::Result<_>>()?;
         tx.commit()?;
-        Ok(n)
+        Ok(Recovery {
+            interrupted,
+            restarted,
+        })
     }
 
     pub fn create(&self, project: Option<&str>) -> anyhow::Result<ChatSummary> {
@@ -340,7 +391,9 @@ mod tests {
             let graph = KnowledgeGraph::open(&path).unwrap();
             ProjectRegistry::new(graph.shared_conn()).unwrap();
             let store = ChatStore::new(graph.shared_conn()).unwrap();
-            assert_eq!(store.recover_interrupted().unwrap(), 0);
+            let recovery = store.recover_interrupted().unwrap();
+            assert_eq!(recovery.interrupted, 0);
+            assert!(recovery.restarted.is_empty());
             assert_eq!(
                 store.messages(&chat_id).unwrap()[1].reply,
                 Some(reply.clone())
@@ -366,8 +419,10 @@ mod tests {
         let chat = store.create(None).unwrap();
         store.begin(&chat.id, "request", "run something").unwrap();
         store.executing("request", "run").unwrap();
-        assert_eq!(store.recover_interrupted().unwrap(), 1);
-        assert_eq!(store.recover_interrupted().unwrap(), 0);
+        let recovery = store.recover_interrupted().unwrap();
+        assert_eq!(recovery.interrupted, 1);
+        assert!(recovery.restarted.is_empty(), "executing turns are never re-run");
+        assert_eq!(store.recover_interrupted().unwrap().interrupted, 0);
         let messages = store.messages(&chat.id).unwrap();
         assert_eq!(messages[1].status.as_deref(), Some("interrupted"));
         assert!(messages[1].content.contains("Some commands may have run"));
@@ -380,5 +435,100 @@ mod tests {
             store.begin(&chat.id, "new", "new request").unwrap(),
             StartTurn::New(_)
         ));
+    }
+
+    #[test]
+    fn restart_during_planning_restarts_the_turn_at_most_once() {
+        let store = store();
+        let chat = store.create(None).unwrap();
+        store.begin(&chat.id, "plan", "plan something").unwrap();
+
+        let recovery = store.recover_interrupted().unwrap();
+        assert_eq!(recovery.interrupted, 0);
+        assert_eq!(recovery.restarted.len(), 1);
+        let turn = &recovery.restarted[0];
+        assert_eq!(
+            (turn.id.as_str(), turn.user_input.as_str(), turn.status.as_str()),
+            ("plan", "plan something", "planning")
+        );
+        let messages = store.messages(&chat.id).unwrap();
+        assert_eq!(messages[1].status.as_deref(), Some("planning"));
+        assert_eq!(messages[1].content, PLANNING_RESTARTED);
+        assert_eq!(
+            PLANNING_RESTARTED,
+            "Planning was interrupted by a restart and has been restarted."
+        );
+        assert!(!messages[1].content.contains("Some commands may have run"));
+
+        // Interrupted again while re-planning: never restarted a second time.
+        let recovery = store.recover_interrupted().unwrap();
+        assert_eq!(recovery.interrupted, 1);
+        assert!(recovery.restarted.is_empty());
+        let messages = store.messages(&chat.id).unwrap();
+        assert_eq!(messages[1].status.as_deref(), Some("interrupted"));
+        assert!(messages[1].content.contains("already been restarted once"));
+        assert!(messages[1].content.contains("No commands were executed"));
+        assert!(!messages[1].content.contains("Some commands may have run"));
+        assert!(store.recover_interrupted().unwrap().restarted.is_empty());
+    }
+
+    #[test]
+    fn a_restarted_plan_finishes_normally_and_mixed_turns_keep_their_paths() {
+        let store = store();
+        let planning = store.create(None).unwrap();
+        let executing = store.create(None).unwrap();
+        store.begin(&planning.id, "p", "plan me").unwrap();
+        store.begin(&executing.id, "e", "run me").unwrap();
+        store.executing("e", "run-e").unwrap();
+
+        let recovery = store.recover_interrupted().unwrap();
+        assert_eq!(recovery.interrupted, 1);
+        assert_eq!(
+            recovery.restarted.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["p"]
+        );
+        let executed = store.messages(&executing.id).unwrap();
+        assert_eq!(executed[1].status.as_deref(), Some("interrupted"));
+        assert!(executed[1].content.contains("Some commands may have run"));
+
+        store.executing("p", "run-p").unwrap();
+        store.finish("p", "completed", "Done", None).unwrap();
+        let recovery = store.recover_interrupted().unwrap();
+        assert_eq!(recovery.interrupted, 0);
+        assert!(recovery.restarted.is_empty());
+        let planned = store.messages(&planning.id).unwrap();
+        assert_eq!(planned[1].status.as_deref(), Some("completed"));
+        assert_eq!(planned[1].content, "Done");
+    }
+
+    #[test]
+    fn opening_a_database_from_before_restart_tracking_adds_the_column() {
+        let path = std::env::temp_dir().join(format!("hive-chat-{}.db", uuid::Uuid::new_v4()));
+        {
+            let graph = KnowledgeGraph::open(&path).unwrap();
+            ProjectRegistry::new(graph.shared_conn()).unwrap();
+            graph.shared_conn().lock().unwrap().execute_batch(
+                "CREATE TABLE web_chat_turns (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                    user_message_id INTEGER NOT NULL REFERENCES messages(id),
+                    assistant_message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id),
+                    run_id TEXT UNIQUE,
+                    status TEXT NOT NULL,
+                    reply TEXT
+                );",
+            ).unwrap();
+        }
+        {
+            let graph = KnowledgeGraph::open(&path).unwrap();
+            ProjectRegistry::new(graph.shared_conn()).unwrap();
+            let store = ChatStore::new(graph.shared_conn()).unwrap();
+            let chat = store.create(None).unwrap();
+            store.begin(&chat.id, "old", "legacy planning").unwrap();
+            assert_eq!(store.recover_interrupted().unwrap().restarted.len(), 1);
+            // Reopening is idempotent.
+            ChatStore::new(graph.shared_conn()).unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

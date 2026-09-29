@@ -153,6 +153,7 @@ impl MasterAgent {
                 &self.fleet_context(),
                 context_block.as_deref(),
                 skill,
+                turn.as_ref().map(|t| t.conversation_id.as_str()),
             )
             .await?;
         if let Some(s) = skill {
@@ -322,23 +323,31 @@ impl MasterAgent {
             None => None,
         };
         let context_block = render_turn_context(turn.as_ref());
-        self.plan_with_context(user_input, context_block, turn.map(|t| t.conversation_id))
-            .await
+        let conversation_id = turn.map(|t| t.conversation_id);
+        self.plan_with_context(
+            user_input,
+            context_block,
+            conversation_id.clone(),
+            conversation_id.as_deref(),
+        )
+        .await
     }
 
     /// Web history is already durably saved by the caller, which also owns the
     /// reply. Keep it separate from the CLI's automatic one-turn persistence.
+    /// `conversation_id` only labels planner warnings.
     pub async fn plan_chat_run(
         &self,
         user_input: &str,
         history: Vec<String>,
+        conversation_id: &str,
     ) -> anyhow::Result<PlannedRun> {
         let context = crate::memory::RetrievedContext {
             recent_messages: history,
             rag_chunks: vec![],
             kg_entities: vec![],
         };
-        self.plan_with_context(user_input, Some(context.render()), None)
+        self.plan_with_context(user_input, Some(context.render()), None, Some(conversation_id))
             .await
     }
 
@@ -347,6 +356,7 @@ impl MasterAgent {
         user_input: &str,
         context_block: Option<String>,
         conversation_id: Option<String>,
+        log_conversation_id: Option<&str>,
     ) -> anyhow::Result<PlannedRun> {
         let skill = self.skills.resolve(user_input, &self.llm).await;
 
@@ -365,6 +375,7 @@ impl MasterAgent {
                 &self.fleet_context(),
                 context_block.as_deref(),
                 skill,
+                log_conversation_id,
             )
             .await?;
         if let Some(s) = skill {

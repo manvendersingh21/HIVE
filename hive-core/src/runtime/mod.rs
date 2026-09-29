@@ -53,6 +53,12 @@ pub use report::{RunOutcome, RunReport, Stage};
 ///
 /// The workspace has no temp-dir dependency and does not need one: `collab::workspace`
 /// already settled on this shape, and a test fixture is not worth a crate.
+///
+/// Every instance gets a fresh UUID, so two tests — in one binary, in two binaries
+/// racing under `cargo test`, or in two runs of the same binary — never share a
+/// directory. Sharing one is not a duplicate-fixture problem but a lock problem: the
+/// run lock inside it is held for the whole run, so a test that reused another's
+/// directory could fail to start with `EWOULDBLOCK` for reasons of scheduling.
 #[cfg(test)]
 pub(crate) struct Scratch {
     pub dir: std::path::PathBuf,

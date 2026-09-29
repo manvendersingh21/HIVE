@@ -3,13 +3,17 @@ use hive_common::config::NvidiaConfig;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// How many attempts a single POST gets inside the overall deadline.
+const ATTEMPTS: u32 = 2;
+
 pub struct NvidiaClient {
     http: reqwest::Client,
     key: Option<String>,
     key_env: &'static str,
     pub model: String,
     base_url: String,
-    deadline: Duration,
+    pub deadline: Duration,
+    pub stream: bool,
 }
 
 impl NvidiaClient {
@@ -29,6 +33,7 @@ impl NvidiaClient {
             model: config.model.clone(),
             base_url: config.base_url.trim_end_matches('/').into(),
             deadline: Duration::from_secs(config.timeout_secs.max(1)),
+            stream: config.stream,
         }
     }
 
@@ -37,14 +42,29 @@ impl NvidiaClient {
             .key
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("NVIDIA is not configured: set {}", self.key_env))?;
+        let start = std::time::Instant::now();
         tokio::time::timeout(self.deadline, async {
-            for attempt in 0..3 {
+            for attempt in 0..ATTEMPTS {
+                // Without streaming, a hung connection and a healthy but slow
+                // generation look the same, so the first attempt gets most of
+                // the budget (two thirds / ~80s of 120s): a long generation still
+                // completes on the first try, while a hung one is cut off with the
+                // remainder left for its retry. Retries after a fast failure
+                // (connect error or 5xx) get whatever budget is left. The overall
+                // deadline around this loop stays the hard cap.
+                let attempt_timeout = if attempt == 0 {
+                    self.deadline * 2 / 3
+                } else {
+                    self.deadline.saturating_sub(start.elapsed())
+                }
+                .max(Duration::from_millis(1));
+
                 let response = self
                     .http
                     .post(format!("{}/{path}", self.base_url))
                     .bearer_auth(key)
                     .json(&body)
-                    .timeout(self.deadline)
+                    .timeout(attempt_timeout)
                     .send()
                     .await;
                 match response {
@@ -53,10 +73,8 @@ impl NvidiaClient {
                         if status == reqwest::StatusCode::OK {
                             return Ok(r.json().await?);
                         }
-                        let retry = status.as_u16() == 429
-                            || status.as_u16() == 408
-                            || status.is_server_error();
-                        if !retry || attempt == 2 {
+                        let retry = status.is_server_error();
+                        if !retry || attempt + 1 >= ATTEMPTS {
                             // Include structured diagnostics only, bounded and with the key redacted.
                             let reason = match status.as_u16() {
                                 401 => "authentication failed",
@@ -81,7 +99,8 @@ impl NvidiaClient {
                         }
                     }
                     Err(e) => {
-                        if attempt == 2 || !(e.is_timeout() || e.is_connect() || e.is_body()) {
+                        let retry = e.is_connect() || e.is_timeout();
+                        if !retry || attempt + 1 >= ATTEMPTS {
                             return Err(anyhow::anyhow!(
                                 "NVIDIA transport failure: {}",
                                 e.without_url()
@@ -107,17 +126,47 @@ impl NvidiaClient {
         }
     }
 
+    /// NVIDIA documents JSON mode (`response_format: json_object`) for the
+    /// Nemotron 3 family; other configured models keep the plain request.
+    fn chat_body(&self, prompt: &str, effort: &str, stream: bool, json_mode: bool) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "messages": [{"role":"user", "content":prompt}],
+            "temperature":1, "top_p":0.95, "max_tokens":16384, "stream":stream,
+            "chat_template_kwargs":self.chat_template_kwargs(effort)
+        });
+        if json_mode && self.model.starts_with("nvidia/nemotron-") {
+            body["response_format"] = json!({"type":"json_object"});
+        }
+        body
+    }
+
     pub async fn complete(&self, prompt: &str, effort: &str) -> anyhow::Result<super::LlmResponse> {
+        self.complete_formatted(prompt, effort, false).await
+    }
+
+    /// Structured (schema) completion. Plain chat must use [`Self::complete`].
+    pub async fn complete_json(
+        &self,
+        prompt: &str,
+        effort: &str,
+    ) -> anyhow::Result<super::LlmResponse> {
+        self.complete_formatted(prompt, effort, true).await
+    }
+
+    async fn complete_formatted(
+        &self,
+        prompt: &str,
+        effort: &str,
+        json_mode: bool,
+    ) -> anyhow::Result<super::LlmResponse> {
+        if self.stream {
+            return self
+                .stream_with_idle(prompt, effort, Duration::from_secs(15), json_mode)
+                .await;
+        }
         let value = self
-            .post(
-                "chat/completions",
-                json!({
-                    "model": self.model,
-                    "messages": [{"role":"user", "content":prompt}],
-                    "temperature":1, "top_p":0.95, "max_tokens":16384, "stream":false,
-                    "chat_template_kwargs":self.chat_template_kwargs(effort)
-                }),
-            )
+            .post("chat/completions", self.chat_body(prompt, effort, false, json_mode))
             .await?;
         let choice = &value["choices"][0];
         anyhow::ensure!(
@@ -132,6 +181,238 @@ impl NvidiaClient {
             provider: hive_common::AiProvider::Nvidia,
             model: value["model"].as_str().unwrap_or(&self.model).into(),
         })
+    }
+
+    /// Streaming (SSE) alternative for completion calls with per-chunk idle timeout
+    /// and overall deadline as hard cap.
+    pub async fn complete_streaming(
+        &self,
+        prompt: &str,
+        effort: &str,
+    ) -> anyhow::Result<super::LlmResponse> {
+        self.complete_streaming_with_idle(prompt, effort, Duration::from_secs(15))
+            .await
+    }
+
+    /// Streaming (SSE) alternative with caller-configurable idle timeout.
+    pub async fn complete_streaming_with_idle(
+        &self,
+        prompt: &str,
+        effort: &str,
+        idle_timeout: Duration,
+    ) -> anyhow::Result<super::LlmResponse> {
+        self.stream_with_idle(prompt, effort, idle_timeout, false)
+            .await
+    }
+
+    async fn stream_with_idle(
+        &self,
+        prompt: &str,
+        effort: &str,
+        idle_timeout: Duration,
+        json_mode: bool,
+    ) -> anyhow::Result<super::LlmResponse> {
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("NVIDIA is not configured: set {}", self.key_env))?;
+        let start = std::time::Instant::now();
+        let body = self.chat_body(prompt, effort, true, json_mode);
+
+        tokio::time::timeout(self.deadline, async {
+            for attempt in 0..ATTEMPTS {
+                let attempt_timeout = if attempt == 0 {
+                    self.deadline * 2 / 3
+                } else {
+                    self.deadline.saturating_sub(start.elapsed())
+                }
+                .max(Duration::from_millis(1));
+
+                // Limit only time-to-headers; body progress is governed by
+                // idle_timeout and the overall deadline.
+                let response = match tokio::time::timeout(
+                    attempt_timeout,
+                    self.http
+                        .post(format!("{}/chat/completions", self.base_url))
+                        .bearer_auth(key)
+                        .json(&body)
+                        .send(),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) if attempt + 1 < ATTEMPTS => {
+                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                        continue;
+                    }
+                    Err(_) => anyhow::bail!("NVIDIA streaming response headers timed out"),
+                };
+
+                let mut r = match response {
+                    Ok(r) => {
+                        let status = r.status();
+                        if status == reqwest::StatusCode::OK {
+                            r
+                        } else {
+                            let retry = status.is_server_error();
+                            if !retry || attempt + 1 >= ATTEMPTS {
+                                let reason = match status.as_u16() {
+                                    401 => "authentication failed",
+                                    403 | 404 => {
+                                        "model unavailable or access denied; check NVIDIA model access"
+                                    }
+                                    429 => "rate limit exceeded",
+                                    _ => "request failed",
+                                };
+                                let error_body: Value = r.json().await.unwrap_or_default();
+                                let detail = error_body
+                                    .pointer("/error/message")
+                                    .or_else(|| error_body.get("detail"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .replace(key, "[redacted]");
+                                let detail: String = detail.chars().take(500).collect();
+                                anyhow::bail!(
+                                    "NVIDIA {reason} (HTTP {status}, model {}, credential {}): {detail}",
+                                    body["model"], self.key_env
+                                );
+                            }
+                            tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        let retry = e.is_connect() || e.is_timeout();
+                        if !retry || attempt + 1 >= ATTEMPTS {
+                            return Err(anyhow::anyhow!(
+                                "NVIDIA transport failure: {}",
+                                e.without_url()
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                        continue;
+                    }
+                };
+
+                let mut full_text = String::new();
+                let mut model_name = self.model.clone();
+                let mut line_buffer: Vec<u8> = Vec::new();
+                let mut finish_reason = None;
+                let mut stream_retry = false;
+                let mut received = false;
+
+                'stream: loop {
+                    let chunk_result = tokio::time::timeout(idle_timeout, r.chunk()).await;
+                    match chunk_result {
+                        Ok(Ok(Some(bytes))) => {
+                            received = true;
+                            line_buffer.extend_from_slice(&bytes);
+                            anyhow::ensure!(
+                                line_buffer.len() <= 1 << 20,
+                                "NVIDIA streaming line exceeds 1 MiB"
+                            );
+                            while let Some(idx) = line_buffer.iter().position(|&b| b == b'\n') {
+                                let raw: Vec<u8> = line_buffer.drain(..=idx).collect();
+                                let line = String::from_utf8_lossy(&raw).trim().to_string();
+                                if let Some(data) = line.strip_prefix("data: ") {
+                                    let data = data.trim();
+                                    if data == "[DONE]" {
+                                        break 'stream;
+                                    }
+                                    if let Ok(val) = serde_json::from_str::<Value>(data) {
+                                        if let Some(m) = val["model"].as_str() {
+                                            model_name = m.to_string();
+                                        }
+                                        if let Some(choice) = val["choices"].get(0) {
+                                            if let Some(c) = choice
+                                                .pointer("/delta/content")
+                                                .and_then(Value::as_str)
+                                            {
+                                                full_text.push_str(c);
+                                            }
+                                            if let Some(fr) =
+                                                choice.get("finish_reason").and_then(Value::as_str)
+                                            {
+                                                finish_reason = Some(fr.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Ok(None)) => {
+                            break 'stream;
+                        }
+                        Ok(Err(e)) => {
+                            // Body errors are never connect/timeout errors on this
+                            // client (it has no reqwest timeout). A failure before
+                            // the first chunk consumed nothing, so it is replayable.
+                            let retry = !received || e.is_connect() || e.is_timeout();
+                            if retry && attempt + 1 < ATTEMPTS {
+                                stream_retry = true;
+                                break 'stream;
+                            }
+                            return Err(anyhow::anyhow!(
+                                "NVIDIA streaming transport error: {}",
+                                e.without_url()
+                            ));
+                        }
+                        Err(_) => {
+                            if attempt + 1 < ATTEMPTS {
+                                stream_retry = true;
+                                break 'stream;
+                            }
+                            anyhow::bail!("NVIDIA streaming idle timeout exceeded");
+                        }
+                    }
+                }
+
+                if stream_retry {
+                    tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                    continue;
+                }
+
+                let remaining = String::from_utf8_lossy(&line_buffer).trim().to_string();
+                if let Some(data) = remaining.strip_prefix("data: ") {
+                    let data = data.trim();
+                    if data != "[DONE]" {
+                        if let Ok(val) = serde_json::from_str::<Value>(data) {
+                            if let Some(m) = val["model"].as_str() {
+                                model_name = m.to_string();
+                            }
+                            if let Some(choice) = val["choices"].get(0) {
+                                if let Some(c) =
+                                    choice.pointer("/delta/content").and_then(Value::as_str)
+                                {
+                                    full_text.push_str(c);
+                                }
+                                if let Some(fr) =
+                                    choice.get("finish_reason").and_then(Value::as_str)
+                                {
+                                    finish_reason = Some(fr.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                anyhow::ensure!(
+                    finish_reason.as_deref() == Some("stop"),
+                    "NVIDIA response incomplete or truncated (finish_reason: {})",
+                    finish_reason.as_deref().unwrap_or("none")
+                );
+                let text = full_text.trim();
+                anyhow::ensure!(!text.is_empty(), "NVIDIA returned an empty final answer");
+                return Ok(super::LlmResponse {
+                    text: text.into(),
+                    provider: hive_common::AiProvider::Nvidia,
+                    model: model_name,
+                });
+            }
+            unreachable!()
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("NVIDIA request deadline exceeded"))?
     }
 
     pub async fn embed(&self, input: &str, input_type: &str) -> anyhow::Result<Vec<f32>> {
@@ -205,7 +486,10 @@ pub(crate) mod tests {
                     let mut eof = [0u8; 1];
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {},
-                        _ = stream.read(&mut eof) => return,
+                        // The client gave up on this attempt (e.g. its
+                        // per-attempt timeout fired): skip this reply and
+                        // let the next scripted reply serve the retry.
+                        _ = stream.read(&mut eof) => continue,
                     }
                 }
                 let body = body.to_string();
@@ -288,13 +572,89 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn json_mode_is_requested_for_schema_calls_only() {
+        let (url, captured, task) = server(vec![
+            (200, answer("{\"a\":1}"), Duration::ZERO),
+            (200, answer("hello"), Duration::ZERO),
+        ])
+        .await;
+        let router = router(url);
+        let schema = json!({"type":"object","properties":{"a":{"type":"integer"}}});
+        let structured = router
+            .complete_json_with("give json", hive_common::AiProvider::Claude, &schema)
+            .await
+            .unwrap();
+        assert_eq!(structured.text, "{\"a\":1}");
+        let plain = router
+            .complete_with("say hi", hive_common::AiProvider::Claude)
+            .await
+            .unwrap();
+        assert_eq!(plain.text, "hello");
+        task.await.unwrap();
+
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let (headers, body) = &calls[0];
+        assert!(headers.starts_with("POST /v1/chat/completions"), "{headers}");
+        assert_eq!(body["model"], "nvidia/nemotron-3-ultra-550b-a55b");
+        assert_eq!(body["response_format"], json!({"type":"json_object"}));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("give json"));
+        let (_, body) = &calls[1];
+        assert!(
+            body.get("response_format").is_none(),
+            "plain chat must not request JSON mode: {body}"
+        );
+        assert_eq!(body["messages"][0]["content"], "say hi");
+    }
+
+    #[tokio::test]
+    async fn streaming_schema_calls_request_json_mode_too() {
+        let done = "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let (url, requests, task) = streaming_server(vec![
+            (200, vec![(done, Duration::ZERO), ("data: [DONE]\n\n", Duration::ZERO)]),
+            (200, vec![(done, Duration::ZERO), ("data: [DONE]\n\n", Duration::ZERO)]),
+        ])
+        .await;
+        let mut r = router(url);
+        r.nvidia.stream = true;
+        r.nvidia.complete_json("structured", "high").await.unwrap();
+        r.nvidia.complete("plain", "high").await.unwrap();
+        task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].1["stream"], true);
+        assert_eq!(requests[0].1["response_format"], json!({"type":"json_object"}));
+        assert!(requests[1].1.get("response_format").is_none());
+    }
+
+    #[test]
+    fn json_mode_is_only_sent_to_models_documented_to_support_it() {
+        let deepseek = NvidiaClient::for_reasoning(&NvidiaConfig {
+            model: "deepseek-ai/deepseek-v4-flash-0731".into(),
+            ..Default::default()
+        });
+        assert!(deepseek.chat_body("p", "high", false, true).get("response_format").is_none());
+        let nemotron = NvidiaClient::for_reasoning(&NvidiaConfig {
+            model: "nvidia/nemotron-3-ultra-550b-a55b".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            nemotron.chat_body("p", "high", false, true)["response_format"],
+            json!({"type":"json_object"})
+        );
+        assert!(nemotron.chat_body("p", "high", false, false).get("response_format").is_none());
+    }
+
+    #[tokio::test]
     async fn failures_are_bounded_and_never_fall_back() {
         for (status, count, expected) in [
             (401, 1, "authentication"),
             (403, 1, "access"),
             (404, 1, "model"),
-            (429, 3, "rate limit"),
-            (503, 3, "request failed"),
+            (429, 1, "rate limit"),
+            (503, 2, "request failed"),
         ] {
             let (url, requests, task) =
                 server(vec![(status, json!({}), Duration::ZERO); count]).await;
@@ -307,13 +667,374 @@ pub(crate) mod tests {
             assert_eq!(requests.lock().unwrap().len(), count);
         }
         let (url, requests, task) = server(vec![
-            (429, json!({}), Duration::ZERO),
+            (503, json!({}), Duration::ZERO),
             (200, answer("ok"), Duration::ZERO),
         ])
         .await;
         assert_eq!(router(url).local_complete("x").await.unwrap(), "ok");
         task.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_hung_first_attempt_is_cut_off_and_the_retry_succeeds() {
+        // The first reply hangs past the first attempt's share of the budget
+        // (two thirds of the overall deadline) but inside the overall
+        // deadline itself, so the retry still has the remainder available.
+        let (url, requests, task) = server(vec![
+            (200, answer("late"), Duration::from_millis(1100)),
+            (200, answer("retried"), Duration::ZERO),
+        ])
+        .await;
+        let mut r = router(url);
+        r.nvidia.deadline = Duration::from_millis(1500);
+        let start = std::time::Instant::now();
+        assert_eq!(r.local_complete("x").await.unwrap(), "retried");
+        // Success must come from the retry, before the overall deadline and
+        // without waiting for the hung first attempt to finish.
+        assert!(start.elapsed() < Duration::from_millis(1500));
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_slow_first_attempt_completes_without_a_retry() {
+        // A generation slower than an even share of the deadline, but inside
+        // the first attempt's two-thirds share, must succeed on the first
+        // try: the budget split must not cut off healthy slow calls.
+        let (url, requests, task) = server(vec![(200, answer("slow but fine"), Duration::from_millis(800))])
+            .await;
+        let mut r = router(url);
+        r.nvidia.deadline = Duration::from_millis(1500);
+        assert_eq!(r.local_complete("x").await.unwrap(), "slow but fine");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    pub async fn streaming_server_bytes(
+        replies: Vec<(u16, Vec<(Vec<u8>, Duration)>)>,
+    ) -> (String, Requests, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests: Requests = Default::default();
+        let captured = requests.clone();
+        let task = tokio::spawn(async move {
+            for (status, chunks) in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut data = vec![];
+                let header_end = loop {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = data.windows(4).position(|b| b == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&data[..header_end]).to_string();
+                let len: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                while data.len() < header_end + len {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                }
+                captured.lock().unwrap().push((
+                    headers,
+                    serde_json::from_slice(&data[header_end..header_end + len]).unwrap_or_default(),
+                ));
+
+                if status != 200 {
+                    let err_body = "{\"error\":{\"message\":\"server error\"}}";
+                    let resp = format!(
+                        "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err_body}",
+                        err_body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    continue;
+                }
+
+                let resp_head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp_head.as_bytes()).await;
+                for (chunk, delay) in chunks {
+                    if !delay.is_zero() {
+                        let mut eof = [0u8; 1];
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {},
+                            _ = stream.read(&mut eof) => break,
+                        }
+                    }
+                    if stream.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (url, requests, task)
+    }
+
+    pub async fn streaming_server(
+        replies: Vec<(u16, Vec<(&'static str, Duration)>)>,
+    ) -> (String, Requests, tokio::task::JoinHandle<()>) {
+        streaming_server_bytes(
+            replies
+                .into_iter()
+                .map(|(status, chunks)| {
+                    (
+                        status,
+                        chunks
+                            .into_iter()
+                            .map(|(s, d)| (s.as_bytes().to_vec(), d))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn streaming_planner_call_succeeds() {
+        let (url, requests, task) = streaming_server(vec![(
+            200,
+            vec![
+                ("data: {\"model\":\"nemotron-stream\",\"choices\":[{\"delta\":{\"content\":\"plan \"},\"finish_reason\":null}]}\n\n", Duration::from_millis(10)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"step 1\"},\"finish_reason\":\"stop\"}]}\n\n", Duration::from_millis(10)),
+                ("data: [DONE]\n\n", Duration::ZERO),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.stream = true;
+        let resp = r.nvidia.complete("make plan", "high").await.unwrap();
+        assert_eq!(resp.text, "plan step 1");
+        assert_eq!(resp.model, "nemotron-stream");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_idle_timeout_triggers_retry_and_succeeds() {
+        let (url, requests, task) = streaming_server(vec![
+            (
+                200,
+                vec![
+                    ("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", Duration::ZERO),
+                    // Hangs for 300ms, exceeding the 50ms idle timeout!
+                    ("data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n", Duration::from_millis(300)),
+                ],
+            ),
+            (
+                200,
+                vec![
+                    ("data: {\"choices\":[{\"delta\":{\"content\":\"retried ok\"},\"finish_reason\":\"stop\"}]}\n\n", Duration::ZERO),
+                    ("data: [DONE]\n\n", Duration::ZERO),
+                ],
+            ),
+        ])
+        .await;
+        let r = router(url);
+        let resp = r
+            .nvidia
+            .complete_streaming_with_idle("plan", "high", Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(resp.text, "retried ok");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    /// Answers each connection with raw bytes and then closes it, so a reply
+    /// can promise more body than it sends.
+    async fn raw_server(replies: Vec<Vec<u8>>) -> (String, Requests, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests: Requests = Default::default();
+        let captured = requests.clone();
+        let task = tokio::spawn(async move {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut data = vec![];
+                let header_end = loop {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = data.windows(4).position(|b| b == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&data[..header_end]).to_string();
+                let len: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                while data.len() < header_end + len {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    data.extend_from_slice(&buf[..n]);
+                }
+                captured.lock().unwrap().push((headers, Value::Null));
+                let _ = stream.write_all(&reply).await;
+            }
+        });
+        (url, requests, task)
+    }
+
+    fn truncated_stream(body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n{body}").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn streaming_error_before_first_chunk_is_retried() {
+        let ok = "data: {\"choices\":[{\"delta\":{\"content\":\"retried ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (url, requests, task) = raw_server(vec![
+            truncated_stream(""),
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok}", ok.len()).into_bytes(),
+        ])
+        .await;
+        let resp = router(url)
+            .nvidia
+            .complete_streaming_with_idle("plan", "high", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(resp.text, "retried ok");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_error_after_first_chunk_is_not_retried() {
+        let (url, requests, task) = raw_server(vec![truncated_stream(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        )])
+        .await;
+        let err = router(url)
+            .nvidia
+            .complete_streaming_with_idle("plan", "high", Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("streaming transport error"), "{err}");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_overall_deadline_is_hard_cap() {
+        let (url, _, task) = streaming_server(vec![(
+            200,
+            vec![
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"slow\"}}]}\n\n", Duration::from_millis(10)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"...\"}}]}\n\n", Duration::from_millis(200)),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.deadline = Duration::from_millis(50);
+        let err = r
+            .nvidia
+            .complete_streaming_with_idle("plan", "high", Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deadline"), "{err}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_split_utf8_across_chunks_is_preserved() {
+        // "✓" is 3 bytes in UTF-8: 0xE2, 0x9C, 0x93
+        let part1 = b"data: {\"choices\":[{\"delta\":{\"content\":\"valid \xe2".to_vec();
+        let part2 = b"\x9c\x93 plan\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_vec();
+        let (url, _, task) = streaming_server_bytes(vec![(
+            200,
+            vec![
+                (part1, Duration::ZERO),
+                (part2, Duration::ZERO),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.stream = true;
+        let resp = r.nvidia.complete("make plan", "high").await.unwrap();
+        assert_eq!(resp.text, "valid ✓ plan");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_finish_reason_validation() {
+        // Case 1: finish_reason is "length"
+        let (url, _, task) = streaming_server(vec![(
+            200,
+            vec![
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"truncated plan\"},\"finish_reason\":\"length\"}]}\n\n", Duration::ZERO),
+                ("data: [DONE]\n\n", Duration::ZERO),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.stream = true;
+        let err = r.nvidia.complete("make plan", "high").await.unwrap_err().to_string();
+        assert!(err.contains("finish_reason: length"), "{err}");
+        task.await.unwrap();
+
+        // Case 2: stream ends without finish_reason before [DONE] or EOF
+        let (url, _, task) = streaming_server(vec![(
+            200,
+            vec![
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"incomplete plan\"}}]}\n\n", Duration::ZERO),
+                ("data: [DONE]\n\n", Duration::ZERO),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.stream = true;
+        let err = r.nvidia.complete("make plan", "high").await.unwrap_err().to_string();
+        assert!(err.contains("finish_reason: none"), "{err}");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_slow_steady_stream_exceeding_first_attempt_share_succeeds() {
+        // Total deadline = 1500 ms. First attempt share in non-streaming would be ~1000 ms.
+        // 6 chunks arriving every 200 ms = ~1200 ms total, well within 1500 ms deadline.
+        // In streaming mode, body read must NOT time out on the 1000 ms header timeout.
+        let (url, requests, task) = streaming_server(vec![(
+            200,
+            vec![
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 1 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 2 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 3 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 4 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 5 \"}}]}\n\n", Duration::from_millis(200)),
+                ("data: {\"choices\":[{\"delta\":{\"content\":\"chunk 6\"},\"finish_reason\":\"stop\"}]}\n\n", Duration::from_millis(200)),
+                ("data: [DONE]\n\n", Duration::ZERO),
+            ],
+        )])
+        .await;
+        let mut r = router(url);
+        r.nvidia.deadline = Duration::from_millis(1500);
+        let resp = r
+            .nvidia
+            .complete_streaming_with_idle("plan", "high", Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(resp.text, "chunk 1 chunk 2 chunk 3 chunk 4 chunk 5 chunk 6");
+        task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

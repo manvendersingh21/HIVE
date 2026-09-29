@@ -6,7 +6,7 @@
 //! user's decisions. The plan is held server-side between the two calls so the
 //! browser cannot hand back a *different* command than the one it was shown.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Path, Query, State},
@@ -23,29 +23,138 @@ use hive_core::memory::machines;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+// Planner-call budget, chat path:
+// 1. Concurrency limit: PLANNER_SLOTS bounds concurrent planning calls to 2.
+// 2. Permit wait bounding: In `bounded_plan`, acquiring a permit from `slots` is bounded by
+//    the whole-request budget (PLANNING_TIMEOUT + retry, i.e. 2 * deadline). Waiting does not
+//    consume the single-attempt `deadline` timer once the permit is acquired, but the wait itself
+//    is capped so queued requests cannot hang indefinitely.
+// 3. Deadline hierarchy: A single planning attempt runs within PLANNING_TIMEOUT (150s).
+//    Inside this window, NVIDIA's own overall deadline is 120s by default (split into
+//    an ~80s / ~2/3 first attempt, and the remaining budget for retries). This leaves
+//    a 30s margin for ancillary tasks (memory retrieval, prompt generation, complexity classification).
+// 4. Automatic retry: `plan_with_retry` grants one automatic retry of the whole plan if
+//    the deadline fires, giving up to ~300s total before a user-facing timeout message.
+//    A permit-wait timeout has already spent that budget, so it is returned without a retry.
 const PLANNING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 const CONTINUATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Bounds how many planner calls run at once. The planner hits a single
+/// upstream model endpoint; two concurrent plans is the most it serves
+/// without timing out.
+pub(crate) static PLANNER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 // Bound the whole planning phase, including sequential model and memory calls.
 // This future never executes commands, so dropping it on timeout is safe.
-async fn bounded_plan(
-    plan: impl std::future::Future<Output = anyhow::Result<PlannedRun>>,
+// Waiting for a permit from `slots` is bounded by the whole-request budget
+// (PLANNING_TIMEOUT + retry, or 2 * deadline) as a cap on wait+plan, so
+// queued requests cannot hang indefinitely. Once acquired, the deadline timer
+// starts, bounding concurrent planner calls.
+pub(crate) async fn bounded_plan<T>(
+    slots: &tokio::sync::Semaphore,
+    plan: impl std::future::Future<Output = anyhow::Result<T>>,
     deadline: std::time::Duration,
-) -> Result<PlannedRun, Response> {
+) -> Result<T, Response> {
+    try_bounded_plan(slots, plan, deadline)
+        .await
+        .map_err(PlanFailure::into_response)
+}
+
+/// Why a bounded plan produced no value. Kept distinct so only a plan that
+/// actually ran out of time is retried; a slot-wait timeout has already spent
+/// the whole-request budget.
+enum PlanFailure {
+    SlotWait,
+    Deadline,
+    Failed(anyhow::Error),
+}
+
+impl IntoResponse for PlanFailure {
+    fn into_response(self) -> Response {
+        match self {
+            PlanFailure::SlotWait => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Planning timed out waiting for an available planner slot. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
+            )
+                .into_response(),
+            PlanFailure::Deadline => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Planning timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
+            )
+                .into_response(),
+            PlanFailure::Failed(e) => {
+                (StatusCode::BAD_GATEWAY, format!("planning failed: {e}")).into_response()
+            }
+        }
+    }
+}
+
+async fn try_bounded_plan<T>(
+    slots: &tokio::sync::Semaphore,
+    plan: impl std::future::Future<Output = anyhow::Result<T>>,
+    deadline: std::time::Duration,
+) -> Result<T, PlanFailure> {
+    let wait_budget = deadline * 2;
+    let _permit = match tokio::time::timeout(wait_budget, slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => panic!("planner semaphore is closed"),
+        Err(_) => {
+            warn!("planner semaphore permit wait timed out");
+            return Err(PlanFailure::SlotWait);
+        }
+    };
     match tokio::time::timeout(deadline, plan).await {
-        Ok(Ok(plan)) => Ok(plan),
+        Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => {
             warn!(error = %e, "planning failed");
-            Err((StatusCode::BAD_GATEWAY, format!("planning failed: {e}")).into_response())
+            Err(PlanFailure::Failed(e))
         }
         Err(_) => {
             warn!("total planning deadline exceeded");
-            Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                "Planning timed out. No commands were executed from this planning round. Earlier results, if any, remain saved.",
-            )
-                .into_response())
+            Err(PlanFailure::Deadline)
         }
+    }
+}
+
+/// One automatic retry of the whole plan when its deadline fires: a transient
+/// provider stall should not lose the user's message. A deadline failure on
+/// the retry as well becomes a user-facing explanation instead of a bare
+/// timeout.
+pub(crate) async fn plan_with_retry<T, F, Fut>(
+    make_plan: F,
+    deadline: std::time::Duration,
+) -> Result<T, Response>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    plan_with_retry_slots(&PLANNER_SLOTS, make_plan, deadline).await
+}
+
+pub(crate) async fn plan_with_retry_slots<T, F, Fut>(
+    slots: &tokio::sync::Semaphore,
+    make_plan: F,
+    deadline: std::time::Duration,
+) -> Result<T, Response>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match try_bounded_plan(slots, make_plan(), deadline).await {
+        Ok(plan) => Ok(plan),
+        Err(PlanFailure::Deadline) => {
+            warn!("planning deadline exceeded; retrying the whole plan once");
+            match try_bounded_plan(slots, make_plan(), deadline).await {
+                Ok(plan) => Ok(plan),
+                Err(PlanFailure::Deadline) => Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Planning timed out and one automatic retry also timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message in a moment, and if it keeps timing out, try a shorter or simpler request.",
+                )
+                    .into_response()),
+                Err(failure) => Err(failure.into_response()),
+            }
+        }
+        Err(failure) => Err(failure.into_response()),
     }
 }
 
@@ -69,12 +178,26 @@ impl AgentHandle {
 
     pub fn enabled(agent: Arc<MasterAgent>, master_name: String) -> anyhow::Result<Self> {
         let history = ChatStore::new(agent.memory.graph.shared_conn())?;
-        history.recover_interrupted()?;
-        Ok(Self {
+        let recovery = history.recover_interrupted()?;
+        let handle = Self {
             agent: Some(agent),
             history: Some(history),
             master_name,
-        })
+        };
+        handle.restart_planning(recovery.restarted);
+        Ok(handle)
+    }
+
+    /// Plan again the turns a restart interrupted while they were planning.
+    /// Planning has no side effects, so nothing can be replayed by this.
+    pub(crate) fn restart_planning(&self, turns: Vec<SavedTurn>) {
+        for turn in turns {
+            info!(conversation_id = %turn.conversation_id, turn_id = %turn.id, "restarting planning interrupted by a restart");
+            let h = self.clone();
+            tokio::spawn(async move {
+                process_chat(h, turn).await;
+            });
+        }
     }
 
     pub(crate) fn require(&self) -> Result<&Arc<MasterAgent>, Response> {
@@ -161,6 +284,174 @@ pub async fn get_chat(State(h): State<AgentHandle>, Path(id): Path<String>) -> R
         },
         Ok(None) => storage_error(ChatError::NotFound.into()),
         Err(e) => storage_error(e),
+    }
+}
+
+/// Delegated-run states that still own a live agent session. A chat with any
+/// of these cannot be deleted: the run would keep working with nowhere to
+/// report, and its approvals would point at a conversation that is gone.
+pub(crate) const LIVE_RUN_STATES: [&str; 8] = [
+    "queued",
+    "launching",
+    "working",
+    "waiting-for-peer",
+    "awaiting-approval",
+    "paused-quota",
+    "verifying",
+    "reviewing",
+];
+
+/// What stopped a chat deletion, if anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeleteRefusal {
+    NotFound,
+    LiveRuns(i64),
+    ActiveTurn,
+}
+
+/// Delete one conversation and everything that exists only because of it, in
+/// a single IMMEDIATE transaction on the shared memory connection:
+///
+/// - web chat turns, messages, and the conversation row;
+/// - RAG memory rows (`rag_chunks`, `rag_indexed`) for that conversation;
+/// - finished delegated runs of that conversation, with their events,
+///   decisions, and the task-scoped contracts/reviews no other run uses.
+///
+/// Relay state is deliberately left alone. The audit chain is append-only
+/// (triggers refuse DELETE), and the envelopes, messages, keys and incidents
+/// it references stay so the chain remains verifiable after the chat is gone.
+pub(crate) fn delete_conversation(
+    agent: &MasterAgent,
+    id: &str,
+) -> anyhow::Result<Result<(), DeleteRefusal>> {
+    let conn = agent.memory.graph.shared_conn();
+    let db = conn.lock().unwrap();
+    db.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> anyhow::Result<Result<(), DeleteRefusal>> {
+        let exists: i64 = db.query_row(
+            "SELECT count(*) FROM conversations WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(Err(DeleteRefusal::NotFound));
+        }
+        let table = |name: &str| -> anyhow::Result<bool> {
+            let n: i64 = db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        };
+        let has_runs = table("delegated_runs")?;
+        if has_runs {
+            let live_list = LIVE_RUN_STATES
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let live: i64 = db.query_row(
+                &format!(
+                    "SELECT count(*) FROM delegated_runs WHERE conversation_id=?1 AND state IN ({live_list})"
+                ),
+                [id],
+                |r| r.get(0),
+            )?;
+            if live > 0 {
+                return Ok(Err(DeleteRefusal::LiveRuns(live)));
+            }
+        }
+        if table("web_chat_turns")? {
+            let active: i64 = db.query_row(
+                "SELECT count(*) FROM web_chat_turns WHERE conversation_id=?1 AND status IN ('planning','executing','awaiting_approval')",
+                [id],
+                |r| r.get(0),
+            )?;
+            if active > 0 {
+                return Ok(Err(DeleteRefusal::ActiveTurn));
+            }
+            db.execute("DELETE FROM web_chat_turns WHERE conversation_id=?1", [id])?;
+        }
+        if has_runs {
+            let runs = "SELECT id FROM delegated_runs WHERE conversation_id=?1";
+            let tasks = "SELECT task_id FROM delegated_runs WHERE conversation_id=?1 \
+                         AND task_id NOT IN (SELECT task_id FROM delegated_runs WHERE conversation_id!=?1)";
+            db.execute(&format!("DELETE FROM delegated_events WHERE run_id IN ({runs})"), [id])?;
+            db.execute(&format!("DELETE FROM delegated_decisions WHERE run_id IN ({runs})"), [id])?;
+            if table("delegated_completions")? {
+                db.execute(&format!("DELETE FROM delegated_completions WHERE run_id IN ({runs})"), [id])?;
+            }
+            for scoped in ["delegated_contracts", "delegated_reviews"] {
+                if table(scoped)? {
+                    db.execute(&format!("DELETE FROM {scoped} WHERE task_id IN ({tasks})"), [id])?;
+                }
+            }
+            db.execute("DELETE FROM delegated_runs WHERE conversation_id=?1", [id])?;
+        }
+        for memory in ["rag_chunks", "rag_indexed"] {
+            if table(memory)? {
+                db.execute(&format!("DELETE FROM {memory} WHERE conversation_id=?1"), [id])?;
+            }
+        }
+        db.execute("DELETE FROM messages WHERE conversation_id=?1", [id])?;
+        db.execute("DELETE FROM conversations WHERE id=?1", [id])?;
+        Ok(Ok(()))
+    })();
+    // Never leave the shared connection inside an open transaction, and never
+    // let a failed ROLLBACK hide the error that caused it.
+    if matches!(result, Ok(Ok(()))) {
+        if let Err(commit) = db.execute_batch("COMMIT") {
+            let _ = db.execute_batch("ROLLBACK");
+            return Err(commit.into());
+        }
+    } else {
+        let _ = db.execute_batch("ROLLBACK");
+    }
+    result
+}
+
+/// `DELETE /api/chats/{id}` — 204 when deleted, 404 for an unknown chat, 409
+/// while a delegated run or a chat request of that conversation is still live.
+pub async fn delete_chat(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
+    if let Err(r) = h.store() {
+        return r;
+    }
+    let agent = match h.require() {
+        Ok(a) => a.clone(),
+        Err(r) => return r,
+    };
+    // Make sure the delegation tables exist, so the live-run check can never
+    // be skipped just because no run was ever created on this host.
+    if let Err(e) = crate::delegation::store(&h) {
+        return storage_error(e);
+    }
+    let outcome = {
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || delete_conversation(&agent, &id)).await
+    };
+    match outcome {
+        Ok(Ok(Ok(()))) => {
+            info!(conversation_id = %id, "chat deleted");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(Err(DeleteRefusal::NotFound))) => storage_error(ChatError::NotFound.into()),
+        Ok(Ok(Err(DeleteRefusal::LiveRuns(n)))) => (
+            StatusCode::CONFLICT,
+            format!(
+                "This chat still has {n} delegated run{} in progress. Stop or finish {} before deleting the chat.",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "it" } else { "them" },
+            ),
+        )
+            .into_response(),
+        Ok(Ok(Err(DeleteRefusal::ActiveTurn))) => (
+            StatusCode::CONFLICT,
+            "This chat has a request running or awaiting approval. Wait for it to finish before deleting the chat.",
+        )
+            .into_response(),
+        Ok(Err(e)) => storage_error(e),
+        Err(e) => storage_error(anyhow::anyhow!("chat deletion task failed: {e}")),
     }
 }
 
@@ -303,8 +594,8 @@ async fn process_chat(h: AgentHandle, turn: SavedTurn) -> Response {
         Ok(history) => history,
         Err(e) => return save_failure(store, &turn, storage_error(e)).await,
     };
-    let plan = match bounded_plan(
-        agent.plan_chat_run(&turn.user_input, history),
+    let plan = match plan_with_retry(
+        || agent.plan_chat_run(&turn.user_input, history.clone(), &turn.conversation_id),
         PLANNING_TIMEOUT,
     )
     .await
@@ -466,7 +757,13 @@ async fn drive_workflow(
         let mut planning_attempts = 0;
         let next = loop {
             let proposed = bounded_plan(
-                agent.continue_run(&reply.run, &reply.result, reply.workflow.as_ref().unwrap()),
+                &PLANNER_SLOTS,
+                agent.continue_run(
+                    &reply.run,
+                    &reply.result,
+                    reply.workflow.as_ref().unwrap(),
+                    &turn.conversation_id,
+                ),
                 CONTINUATION_TIMEOUT,
             )
             .await.and_then(|next| {
@@ -693,8 +990,12 @@ pub async fn capabilities(State(h): State<AgentHandle>) -> Json<Capabilities> {
 // Master-agent model selection — local (Qwen/Ollama) or an API-key cloud
 // provider (Z.ai, NVIDIA). Picking a cloud provider fully disables fallback
 // to the local model (see `LlmRouter::set_provider`); the choice, and any
-// Z.ai key entered through this endpoint, are persisted outside the repo so
-// they survive a restart without leaking into a shared working tree.
+// Z.ai key entered through this endpoint, are persisted to
+// `~/.hive/master-agent.json` (override the location with
+// `HIVE_MASTER_AGENT_FILE`) using an atomic write with 0600 permissions,
+// and re-applied at startup — always below whatever the environment and
+// `hive.toml` configure. The key never appears in an API response, a log
+// line, or a prompt.
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -729,17 +1030,23 @@ fn provider_id(provider: hive_common::AiProvider) -> &'static str {
     }
 }
 
-fn parse_provider_id(id: &str) -> Result<hive_common::AiProvider, Response> {
+fn parse_persisted_provider(id: &str) -> Option<hive_common::AiProvider> {
     match id {
-        "local" => Ok(hive_common::AiProvider::Local),
-        "zai" => Ok(hive_common::AiProvider::Zai),
-        "nvidia" => Ok(hive_common::AiProvider::Nvidia),
-        other => Err((
-            StatusCode::BAD_REQUEST,
-            format!("unknown provider '{other}' (expected local, zai, or nvidia)"),
-        )
-            .into_response()),
+        "local" => Some(hive_common::AiProvider::Local),
+        "zai" => Some(hive_common::AiProvider::Zai),
+        "nvidia" => Some(hive_common::AiProvider::Nvidia),
+        _ => None,
     }
+}
+
+fn parse_provider_id(id: &str) -> Result<hive_common::AiProvider, Response> {
+    parse_persisted_provider(id).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("unknown provider '{id}' (expected local, zai, or nvidia)"),
+        )
+            .into_response()
+    })
 }
 
 async fn master_agent_settings_view(agent: &MasterAgent) -> MasterAgentSettings {
@@ -797,11 +1104,19 @@ pub async fn set_master_agent(
     Ok(Json(master_agent_settings_view(agent).await))
 }
 
+/// Env var overriding where the master-agent state lives (tests, parallel
+/// installs on one host).
+const MASTER_AGENT_FILE_ENV: &str = "HIVE_MASTER_AGENT_FILE";
+
 /// Where the master-agent provider selection (and any Z.ai key entered
-/// through the settings API) is persisted. Never inside the project
-/// directory — this can be a shared working tree.
+/// through the settings API) is persisted: `~/.hive/master-agent.json`, or
+/// `$HIVE_MASTER_AGENT_FILE` when set. Never inside the project directory —
+/// this can be a shared working tree.
 fn master_agent_state_path() -> Option<std::path::PathBuf> {
-    std::env::var("HOME").ok().map(|home| {
+    if let Some(path) = std::env::var_os(MASTER_AGENT_FILE_ENV).filter(|p| !p.is_empty()) {
+        return Some(std::path::PathBuf::from(path));
+    }
+    std::env::var_os("HOME").map(|home| {
         std::path::Path::new(&home)
             .join(".hive")
             .join("master-agent.json")
@@ -815,58 +1130,204 @@ struct PersistedMasterAgent {
     zai_api_key: Option<String>,
 }
 
-fn save_master_agent_selection(provider: &str, api_key: Option<&str>) -> anyhow::Result<()> {
-    let path = master_agent_state_path()
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot persist master-agent selection"))?;
-    if let Some(parent) = path.parent() {
+/// Serializes the read-modify-write in `save_master_agent_selection`.
+/// POSTs to the settings API can run concurrently on different Tokio
+/// workers; two interleaved saves would read the same state and one update
+/// (provider or key) would be lost. Poisoning only means a saver panicked
+/// midway — the next save still takes the lock and rewrites the file.
+static MASTER_AGENT_SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write the state file: serialize, write a uniquely-named sibling temp
+/// file created fresh with 0600 (`create_new` — a leftover temp from an
+/// earlier crash can never be written through, so its looser permissions
+/// are irrelevant), sync, then atomically rename over the destination. The
+/// chmod-on-destination afterwards repairs a looser mode left by an older
+/// version; the mode-on-create closes the umask window.
+fn write_master_agent_state(
+    path: &std::path::Path,
+    state: &PersistedMasterAgent,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
+    let contents = serde_json::to_string_pretty(state)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("master-agent.json");
+    // Unique per attempt: concurrent savers (or a stale temp from a crashed
+    // one) can never collide on the temp path, which would make the rename
+    // race or clobber another writer's bytes.
+    let temp = path.with_file_name(format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let write = || -> anyhow::Result<()> {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)?
+        };
+        #[cfg(not(unix))]
+        let mut file =
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        use std::io::Write as _;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    };
+    let result = write();
+    if result.is_err() {
+        // A half-written temp file helps nobody.
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn save_master_agent_selection(provider: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+    let path = master_agent_state_path().ok_or_else(|| {
+        anyhow::anyhow!(
+            "HOME is not set and {MASTER_AGENT_FILE_ENV} is unset; cannot persist master-agent selection"
+        )
+    })?;
+
+    // The whole read-modify-write is serialized: merge-on-save reads what is
+    // on disk, so two concurrent saves must not interleave.
+    let _serialized = MASTER_AGENT_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // Merge with whatever is already on disk so switching to `local` (no
-    // key) doesn't discard a previously entered Z.ai key.
+    // key) doesn't discard a previously entered Z.ai key. An empty key is
+    // treated as absent — it would only ever construct a broken client.
     let mut state = load_master_agent_state().unwrap_or_default();
     state.provider = provider.to_string();
-    if let Some(key) = api_key {
+    if let Some(key) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
         state.zai_api_key = Some(key.to_string());
     }
 
-    let contents = serde_json::to_string_pretty(&state)?;
-    std::fs::write(&path, contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    write_master_agent_state(&path, &state)
 }
 
 fn load_master_agent_state() -> Option<PersistedMasterAgent> {
     let path = master_agent_state_path()?;
     let contents = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    match serde_json::from_str(&contents) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            warn!(error = %e, "master-agent state file is corrupt; ignoring it (the next save rewrites it)");
+            None
+        }
+    }
+}
+
+/// Why the master agent ended up on the provider it starts with. Reported
+/// by [`apply_persisted_master_agent`] and logged once at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderSelectionReason {
+    /// The selection saved from the settings UI was restored.
+    PersistedChoice,
+    /// No usable persisted selection; `hive.toml` `single_provider` applies.
+    ConfigDefault,
+    /// Neither a usable persisted selection nor a configured
+    /// `single_provider`: legacy routing with the local model as default.
+    Fallback,
+}
+
+impl ProviderSelectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PersistedChoice => "persisted choice",
+            Self::ConfigDefault => "config default",
+            Self::Fallback => "fallback",
+        }
+    }
 }
 
 /// Apply a persisted master-agent selection to a freshly built router, if
 /// one was saved by an earlier run. Called once at startup, before the
-/// router is shared behind an `Arc`. Failures are logged, not fatal — the
-/// process falls back to whatever `hive.toml` configured.
-pub fn apply_persisted_master_agent(llm: &hive_core::llm::LlmRouter) {
-    let Some(state) = load_master_agent_state() else {
-        return;
-    };
-    let Ok(provider) = (match state.provider.as_str() {
-        "local" => Ok(hive_common::AiProvider::Local),
-        "zai" => Ok(hive_common::AiProvider::Zai),
-        "nvidia" => Ok(hive_common::AiProvider::Nvidia),
-        other => Err(anyhow::anyhow!("unknown persisted provider '{other}'")),
-    }) else {
-        warn!(provider = %state.provider, "ignoring unrecognized persisted master-agent provider");
-        return;
-    };
-    if let Err(e) = llm.set_provider(provider, state.zai_api_key.clone()) {
-        warn!(error = %e, provider = %state.provider, "could not restore persisted master-agent selection");
+/// router is shared behind an `Arc`. Returns (and logs at `info`) the
+/// provider the master agent starts with and why.
+///
+/// Precedence:
+/// - Provider: the persisted selection is the operator's most recent
+///   explicit choice, so it overrides `hive.toml` `single_provider` — as
+///   long as that provider is still configured/usable (e.g. `nvidia` still
+///   has `NVIDIA_API_KEY_FLASH`, `zai` still has a key). A persisted
+///   provider that is unknown or no longer usable is ignored and the
+///   `hive.toml` default applies (or, with none, legacy routing on the
+///   local model). `hive.toml` is therefore the default, not an override.
+/// - Z.ai key: unchanged — the environment and `hive.toml` win over the
+///   file. A key already resolved from `[llm.zai]`/`Z_AI` by `from_config`
+///   is never replaced; the persisted key only fills a router that has none.
+///
+/// Failures are logged, not fatal. API keys are never logged.
+pub fn apply_persisted_master_agent(
+    llm: &hive_core::llm::LlmRouter,
+    cfg: &hive_common::config::LlmConfig,
+) -> (hive_common::AiProvider, ProviderSelectionReason) {
+    let restored = restore_persisted_provider(llm);
+    let (provider, reason) = if let Some(provider) = restored {
+        (provider, ProviderSelectionReason::PersistedChoice)
+    } else if let Some(provider) = cfg.single_provider {
+        (provider, ProviderSelectionReason::ConfigDefault)
     } else {
-        info!(provider = %state.provider, "restored persisted master-agent selection");
+        (llm.current_provider(), ProviderSelectionReason::Fallback)
+    };
+    info!(
+        provider = %provider,
+        reason = reason.as_str(),
+        configured_default = ?cfg.single_provider,
+        "master-agent provider selected"
+    );
+    (provider, reason)
+}
+
+/// Seed the persisted Z.ai key and try to switch the router to the
+/// persisted provider. Returns the provider when it was restored; `None`
+/// when there is no state file, the provider is unknown, or it is no longer
+/// usable (the router then keeps its `hive.toml` configuration untouched,
+/// since `set_provider` only mutates on success).
+fn restore_persisted_provider(llm: &hive_core::llm::LlmRouter) -> Option<hive_common::AiProvider> {
+    let state = load_master_agent_state()?;
+    // Make the persisted Z.ai key available first (a no-op when env/config
+    // already provided one — env/config keys keep precedence). Seeding
+    // happens regardless of the persisted provider so a key entered while
+    // running on `local` still works after a restart.
+    if let Some(key) = state
+        .zai_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        llm.seed_zai_key_if_unconfigured(key.to_string());
+    }
+    let Some(provider) = parse_persisted_provider(&state.provider) else {
+        warn!(provider = %state.provider, "ignoring unrecognized persisted master-agent provider");
+        return None;
+    };
+    match llm.set_provider(provider, None) {
+        Ok(()) => Some(provider),
+        Err(e) => {
+            // The error names a missing env var at most, never a key value.
+            warn!(
+                error = %e,
+                provider = %state.provider,
+                "persisted master-agent provider is no longer configured; using the hive.toml default"
+            );
+            None
+        }
     }
 }
 
@@ -1086,8 +1547,178 @@ pub fn apply_persisted_fleet(workers: &hive_core::workers::WorkerPool) {
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn empty_plan() -> PlannedRun {
+        serde_json::from_value(serde_json::json!({
+            "id": "plan-1",
+            "user_input": "hi",
+            "summary": "nothing",
+            "complexity": "simple",
+            "routed_provider": "local",
+            "provider": "local",
+            "steps": []
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_planning_deadline_failure_is_retried_once_and_can_succeed() {
+        let slots = tokio::sync::Semaphore::new(2);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let plan = empty_plan();
+        let result = plan_with_retry_slots(
+            &slots,
+            move || {
+                let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+                let plan = plan.clone();
+                async move {
+                    if first {
+                        // The first attempt hangs past the deadline.
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(plan)
+                }
+            },
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.id, "plan-1");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_second_deadline_failure_tells_the_user_what_to_do() {
+        let slots = tokio::sync::Semaphore::new(2);
+        let response = plan_with_retry_slots(
+            &slots,
+            || std::future::pending::<anyhow::Result<PlannedRun>>(),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("automatic retry"), "{text}");
+        assert!(text.contains("resend"), "{text}");
+        assert!(text.contains("No commands were executed"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_planner_slot_does_not_consume_the_deadline() {
+        // Both slots occupied: the caller below must wait longer than its
+        // own deadline before its plan even starts. If the permit wait
+        // counted against the deadline, this call would time out; it must
+        // instead succeed once a slot frees up (within the whole-request budget).
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let hog1 = slots.clone().acquire_owned().await.unwrap();
+        let hog2 = slots.clone().acquire_owned().await.unwrap();
+        let s = slots.clone();
+        let waiter = tokio::spawn(async move {
+            bounded_plan(
+                &s,
+                async { anyhow::Ok(()) },
+                Duration::from_millis(50),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        drop(hog1);
+        drop(hog2);
+        assert!(waiter.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_planner_slot_beyond_whole_request_budget_times_out() {
+        // When all slots stay occupied beyond whole-request budget (2 * deadline),
+        // the permit wait times out with GATEWAY_TIMEOUT.
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let _hog1 = slots.clone().acquire_owned().await.unwrap();
+        let _hog2 = slots.clone().acquire_owned().await.unwrap();
+        let s = slots.clone();
+        let waiter = tokio::spawn(async move {
+            bounded_plan(
+                &s,
+                async { anyhow::Ok(()) },
+                Duration::from_millis(30),
+            )
+            .await
+        });
+        let response = waiter.await.unwrap().unwrap_err();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("No commands were executed"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_planner_slot_wait_timeout_is_returned_without_a_whole_plan_retry() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let _hog1 = slots.clone().acquire_owned().await.unwrap();
+        let _hog2 = slots.clone().acquire_owned().await.unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let response = plan_with_retry_slots(
+            &slots,
+            move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async { anyhow::Ok(()) }
+            },
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        // A whole-plan retry would build a second plan future.
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("available planner slot"), "{text}");
+        assert!(!text.contains("automatic retry"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn planner_calls_are_bounded_to_two_concurrent() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let inside = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let (slots, inside, peak) = (slots.clone(), inside.clone(), peak.clone());
+                tokio::spawn(async move {
+                    bounded_plan(
+                        &slots,
+                        async move {
+                            let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                            anyhow::Ok(())
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            assert!(task.await.unwrap().is_ok());
+        }
+        assert_eq!(inside.load(Ordering::SeqCst), 0);
+        // The semaphore allows at most two planner calls at once, and the
+        // waiting calls above really did run two at a time.
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn planning_deadline_cancels_work_before_execution() {
@@ -1099,7 +1730,9 @@ mod deadline_tests {
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         let guard = PendingWork(cancelled.clone());
+        let slots = tokio::sync::Semaphore::new(2);
         let response = bounded_plan(
+            &slots,
             async move {
                 let _guard = guard;
                 std::future::pending::<anyhow::Result<PlannedRun>>().await
@@ -1120,7 +1753,9 @@ mod deadline_tests {
 
     #[tokio::test]
     async fn provider_failure_is_reported_without_waiting_for_total_deadline() {
-        let response = bounded_plan(
+        let slots = tokio::sync::Semaphore::new(2);
+        let response = bounded_plan::<()>(
+            &slots,
             async { anyhow::bail!("NVIDIA request deadline exceeded") },
             Duration::from_secs(150),
         )
@@ -1133,5 +1768,528 @@ mod deadline_tests {
         assert!(std::str::from_utf8(&body)
             .unwrap()
             .contains("NVIDIA request deadline exceeded"));
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use hive_core::memory::chats::PLANNING_RESTARTED;
+
+    fn handle() -> AgentHandle {
+        let agent = Arc::new(MasterAgent::new(
+            hive_core::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            hive_core::workers::WorkerPool::new(vec![]),
+            hive_core::skills::SkillRegistry::new(),
+            hive_core::memory::MemorySystem::new(),
+        ));
+        AgentHandle::enabled(agent, "test".into()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_turn_interrupted_while_planning_is_planned_again() {
+        let h = handle();
+        let store = h.history.as_ref().unwrap();
+        let chat = store.create(None).unwrap();
+        store.begin(&chat.id, "held", "plan after restart").unwrap();
+
+        let recovery = store.recover_interrupted().unwrap();
+        assert_eq!(recovery.restarted.len(), 1);
+        assert_eq!(store.messages(&chat.id).unwrap()[1].content, PLANNING_RESTARTED);
+        h.restart_planning(recovery.restarted);
+
+        // The model is unreachable, so the re-run planning attempt fails; the
+        // turn only leaves `planning` because planning actually ran again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let turn = loop {
+            let turn = store.turn("held").unwrap().unwrap();
+            if turn.status != "planning" {
+                break turn;
+            }
+            assert!(std::time::Instant::now() < deadline, "planning was never restarted");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(turn.status, "failed");
+        let message = &store.messages(&chat.id).unwrap()[1].content;
+        assert!(message.starts_with("planning failed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_interrupted_while_executing_is_not_run_again() {
+        let h = handle();
+        let store = h.history.as_ref().unwrap();
+        let chat = store.create(None).unwrap();
+        store.begin(&chat.id, "running", "run once").unwrap();
+        store.executing("running", "run-1").unwrap();
+
+        let recovery = store.recover_interrupted().unwrap();
+        assert_eq!(recovery.interrupted, 1);
+        assert!(recovery.restarted.is_empty());
+        h.restart_planning(recovery.restarted);
+        tokio::task::yield_now().await;
+        let message = &store.messages(&chat.id).unwrap()[1];
+        assert_eq!(message.status.as_deref(), Some("interrupted"));
+        assert!(message.content.contains("Some commands may have run"));
+    }
+}
+
+#[cfg(test)]
+mod master_agent_state_tests {
+    use super::*;
+    use crate::{AppState, app_router};
+    use axum::body::Body;
+    use axum::http::{header, Request};
+    use hive_common::config::{CloudLlmConfig, LlmConfig, LocalLlmConfig, NvidiaConfig};
+    use hive_core::llm::LlmRouter;
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    /// Every test that touches `HIVE_MASTER_AGENT_FILE` or `HOME` holds this
+    /// lock: `std::env` is process-global and tests run in parallel.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restores the previous value (or absence) of an env var on drop.
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_private(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{path:?} was mode {mode:o}");
+    }
+
+    /// A fresh temp directory whose `master-agent.json` is wired up as the
+    /// state file via the env override.
+    fn isolated_state_file() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hive-master-agent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("master-agent.json");
+        (file, dir)
+    }
+
+    fn quiet_llm_config() -> LlmConfig {
+        LlmConfig {
+            single_provider: None,
+            nvidia: NvidiaConfig::default(),
+            local: LocalLlmConfig::default(),
+            gemini: None,
+            claude: None,
+            codex: None,
+            zai: None,
+        }
+    }
+
+    #[test]
+    fn save_roundtrips_atomically_and_privately_via_the_env_override() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+
+        save_master_agent_selection("zai", Some("secret-zai-key-1")).unwrap();
+        assert!(file.exists(), "state must land at $HIVE_MASTER_AGENT_FILE");
+        #[cfg(unix)]
+        assert_private(&file);
+        assert!(
+            !file.with_extension("json.tmp").exists(),
+            "no temp file may survive the atomic rename"
+        );
+
+        let state = load_master_agent_state().expect("saved state must load back");
+        assert_eq!(state.provider, "zai");
+        assert_eq!(state.zai_api_key.as_deref(), Some("secret-zai-key-1"));
+
+        // Switching to local must not discard the stored key (merge-on-save).
+        save_master_agent_selection("local", None).unwrap();
+        let state = load_master_agent_state().unwrap();
+        assert_eq!(state.provider, "local");
+        assert_eq!(state.zai_api_key.as_deref(), Some("secret-zai-key-1"));
+        #[cfg(unix)]
+        assert_private(&file);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_state_path_is_dot_hive_in_the_home_directory() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("hive-master-agent-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let _no_override = EnvGuard::remove(MASTER_AGENT_FILE_ENV);
+        let _guard = EnvGuard::set("HOME", home.to_str().unwrap());
+
+        save_master_agent_selection("local", None).unwrap();
+        let file = home.join(".hive").join("master-agent.json");
+        assert!(file.exists(), "default path is $HOME/.hive/master-agent.json");
+        #[cfg(unix)]
+        assert_private(&file);
+
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn corrupt_state_file_is_ignored_and_self_heals_on_the_next_save() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        std::fs::write(&file, "{\"provider\": \"zai\", \"zai_api_key\": \"truncat").unwrap();
+
+        assert!(load_master_agent_state().is_none(), "corrupt JSON loads as nothing");
+
+        // Startup application survives the corrupt file as a no-op.
+        let cfg = quiet_llm_config();
+        let router = LlmRouter::from_config(&cfg);
+        apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(router.current_provider(), hive_common::AiProvider::Local);
+        assert!(!router.zai_configured());
+
+        // The next save rewrites the corrupt file with valid state.
+        save_master_agent_selection("zai", Some("fresh-key")).unwrap();
+        let state = load_master_agent_state().expect("file must be valid again");
+        assert_eq!(state.provider, "zai");
+        assert_eq!(state.zai_api_key.as_deref(), Some("fresh-key"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn startup_restores_a_persisted_selection_when_config_is_silent() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        save_master_agent_selection("zai", Some("persisted-key")).unwrap();
+
+        let cfg = quiet_llm_config();
+        let router = LlmRouter::from_config(&cfg);
+        apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(router.current_provider(), hive_common::AiProvider::Zai);
+        assert!(router.zai_configured());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_selection_overrides_the_configured_default_when_still_usable() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        save_master_agent_selection("zai", Some("persisted-key")).unwrap();
+
+        let mut cfg = quiet_llm_config();
+        cfg.single_provider = Some(hive_common::AiProvider::Local);
+        let router = LlmRouter::from_config(&cfg);
+        let selected = apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(
+            selected,
+            (hive_common::AiProvider::Zai, ProviderSelectionReason::PersistedChoice)
+        );
+        assert_eq!(
+            router.current_provider(),
+            hive_common::AiProvider::Zai,
+            "the persisted provider beats hive.toml single_provider"
+        );
+        assert!(router.zai_configured());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_nvidia_overrides_a_configured_local_default() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        let _nvidia = EnvGuard::set("NVIDIA_API_KEY_FLASH", "test-nvidia-key");
+        save_master_agent_selection("nvidia", None).unwrap();
+
+        let mut cfg = quiet_llm_config();
+        cfg.single_provider = Some(hive_common::AiProvider::Local);
+        let router = LlmRouter::from_config(&cfg);
+        let selected = apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(
+            selected,
+            (hive_common::AiProvider::Nvidia, ProviderSelectionReason::PersistedChoice)
+        );
+        assert_eq!(router.current_provider(), hive_common::AiProvider::Nvidia);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_provider_no_longer_configured_falls_back_to_the_config_default() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        // Saved while NVIDIA was configured; its key is gone at this startup.
+        save_master_agent_selection("nvidia", None).unwrap();
+        let _nvidia = EnvGuard::remove("NVIDIA_API_KEY_FLASH");
+
+        let mut cfg = quiet_llm_config();
+        cfg.single_provider = Some(hive_common::AiProvider::Local);
+        let router = LlmRouter::from_config(&cfg);
+        let selected = apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(
+            selected,
+            (hive_common::AiProvider::Local, ProviderSelectionReason::ConfigDefault)
+        );
+        assert_eq!(router.current_provider(), hive_common::AiProvider::Local);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_a_persisted_file_the_config_default_applies() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        let _nvidia = EnvGuard::set("NVIDIA_API_KEY_FLASH", "test-nvidia-key");
+        assert!(!file.exists());
+
+        let mut cfg = quiet_llm_config();
+        cfg.single_provider = Some(hive_common::AiProvider::Nvidia);
+        let router = LlmRouter::from_config(&cfg);
+        let selected = apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(
+            selected,
+            (hive_common::AiProvider::Nvidia, ProviderSelectionReason::ConfigDefault)
+        );
+        assert_eq!(router.current_provider(), hive_common::AiProvider::Nvidia);
+
+        // With neither a file nor a configured default: legacy fallback.
+        let cfg = quiet_llm_config();
+        let router = LlmRouter::from_config(&cfg);
+        assert_eq!(
+            apply_persisted_master_agent(&router, &cfg),
+            (hive_common::AiProvider::Local, ProviderSelectionReason::Fallback)
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_resolved_keys_win_over_the_persisted_one() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        save_master_agent_selection("zai", Some("file-key")).unwrap();
+
+        let mut cfg = quiet_llm_config();
+        cfg.zai = Some(CloudLlmConfig {
+            api_key: Some("config-key".into()),
+            model: "glm-test".into(),
+            ..CloudLlmConfig::default()
+        });
+        let router = LlmRouter::from_config(&cfg);
+        assert!(router.zai_configured(), "config key already wired up");
+        apply_persisted_master_agent(&router, &cfg);
+        assert_eq!(router.current_provider(), hive_common::AiProvider::Zai);
+        // The client built from `hive.toml` survives: seeding is a no-op
+        // when a key is already configured (asserted against the live
+        // client in the hive-core llm tests; here, provider and configured
+        // state are the observable contract).
+        assert!(router.zai_configured());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_persisted_key_never_builds_a_broken_client() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        std::fs::write(&file, "{\"provider\": \"zai\", \"zai_api_key\": \"  \"}").unwrap();
+
+        let cfg = quiet_llm_config();
+        let router = LlmRouter::from_config(&cfg);
+        apply_persisted_master_agent(&router, &cfg);
+        assert!(!router.zai_configured(), "blank key must not seed a client");
+        assert_eq!(
+            router.current_provider(),
+            hive_common::AiProvider::Local,
+            "restoring zai without any key fails soft and keeps the default"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn settings_api_persists_the_key_but_never_echoes_it() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        let secret = "super-secret-zai-key-e2e";
+
+        let agent = MasterAgent::new(
+            LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            hive_core::workers::WorkerPool::new(vec![]),
+            hive_core::skills::SkillRegistry::new(),
+            hive_core::memory::MemorySystem::new(),
+        );
+        let state = AppState {
+            auth: crate::auth::Auth::new("test-password".into()),
+            agent: AgentHandle {
+                agent: Some(Arc::new(agent)),
+                history: None,
+                master_name: "test".into(),
+            },
+            workers: crate::workers::WorkerIngest::from_env(),
+            incidents: crate::incidents::IncidentReview::new(
+                hive_core::watchdog::incidents::IncidentStore::in_memory().unwrap(),
+            ),
+        };
+        let static_dir =
+            std::env::temp_dir().join(format!("hive-web-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(static_dir.join("login")).unwrap();
+        std::fs::write(static_dir.join("index.html"), "<p>ok</p>").unwrap();
+        let app = app_router(state, static_dir.to_str().unwrap());
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::post("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("password=test-password"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::SEE_OTHER, "password login succeeds");
+        let cookie = login.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let post = app
+            .clone()
+            .oneshot(
+                Request::post("/api/settings/master-agent")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"provider": "zai", "api_key": secret}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(post.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !body.contains(secret),
+            "POST response must never echo the API key: {body}"
+        );
+        let view: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(view["provider"], "zai");
+        assert_eq!(view["options"][1]["configured"], true, "zai now configured");
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::get("/api/settings/master-agent")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !body.contains(secret),
+            "GET response must never include the API key: {body}"
+        );
+        assert!(
+            !body.contains("\"api_key\""),
+            "settings view carries configured booleans only: {body}"
+        );
+
+        // The key did land in the (private) state file.
+        assert!(file.exists());
+        #[cfg(unix)]
+        assert_private(&file);
+        let state = load_master_agent_state().unwrap();
+        assert_eq!(state.zai_api_key.as_deref(), Some(secret));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&static_dir).ok();
+    }
+
+    #[test]
+    fn concurrent_saves_never_lose_the_key_or_leave_temp_files() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (file, dir) = isolated_state_file();
+        let _guard = EnvGuard::set(MASTER_AGENT_FILE_ENV, file.to_str().unwrap());
+        save_master_agent_selection("zai", Some("keeper-key")).unwrap();
+
+        // Eight threads interleaving provider switches and key-carrying
+        // saves: without the save lock one update is lost or the temp-file
+        // renames collide (ENOOENT/clobber); with it every save observes
+        // the previous one's result.
+        let threads: Vec<_> = (0..8usize)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    for round in 0..25usize {
+                        let provider = if (i + round) % 2 == 0 { "local" } else { "zai" };
+                        let key = if (i + round) % 3 == 0 { None } else { Some("keeper-key") };
+                        save_master_agent_selection(provider, key).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let state = load_master_agent_state().expect("final file must parse");
+        assert_eq!(
+            state.zai_api_key.as_deref(),
+            Some("keeper-key"),
+            "merge-on-save must never lose the stored key"
+        );
+        assert!(state.provider == "local" || state.provider == "zai");
+        #[cfg(unix)]
+        assert_private(&file);
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

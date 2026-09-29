@@ -12,6 +12,9 @@ h3 { font-size: 14px; margin: 0 0 10px; color: var(--dim); font-weight: 600; }
 .chip.queued { background: #22262e; color: var(--dim); border-color: var(--line2); }
 .chip.stale { background: transparent; color: #d99a9a; border-color: #5a3434; }
 .chip.done { background: #13291d; color: #7fdca5; border-color: #1f4a31; }
+/* A stalled command can be 300 characters; the title carries all of it. */
+.chip[data-stalled] { display: inline-block; max-width: 48ch; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+.t-stalled { color: #ffc861; overflow-wrap: anywhere; }
 
 .nav-count { margin-left: 6px; background: var(--accent); color: #17120a; border-radius: 999px; font-size: 11px; font-weight: 700; padding: 0 6px; }
 
@@ -101,3 +104,10 @@ pre.cmd { background: #0a0c10; border: 1px solid var(--line); margin: 6px 0; fon
 .ssh-step ul { padding-left: 18px; overflow-wrap: anywhere; }
 .banner.good { border-color: #1f4a31; background: #10201a; color: #bff0d2; }
 .ssh-step .full { width: 100%; margin: 0; }
+
+.relay-audit { overflow-wrap: anywhere; }
+.relay-audit h3 { font-size: 1rem; }
+.relay-audit ol { padding-left: 1.2rem; }
+.relay-audit li { margin-block: .6rem; }
+.coordination .contract-digest { display: block; overflow-wrap: anywhere; margin: .5rem 0 1rem; font-size: .75rem; }
+.coordination pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16rem; overflow: auto; font-size: .75rem; }

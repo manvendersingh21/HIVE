@@ -131,3 +131,24 @@ without losing contract history.
 The result would be a persistent multi-agent workspace: HACP sessions provide
 coordination units, agent profiles provide durable team awareness, and HACP
 contracts protect actual code changes.
+
+## Delegated task roster API
+
+`GET /api/tasks/{id}/team` uses the same authentication as the other `/api`
+routes and returns an array of public profiles for that task, including
+superseded runs for historical ownership. An unknown task returns an empty
+array. Each profile contains `agent_id` (run ID), `key` and `role` (assignment
+key), `agent`, nullable `model`, `device`, `owned_paths`, `current_task`
+(assignment objective), `status`, `dependencies` (assignment keys), and
+`last_seen` (coordinator-observed successful journal sync time in RFC 3339,
+null before first contact). `relay_fingerprint` contains the public relay key
+fingerprint; WP-A was already merged when this implementation began.
+
+The prompt's `peers` projection includes only other non-superseded runs in the
+same task: run ID, key, role, agent, device, owned paths, status, and dependencies.
+It excludes transcripts, runner metadata, objectives, and heartbeat timestamps.
+Initial assignments and subsequent topology messages use the same projection.
+Stable ordering prevents false updates; the runner journal atomically compares
+the projection and queues one same-conversation refresh per transition, so
+retries do not duplicate a refresh and returning to an earlier roster still
+refreshes it. Existing runner lifecycle and idle-session rules still apply.

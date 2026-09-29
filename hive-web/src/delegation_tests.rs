@@ -60,7 +60,8 @@ fn waiting_dependency_with_a_message_to_us_releases_verifier() {
     assert_eq!(ready(&store, &runs[1]), Ok(true));
     // The scheduling exception never consumes the message; launch comes first.
     assert_eq!(store.pending_messages(&runs[1].id).unwrap().len(), 1);
-    store.message_delivered("question").unwrap();
+    let delivery = store.next_delivery(&runs[1].id).unwrap().unwrap();
+    store.message_delivered(&delivery).unwrap();
     assert_eq!(ready(&store, &runs[1]), Ok(false));
 }
 
@@ -251,6 +252,74 @@ with tempfile.TemporaryDirectory() as directory:
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    store.message_delivered("question").unwrap();
+    let delivery = store.next_delivery(&verifier.id).unwrap().unwrap();
+    store.message_delivered(&delivery).unwrap();
     assert!(store.pending_messages(&verifier.id).unwrap().is_empty());
+}
+
+fn paused_with(to: &Run, kind: &str, text: &str) -> Value {
+    let mut snapshot = snapshot("paused-quota");
+    snapshot["metadata"]["quota"] = json!({"agent":"codex","resets_at":1_790_003_600,"message":"You've hit your usage limit."});
+    snapshot["events"] = json!([{
+        "id":"handoff", "seq":1, "kind":"peer",
+        "payload":{"to":to.id,"kind":kind,"text":text}
+    }]);
+    snapshot
+}
+
+#[test]
+fn paused_quota_dependency_keeps_dependents_queued_and_is_not_failed() {
+    let (store, runs) = fixture();
+    sync(&store, &runs[0], &mut snapshot("paused-quota")).unwrap();
+    assert_eq!(store.get(&runs[0].id).unwrap().state, "paused-quota");
+    assert_eq!(ready(&store, &runs[1]), Ok(false));
+    // A progress message that hands nothing over does not release it either.
+    sync(&store, &runs[0], &mut paused_with(&runs[1], "deployment", "Paused on quota; I will push a branch later")).unwrap();
+    assert_eq!(ready(&store, &runs[1]), Ok(false));
+    assert_eq!(store.get(&runs[1].id).unwrap().state, "queued");
+}
+
+#[test]
+fn paused_quota_dependency_that_handed_off_a_branch_or_commit_releases_dependents() {
+    for text in [
+        "Implementation is on branch fix/usage-limit-pause, ready to verify",
+        "Committed 3f9c2ab0 with the parser; verify it",
+    ] {
+        let (store, runs) = fixture();
+        sync(&store, &runs[0], &mut paused_with(&runs[1], "deployment", text)).unwrap();
+        assert_eq!(ready(&store, &runs[1]), Ok(true), "{text}");
+    }
+}
+
+#[test]
+fn a_handoff_from_a_paused_run_cannot_bypass_another_prerequisite() {
+    let (store, mut runs) = fixture();
+    sync(&store, &runs[0], &mut paused_with(&runs[1], "deployment", "branch: fix/x")).unwrap();
+    runs = store.list().unwrap();
+    let mut other = runs[0].clone();
+    other.id = "other".into();
+    other.assignment.key = "other".into();
+    other.state = "paused-quota".into();
+    runs[1].assignment.dependencies.push("other".into());
+    runs.push(other);
+    let messages = store.pending_messages(&runs[1].id).unwrap();
+    assert_eq!(dependency_ready(&runs, &runs[1], &messages), Ok(false));
+}
+
+#[test]
+fn launching_without_session_has_recovery_path() {
+    let (store, runs) = fixture();
+    let run = &runs[0];
+    assert!(LIVE_STATES.contains(&"launching"));
+    assert!(store.claim(&run.id, "runner.py").unwrap());
+    assert_eq!(store.get(&run.id).unwrap().state, "launching");
+    // retry_setup directly on RunStore is refused for launching runs
+    assert!(store.retry_setup(&run.id).is_err());
+    // retry_launching within timeout is refused
+    assert!(store.retry_launching(&run.id, 30).is_err());
+    // Past timeout (tested here with 0 timeout), retry_launching resets state to queued and clears runner_path
+    store.retry_launching(&run.id, 0).unwrap();
+    let recovered = store.get(&run.id).unwrap();
+    assert_eq!(recovered.state, "queued");
+    assert!(recovered.runner_path.is_none());
 }

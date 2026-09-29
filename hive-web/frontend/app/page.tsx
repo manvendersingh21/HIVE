@@ -11,16 +11,16 @@ type Chat = { id: string; title?: string; updated_at?: string };
 type Reply = {
   run?: {
     id: string;
-    steps: {
+    steps?: {
       id: number;
-      command: string;
-      target: { kind: string; worker?: string };
-      risk?: { reason: string };
+      command?: string;
+      target?: { kind?: string; worker?: string };
+      risk?: { reason?: string };
     }[];
   };
   result?: {
-    awaiting_approval: number[];
-    sessions: { session_name: string; worker_name: string }[];
+    awaiting_approval?: number[];
+    sessions?: { session_name: string; worker_name: string }[];
   };
   delegation?: { task_id?: string; runs: Run[] };
 };
@@ -59,6 +59,12 @@ export default function AgentPage() {
   // Refresh failures clear on the next good refresh; `error` reports actions.
   const [loadError, setLoadError] = useState("");
   const [capable, setCapable] = useState(true);
+  // The chat whose inline delete confirmation is open, and how it is going.
+  const [deleting, setDeleting] = useState<{
+    id: string;
+    pending: boolean;
+    error?: string;
+  }>();
   // A chat runs one turn at a time. A message sent meanwhile waits here and
   // goes out when the turn finishes.
   const [queued, setQueued] = useState<{ chat: string; text: string }>();
@@ -119,6 +125,10 @@ export default function AgentPage() {
     setError("");
     setLoadError("");
     setLoading(true);
+    // The URL is the only record of which chat is open, so a reload or a
+    // shared link lands back on it. Replacing keeps Back pointing at whatever
+    // the reader came from rather than at each chat they clicked through.
+    window.history.replaceState(null, "", `?chat=${encodeURIComponent(id)}`);
     try {
       await refresh(id);
       await refreshRuns(id);
@@ -127,6 +137,22 @@ export default function AgentPage() {
     } finally {
       if (activeRef.current === id) setLoading(false);
     }
+  }
+  // The chat the reader asked for is the one the URL names; "New chat" has
+  // none, so the deep link has to go with it.
+  function startNewChat() {
+    activeRef.current = undefined;
+    setActive(undefined);
+    setMessages([]);
+    setRuns([]);
+    setInput("");
+    unqueue();
+    setError("");
+    setLoadError("");
+    setLoading(false);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("chat");
+    window.history.replaceState(null, "", url);
   }
   useEffect(() => {
     void api<{ chat: boolean }>("/api/capabilities")
@@ -221,6 +247,31 @@ export default function AgentPage() {
     setQueued(undefined);
     void submit(queued.text);
   }, [queued, active, busy, loading, messages]);
+  async function removeChat(id: string) {
+    setDeleting({ id, pending: true });
+    try {
+      await api(`/api/chats/${encodeURIComponent(id)}`, { method: "DELETE" });
+      setChats((current) => current.filter((c) => c.id !== id));
+      setDeleting(undefined);
+      if (activeRef.current === id) {
+        activeRef.current = undefined;
+        setActive(undefined);
+        setMessages([]);
+        setRuns([]);
+        setLoadError("");
+        setLoading(false);
+        if (queued?.chat === id) unqueue();
+      }
+      // A deep link to a deleted chat would reopen a 404 on refresh.
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("chat") === id) {
+        url.searchParams.delete("chat");
+        window.history.replaceState(null, "", url);
+      }
+    } catch (e) {
+      setDeleting({ id, pending: false, error: (e as Error).message });
+    }
+  }
   async function approve(runId: string, stepId: number, allowed: boolean) {
     setBusy(true);
     setError("");
@@ -254,20 +305,7 @@ export default function AgentPage() {
         <aside className="chat-sidebar">
           <div className="row">
             <strong className="grow">History</strong>
-            <button
-              disabled={busy}
-              onClick={() => {
-                activeRef.current = undefined;
-                setActive(undefined);
-                setMessages([]);
-                setRuns([]);
-                setInput("");
-                unqueue();
-                setError("");
-                setLoadError("");
-                setLoading(false);
-              }}
-            >
+            <button disabled={busy} onClick={startNewChat}>
               New chat
             </button>
           </div>
@@ -277,17 +315,62 @@ export default function AgentPage() {
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search chats"
           />
-          {chats.map((chat) => (
-            <button
-              disabled={busy}
-              className={`chat-item ${chat.id === active ? "selected" : ""}`}
-              key={chat.id}
-              onClick={() => void open(chat.id)}
-            >
-              <strong>{chat.title || "New chat"}</strong>
-              <small>{chat.updated_at}</small>
-            </button>
-          ))}
+          {chats.map((chat) => {
+            const title = chat.title || "New chat";
+            const confirming = deleting?.id === chat.id;
+            return (
+              <div
+                className={`chat-row ${chat.id === active ? "selected" : ""}`}
+                data-chat-id={chat.id}
+                key={chat.id}
+              >
+                <div className="chat-row-main">
+                  <button
+                    disabled={busy}
+                    className={`chat-item ${chat.id === active ? "selected" : ""}`}
+                    onClick={() => void open(chat.id)}
+                  >
+                    <strong>{title}</strong>
+                    <small>{chat.updated_at}</small>
+                  </button>
+                  {!confirming && (
+                    <button
+                      className="chat-delete"
+                      aria-label="Delete chat"
+                      title={`Delete “${title}”`}
+                      disabled={busy || !!deleting?.pending}
+                      onClick={() => setDeleting({ id: chat.id, pending: false })}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+                {confirming && (
+                  <div className="chat-confirm" role="group" aria-label="Confirm delete chat">
+                    <span className="grow">Delete this chat?</span>
+                    <button
+                      className="danger"
+                      disabled={deleting.pending}
+                      onClick={() => void removeChat(chat.id)}
+                    >
+                      {deleting.pending ? "Deleting…" : "Delete"}
+                    </button>
+                    <button
+                      disabled={deleting.pending}
+                      onClick={() => setDeleting(undefined)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+                {confirming && deleting.error && (
+                  <small role="alert" className="error chat-delete-error">
+                    {deleting.error}
+                  </small>
+                )}
+              </div>
+            );
+          })}
           {chats.length >= offset + 50 && (
             <button onClick={() => void loadChats(query, offset + 50)}>
               Load more
@@ -347,17 +430,17 @@ export default function AgentPage() {
                 ))}
                 {message.status === "awaiting_approval" &&
                   message.reply?.run?.steps
-                    .filter((step) =>
-                      message.reply?.result?.awaiting_approval.includes(
+                    ?.filter((step) =>
+                      (message.reply?.result?.awaiting_approval || []).includes(
                         step.id,
                       ),
                     )
                     .map((step) => (
                       <ApprovalPrompt
                         key={step.id}
-                        title={`Hive wants to run a command on ${step.target.worker || step.target.kind}`}
+                        title={`Hive wants to run a command on ${step.target?.worker || step.target?.kind || "a machine"}`}
                         reason={step.risk?.reason}
-                        command={step.command}
+                        command={step.command || "(command unavailable)"}
                         denyLabel="Deny"
                         busy={busy}
                         onApprove={() => void approve(message.reply!.run!.id, step.id, true)}
