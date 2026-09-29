@@ -3,6 +3,7 @@ import { useCallback, useState } from "react";
 import Link from "next/link";
 import { api } from "../lib/api";
 import { usePoll } from "../lib/poll";
+import { TERMINAL_STATES } from "../lib/runEvents";
 import { sessionUrl } from "./RunView";
 
 type Profile = {
@@ -12,16 +13,16 @@ type Profile = {
   agent: string;
   model: string | null;
   device: string;
-  owned_paths: string[];
+  owned_paths?: string[] | null;
   current_task: string;
   status: string;
-  dependencies: string[];
+  dependencies?: string[] | null;
   last_seen: string | null;
   relay_fingerprint: string;
 };
 
-export function TeamPanel({ taskId, currentId, select }: {
-  taskId: string; currentId: string; select: (id: string) => void;
+export function TeamPanel({ taskId, currentId, select, live = true }: {
+  taskId: string; currentId: string; select: (id: string) => void; live?: boolean;
 }) {
   const [team, setTeam] = useState<Profile[]>();
   const [error, setError] = useState("");
@@ -31,7 +32,7 @@ export function TeamPanel({ taskId, currentId, select }: {
       setError("");
     } catch (e) { setError((e as Error).message); }
   }, [taskId]);
-  usePoll(load, 3000, [load]);
+  usePoll(load, 3000, [load], live || !!team?.some((p) => !TERMINAL_STATES.includes(p.status)));
   return <section className="card" aria-label="Team">
     <h3>Team</h3>
     {error && <p role="alert">{error}</p>}
@@ -42,8 +43,8 @@ export function TeamPanel({ taskId, currentId, select }: {
         aria-current={p.agent_id === currentId ? "page" : undefined}>{p.role}</Link>
       <p>{p.agent} on {p.device} · {p.status}</p>
       <dl>
-        <dt>Owned paths</dt><dd>{p.owned_paths.length ? p.owned_paths.join(", ") : "None assigned"}</dd>
-        <dt>Dependencies</dt><dd>{p.dependencies.length ? p.dependencies.join(", ") : "None"}</dd>
+        <dt>Owned paths</dt><dd>{p.owned_paths?.length ? p.owned_paths.join(", ") : "None assigned"}</dd>
+        <dt>Dependencies</dt><dd>{p.dependencies?.length ? p.dependencies.join(", ") : "None"}</dd>
       </dl>
     </article>)}
   </section>;

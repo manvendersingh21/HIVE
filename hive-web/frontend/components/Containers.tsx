@@ -1,5 +1,5 @@
 "use client";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { api, terminalUrl } from "../lib/api";
 
 type Registered = {
@@ -20,6 +20,8 @@ export function Containers() {
   const [items, setItems] = useState<Registered[]>();
   const [hosts, setHosts] = useState<string[]>([]);
   const [host, setHost] = useState("");
+  const currentHost = useRef(host);
+  currentHost.current = host;
   const [available, setAvailable] = useState<Available[]>();
   const [picked, setPicked] = useState("");
   const [name, setName] = useState("");
@@ -47,12 +49,16 @@ export function Containers() {
     setAvailable(undefined);
     setPicked("");
     setBusy(true);
+    const wanted = host;
     try {
-      setAvailable(
-        await api<Available[]>(`/api/containers/available?host=${encodeURIComponent(host)}`),
+      const list = await api<Available[]>(
+        `/api/containers/available?host=${encodeURIComponent(wanted)}`,
       );
+      // A list for another machine would add its container under this one.
+      if (currentHost.current === wanted) setAvailable(list);
     } catch (e) {
-      setError(`Docker on ${host}: ${(e as Error).message}`);
+      if (currentHost.current === wanted)
+        setError(`Docker on ${wanted}: ${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -189,6 +195,7 @@ export function Containers() {
           <select
             aria-label="Docker machine"
             value={host}
+            disabled={busy}
             onChange={(e) => {
               setHost(e.target.value);
               setAvailable(undefined);
