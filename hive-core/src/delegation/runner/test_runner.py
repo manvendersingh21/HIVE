@@ -43,6 +43,20 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("Never leave background processes attached to the tool's stdout/stderr", observed[0])
         self.assertIn('nohup or setsid and `>file 2>&1 </dev/null`, or avoid background loops', observed[0])
 
+    def test_initial_prompt_contains_user_brief_verbatim_separate_from_objective(self):
+        brief = 'Clone exactly once.\n\nRun `cargo test` with  two spaces preserved.'
+        prompt = runner.initial_prompt(dict(
+            id='run',
+            objective='Implement the planner fix.',
+            user_brief=brief,
+            peers=[],
+        ))
+        self.assertIn(
+            'Planner objective:\nImplement the planner fix.\n\n'
+            'User brief:\n'+brief+'\n\nAssignment metadata:\n',
+            prompt,
+        )
+
     def acceptance_request(self, checks):
         self.j.set('assignment', dict(autonomy='yolo'))
         self.j.emit('acknowledgment', dict(message_id='initial'))
