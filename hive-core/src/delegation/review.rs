@@ -411,7 +411,7 @@ mod tests {
         let id = store.create("task", "chat", &plan).unwrap()[0].id.clone();
         store.sync(&id, &json!({"metadata":{"state":"completed","acceptance_turn":1},"events":[],"approvals":[]})).unwrap();
         store.assess_completion(&id, 1, &[]).unwrap();
-        super::task(&agent, &store, &store.list().unwrap()).await.unwrap();
+        super::task(&agent, &store, &store.list().unwrap().0).await.unwrap();
         let run = store.get(&id).unwrap();
         assert_eq!(run.review["status"], "blocked");
         assert!(run.review["summary"].as_str().unwrap().contains("Objective versus result"));

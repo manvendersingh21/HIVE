@@ -23,7 +23,7 @@ fn snapshot(state: &str) -> Value {
 }
 
 fn sync(store: &RunStore, run: &Run, snapshot: &mut Value) -> anyhow::Result<()> {
-    sync_peer_snapshot(store, run, &store.list()?, snapshot)
+    sync_peer_snapshot(store, run, &store.list()?.0, snapshot)
 }
 
 fn question(to: &Run) -> Value {
@@ -37,7 +37,7 @@ fn question(to: &Run) -> Value {
 
 fn ready(store: &RunStore, run: &Run) -> Result<bool, String> {
     dependency_ready(
-        &store.list().unwrap(),
+        &store.list().unwrap().0,
         run,
         &store.pending_messages(&run.id).unwrap(),
     )
@@ -135,7 +135,7 @@ fn no_agreement_dependency_releases_verifier() {
 fn a_peer_message_cannot_bypass_other_prerequisites_or_hide_failure() {
     let (store, mut runs) = fixture();
     sync(&store, &runs[0], &mut question(&runs[1])).unwrap();
-    runs = store.list().unwrap();
+    runs = store.list().unwrap().0;
     let mut prerequisite = runs[0].clone();
     prerequisite.id = "another-prerequisite".into();
     prerequisite.assignment.key = "another-prerequisite".into();
@@ -164,7 +164,7 @@ fn a_peer_message_cannot_bypass_other_prerequisites_or_hide_failure() {
 fn messages_from_superseded_or_other_task_dependencies_do_not_release_verifier() {
     let (store, mut runs) = fixture();
     sync(&store, &runs[0], &mut question(&runs[1])).unwrap();
-    runs = store.list().unwrap();
+    runs = store.list().unwrap().0;
     let messages = store.pending_messages(&runs[1].id).unwrap();
     runs[0].state = "superseded".into();
     assert_eq!(dependency_ready(&runs, &runs[1], &messages), Ok(false));
@@ -309,7 +309,7 @@ fn paused_quota_dependency_that_handed_off_a_branch_or_commit_releases_dependent
 fn a_handoff_from_a_paused_run_cannot_bypass_another_prerequisite() {
     let (store, mut runs) = fixture();
     sync(&store, &runs[0], &mut paused_with(&runs[1], "deployment", "branch: fix/x")).unwrap();
-    runs = store.list().unwrap();
+    runs = store.list().unwrap().0;
     let mut other = runs[0].clone();
     other.id = "other".into();
     other.assignment.key = "other".into();

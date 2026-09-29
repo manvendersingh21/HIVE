@@ -150,13 +150,22 @@ with tempfile.TemporaryDirectory(prefix='hive-chat-history-') as tmp:
             # Inventory probes can have children still writing into this test's
             # temporary HOME after hive-web exits. Own the whole fixture group
             # and reap it before TemporaryDirectory removes its files.
+            def signal_group(sig):
+                try:
+                    os.killpg(web.pid, sig)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    # Darwin reports EPERM for a zombie-only process group.
+                    # Reaping the leader proves this is an exited server, not
+                    # a live process that this fixture lacks permission to stop.
+                    if web.poll() is None:
+                        raise
             try:
-                try: os.killpg(web.pid, signal.SIGTERM)
-                except ProcessLookupError: pass
+                signal_group(signal.SIGTERM)
                 web.wait(timeout=10)
             finally:
-                try: os.killpg(web.pid, signal.SIGKILL)
-                except ProcessLookupError: pass
+                signal_group(signal.SIGKILL)
                 web.wait(timeout=10)
                 web = None
 
