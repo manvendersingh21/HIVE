@@ -58,6 +58,82 @@ struct EmbedResponse {
 }
 
 impl OllamaClient {
+    /// Private memory must never follow a proxy, redirect, or remote endpoint.
+    /// The ordinary planner client retains its existing routing behaviour.
+    pub fn local_only(base_url: String, model: String) -> anyhow::Result<Self> {
+        let url = reqwest::Url::parse(&base_url)?;
+        let loopback = url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+        anyhow::ensure!(
+            loopback
+                && matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "memory ingestion requires a loopback Ollama URL"
+        );
+        anyhow::ensure!(
+            !model.trim().is_empty() && !model.to_lowercase().contains("cloud"),
+            "memory ingestion requires a locally installed Ollama model"
+        );
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .resolve("localhost", ([127, 0, 0, 1], 0).into())
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .timeout(std::time::Duration::from_secs(120))
+                .build()?,
+            base_url,
+            model,
+            max_context: 8192,
+        })
+    }
+
+    /// Probe once per ingest batch, before sending any transcript. Both models
+    /// must already be installed; ingestion never pulls or signs into models.
+    pub async fn require_local_models(&self, models: &[&str]) -> anyhow::Result<()> {
+        let response: serde_json::Value =
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let response = self
+                    .http
+                    .get(format!("{}/api/tags", self.base_url.trim_end_matches('/')))
+                    .send()
+                    .await?;
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "Ollama model probe failed: {}",
+                    response.status()
+                );
+                Ok::<_, anyhow::Error>(response.json().await?)
+            })
+            .await??;
+        for model in models {
+            let installed = response["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|m| {
+                    let name = m["name"]
+                        .as_str()
+                        .or_else(|| m["model"].as_str())
+                        .unwrap_or("");
+                    (name == *model || name == format!("{model}:latest"))
+                        && m.get("remote_model").is_none()
+                        && m.get("remote_host").is_none()
+                        && !name.to_lowercase().contains("cloud")
+                });
+            anyhow::ensure!(installed, "local Ollama model {model} is unavailable");
+        }
+        Ok(())
+    }
+
     pub fn model_name(&self) -> &str {
         &self.model
     }

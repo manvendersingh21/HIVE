@@ -137,6 +137,11 @@ async fn delete_removes_chat_messages_memory_and_finished_runs() {
     let (keep, _) = f.chat_with_history("failed");
     assert!(f.count(&format!("SELECT count(*) FROM delegated_events WHERE run_id='{}'", runs[0].id)) > 0);
 
+    let memory = &f.handle.agent.as_ref().unwrap().memory;
+    let ingested = memory.ingestor.ingest(chrono::Local::now().date_naive()).await.unwrap();
+    assert_eq!(ingested.runs, 4);
+    assert!(f.count(&format!("SELECT count(*) FROM rag_chunks WHERE conversation_id='run:{}'", runs[0].id)) > 0);
+
     let (status, body) = f.send("DELETE", &format!("/api/chats/{chat}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     assert!(body.is_empty());
@@ -150,6 +155,10 @@ async fn delete_removes_chat_messages_memory_and_finished_runs() {
         format!("SELECT count(*) FROM rag_chunks WHERE conversation_id='{chat}'"),
         format!("SELECT count(*) FROM rag_indexed WHERE conversation_id='{chat}'"),
         format!("SELECT count(*) FROM delegated_runs WHERE conversation_id='{chat}'"),
+        format!("SELECT count(*) FROM memory_ingested WHERE kind='conversation' AND source_id='{chat}'"),
+        format!("SELECT count(*) FROM memory_ingested WHERE kind='run' AND source_id IN ('{}','{}')", runs[0].id, runs[1].id),
+        format!("SELECT count(*) FROM rag_chunks WHERE conversation_id IN ('run:{}','run:{}')", runs[0].id, runs[1].id),
+        format!("SELECT count(*) FROM rag_indexed WHERE conversation_id IN ('run:{}','run:{}')", runs[0].id, runs[1].id),
         format!(
             "SELECT count(*) FROM delegated_events WHERE run_id IN ('{}','{}')",
             runs[0].id, runs[1].id

@@ -12,6 +12,7 @@ mod chat;
 mod containers;
 mod delegation;
 mod incidents;
+mod memory;
 mod sessions;
 mod ssh_setup;
 mod terminal;
@@ -192,6 +193,7 @@ async fn build_agent(master_name: &str) -> (chat::AgentHandle, bool) {
     });
     if handle.agent.is_some() {
         delegation::start(handle.clone());
+        memory::start(&handle);
     }
     (handle, true)
 }
@@ -201,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hive_web=info".into()),
+                .unwrap_or_else(|_| "hive_web=info,hive_core::memory=info".into()),
         )
         .init();
 
@@ -314,6 +316,7 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
             get(chat::get_chat).delete(chat::delete_chat),
         )
         .route("/api/chat", post(chat::chat))
+        .route("/api/memory/ingest", post(memory::ingest))
         .route("/api/chat/{run_id}/approve", post(chat::approve))
         .route("/api/tasks/{id}/team", get(delegation::team))
         .route("/api/runs", get(delegation::list))
@@ -492,6 +495,47 @@ mod router_tests {
             assert_eq!(response.status(), StatusCode::OK, "authenticated {path}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_ingest_requires_authentication_and_returns_durable_counts() {
+        let memory = MemorySystem::new();
+        let conversation = memory.projects.begin_conversation("p", "Saved decision").unwrap();
+        memory.projects.append_message(&conversation.id, "user", "Use local memory").unwrap();
+        let agent = MasterAgent::new(
+            LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            WorkerPool::new(vec![]), SkillRegistry::new(), memory,
+        );
+        let state = AppState {
+            auth: auth::Auth::new("test-password".into()),
+            agent: chat::AgentHandle::enabled(std::sync::Arc::new(agent), "fixture".into()).unwrap(),
+            workers: workers::WorkerIngest::from_env(),
+            incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()), db_ok: true,
+        };
+        let app = app_router(state, "missing-fixture-static");
+        for cookie in ["", "hive_auth=invalid"] {
+            let response = app.clone().oneshot(Request::post("/api/memory/ingest")
+                .header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let login = app.clone().oneshot(Request::post("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("password=test-password")).unwrap()).await.unwrap();
+        let cookie = login.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap();
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            let response = app.clone().oneshot(Request::post("/api/memory/ingest")
+                .header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            results.push(serde_json::from_slice::<Value>(&bytes).unwrap());
+        }
+        assert_eq!(results[0]["conversations"], 1);
+        assert_eq!(results[0]["lessons"], 1);
+        assert_eq!(results[0]["failed"], 0);
+        assert_eq!(results[1]["conversations"], 0);
+        assert_eq!(results[1]["lessons"], 0);
+        assert_eq!(results[1]["watermark"], results[0]["watermark"]);
     }
 
     #[tokio::test]

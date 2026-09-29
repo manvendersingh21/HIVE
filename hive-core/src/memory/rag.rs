@@ -133,6 +133,11 @@ pub struct RagHit {
     pub score: f32,
 }
 
+pub(crate) struct PreparedChunks {
+    pub chunks: Vec<(String, Vec<f32>)>,
+    fingerprint: String,
+}
+
 /// SQLite-backed chunk store with vector search.
 #[derive(Clone)]
 pub struct RagIndex {
@@ -201,16 +206,23 @@ impl RagIndex {
         let chars: Vec<char> = trimmed.chars().collect();
         let mut start = 0;
         while start < chars.len() {
-            let end = (start + chunk_chars).min(chars.len());
-            let mut slice: String = chars[start..end].iter().collect();
-            // Prefer ending on whitespace: a chunk that cuts a word in half
-            // poisons both halves' embeddings.
-            if end < chars.len() {
-                if let Some(cut) = slice.rfind(char::is_whitespace).filter(|&i| i > 0) {
-                    slice.truncate(cut);
+            let mut end = (start + chunk_chars).min(chars.len());
+            // Advance from the boundary actually emitted, not the original
+            // budget boundary, or text after the last whitespace can be lost.
+            if end < chars.len() && !chars[end].is_whitespace() {
+                if let Some(cut) = (start..end)
+                    .rev()
+                    .find(|&i| chars[i].is_whitespace())
+                    .filter(|&i| i > start)
+                {
+                    end = cut;
                 }
             }
-            let slice = slice.trim().to_string();
+            let slice: String = chars[start..end]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
             if !slice.is_empty() {
                 chunks.push(slice);
             }
@@ -231,44 +243,51 @@ impl RagIndex {
         conversation_id: &str,
         transcript: &str,
     ) -> anyhow::Result<usize> {
-        let chunks = self.chunk_text(transcript);
-        let fingerprint = self.fingerprint(transcript);
-        // Embed before deleting the old rows: if the embedder fails midway
-        // the previous index survives intact rather than leaving the
-        // conversation half-indexed.
-        let mut embedded = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            embedded.push((chunk, self.embedder.embed(chunk).await?));
+        let prepared = self.prepare(transcript).await?;
+        let mut db = self.conn.lock().unwrap();
+        let tx = db.transaction()?;
+        self.replace_on(&tx, project_id, conversation_id, &prepared)?;
+        tx.commit()?;
+        Ok(prepared.chunks.len())
+    }
+
+    pub(crate) async fn prepare(&self, transcript: &str) -> anyhow::Result<PreparedChunks> {
+        let mut chunks = Vec::new();
+        for text in self.chunk_text(transcript) {
+            let vector = self.embedder.embed(&text).await?;
+            anyhow::ensure!(
+                !vector.is_empty() && vector.iter().all(|v| v.is_finite()),
+                "invalid embedding vector"
+            );
+            chunks.push((text, vector));
         }
-        {
-            let mut db = self.conn.lock().unwrap();
-            let conn = db.transaction()?;
-            conn.execute(
-                "DELETE FROM rag_chunks WHERE conversation_id = ?1",
-                params![conversation_id],
+        Ok(PreparedChunks {
+            chunks,
+            fingerprint: self.fingerprint(transcript),
+        })
+    }
+
+    pub(crate) fn replace_on(
+        &self,
+        db: &Connection,
+        project: &str,
+        source: &str,
+        prepared: &PreparedChunks,
+    ) -> anyhow::Result<()> {
+        db.execute("DELETE FROM rag_chunks WHERE conversation_id=?1", [source])?;
+        for (i, (text, vector)) in prepared.chunks.iter().enumerate() {
+            db.execute(
+                "INSERT INTO rag_chunks (project_id,conversation_id,chunk_index,text,embedding,dim,provider,model)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![project, source, i as i64, text, encode_f32(vector), vector.len() as i64,
+                    self.embedder.provider(), self.embedder.model()],
             )?;
-            for (i, (text, vec)) in embedded.iter().enumerate() {
-                conn.execute(
-                    "INSERT INTO rag_chunks
-                         (project_id, conversation_id, chunk_index, text, embedding, dim, provider, model)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        project_id,
-                        conversation_id,
-                        i as i64,
-                        text,
-                        encode_f32(vec),
-                        vec.len() as i64, self.embedder.provider(), self.embedder.model()
-                    ],
-                )?;
-            }
-            conn.execute(
-                "INSERT OR REPLACE INTO rag_indexed VALUES (?1, ?2)",
-                params![conversation_id, fingerprint],
-            )?;
-            conn.commit()?;
         }
-        Ok(chunks.len())
+        db.execute(
+            "INSERT OR REPLACE INTO rag_indexed VALUES (?1,?2)",
+            params![source, prepared.fingerprint],
+        )?;
+        Ok(())
     }
 
     /// Embed `query` and return the `top_k` best chunks by cosine, optionally
@@ -322,7 +341,7 @@ impl RagIndex {
         Ok(hits)
     }
 
-    fn fingerprint(&self, text: &str) -> String {
+    pub(crate) fn fingerprint(&self, text: &str) -> String {
         use sha2::{Digest, Sha256};
         format!(
             "{:x}",
@@ -337,7 +356,15 @@ impl RagIndex {
     }
 
     pub fn is_current(&self, conversation: &str, text: &str) -> anyhow::Result<bool> {
-        let db = self.conn.lock().unwrap();
+        self.is_current_on(&self.conn.lock().unwrap(), conversation, text)
+    }
+
+    pub(crate) fn is_current_on(
+        &self,
+        db: &Connection,
+        conversation: &str,
+        text: &str,
+    ) -> anyhow::Result<bool> {
         Ok(db.query_row(
             "SELECT COUNT(*) FROM rag_indexed WHERE conversation_id = ?1 AND fingerprint = ?2",
             params![conversation, self.fingerprint(text)],
@@ -419,6 +446,20 @@ mod tests {
         for c in &chunks {
             assert_eq!(c.chars().next().unwrap().is_whitespace(), false);
         }
+    }
+
+    #[test]
+    fn chunking_with_no_overlap_preserves_words_after_a_short_boundary() {
+        let r = RagIndex::new(
+            KnowledgeGraph::in_memory().unwrap().shared_conn(),
+            Arc::new(HashEmbedder { dim: 8 }),
+            16,
+            0,
+        )
+        .unwrap();
+        let long_word = "x".repeat(60);
+        let text = format!("first {long_word} last");
+        assert_eq!(r.chunk_text(&text).join(" "), text);
     }
 
     #[tokio::test]

@@ -177,7 +177,7 @@ impl AgentHandle {
     }
 
     pub fn enabled(agent: Arc<MasterAgent>, master_name: String) -> anyhow::Result<Self> {
-        let history = ChatStore::new(agent.memory.graph.shared_conn())?;
+        let history = ChatStore::new(agent.memory.graph.shared_conn())?.with_auto_index(agent.memory.clone());
         let recovery = history.recover_interrupted()?;
         let handle = Self {
             agent: Some(agent),
@@ -387,12 +387,23 @@ pub(crate) fn delete_conversation(
                     db.execute(&format!("DELETE FROM {scoped} WHERE task_id IN ({tasks})"), [id])?;
                 }
             }
+            for memory in ["rag_chunks", "rag_indexed"] {
+                if table(memory)? {
+                    db.execute(&format!("DELETE FROM {memory} WHERE conversation_id IN (SELECT 'run:' || id FROM delegated_runs WHERE conversation_id=?1)"), [id])?;
+                }
+            }
+            if table("memory_ingested")? {
+                db.execute(&format!("DELETE FROM memory_ingested WHERE kind='run' AND source_id IN ({runs})"), [id])?;
+            }
             db.execute("DELETE FROM delegated_runs WHERE conversation_id=?1", [id])?;
         }
         for memory in ["rag_chunks", "rag_indexed"] {
             if table(memory)? {
                 db.execute(&format!("DELETE FROM {memory} WHERE conversation_id=?1"), [id])?;
             }
+        }
+        if table("memory_ingested")? {
+            db.execute("DELETE FROM memory_ingested WHERE kind='conversation' AND source_id=?1", [id])?;
         }
         db.execute("DELETE FROM messages WHERE conversation_id=?1", [id])?;
         db.execute("DELETE FROM conversations WHERE id=?1", [id])?;

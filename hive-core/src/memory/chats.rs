@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct ChatStore {
     conn: Arc<Mutex<Connection>>,
+    auto_index: Option<super::MemorySystem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,7 +103,14 @@ impl ChatStore {
                 )?;
             }
         }
-        Ok(Self { conn })
+        Ok(Self { conn, auto_index: None })
+    }
+
+    /// Attach the web completion hook. Persistence succeeds independently of
+    /// inference, and nightly ingestion recovers work interrupted by shutdown.
+    pub fn with_auto_index(mut self, memory: super::MemorySystem) -> Self {
+        self.auto_index = Some(memory);
+        self
     }
 
     /// Called once by the server at startup, never by a read endpoint.
@@ -291,7 +299,17 @@ impl ChatStore {
         let n=tx.execute("UPDATE web_chat_turns SET status=?2,reply=?3 WHERE id=?1 AND status IN ('planning','executing')",params![id,status,reply.map(Value::to_string)])?;
         anyhow::ensure!(n == 1, "Request was already completed or interrupted");
         tx.execute("UPDATE messages SET content=?2 WHERE id=(SELECT assistant_message_id FROM web_chat_turns WHERE id=?1)",params![id,text])?;
+        let conversation: String = tx.query_row("SELECT conversation_id FROM web_chat_turns WHERE id=?1", [id], |r| r.get(0))?;
         tx.commit()?;
+        drop(db);
+        if matches!(status, "completed" | "failed" | "interrupted") {
+            if let Some(memory) = self.auto_index.as_ref().filter(|m| m.ingestor.auto_index()) {
+                let memory = memory.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move { memory.index_saved_conversation(&conversation).await; });
+                }
+            }
+        }
         Ok(())
     }
 }
