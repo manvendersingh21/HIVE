@@ -484,6 +484,155 @@ class Coalescer:
             self.block = []
 
 
+# A tool call with no native event for this long is reported once as stalled.
+# The run stays working: the tool may still finish, and only a person can tell
+# a slow build from one whose output pipe a background process holds open.
+STALL_MINUTES = 10
+STALL_CHECK = 30
+STALL_COMMAND_LIMIT = 300
+
+
+class StallWatchdog:
+    """Reports a tool call that has gone silent, once per silence.
+
+    Adapters call `event` for every native event, naming the tool calls it
+    started or finished (call id -> (tool, command)), or with `running`, the
+    complete set in progress when the protocol reports whole state. `check`
+    runs on a timer; `clock` is injectable so tests need not wait.
+    """
+
+    def __init__(self, journal, clock=time.time, limit=STALL_MINUTES*60):
+        self.j, self.clock, self.limit = journal, clock, limit
+        self.begin()
+
+    def begin(self):
+        self.running, self.last, self.stall = {}, self.clock(), None
+
+    def event(self, started=None, finished=(), running=None):
+        self.last = self.clock()
+        if running is not None:
+            self.running = dict(running)
+        self.running.update(started or {})
+        for ident in finished:
+            self.running.pop(ident, None)
+        self.end()
+
+    def check(self):
+        silent = self.clock() - self.last
+        if not self.running or silent < self.limit:
+            return None
+        minutes = int(silent // 60)
+        if self.stall:
+            # Still the same silence: keep the shown duration current, never re-emit.
+            if minutes != self.stall['silent_minutes']:
+                self.stall = dict(self.stall, silent_minutes=minutes,
+                                  reason='Stalled: '+self.stall['command']+' silent for '+str(minutes)+' min')
+                self.j.set('stall', self.stall)
+            return None
+        tool, command = next(iter(self.running.values()))
+        command = command[:STALL_COMMAND_LIMIT]
+        self.stall = dict(tool=tool, command=command, silent_since=int(self.last), silent_minutes=minutes,
+                          reason='Stalled: '+command+' silent for '+str(minutes)+' min')
+        self.j.set('stall', self.stall)
+        self.j.emit('stalled', self.stall)
+        return self.stall
+
+    def end(self):
+        if self.stall:
+            self.stall = None
+            self.j.set('stall', None)
+
+    async def wait(self, awaitable):
+        """`awaitable`'s result, checking for a stall while it is pending.
+
+        The awaitable is never cancelled by a check, so no queued event or
+        partially read line is lost.
+        """
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=STALL_CHECK)
+                if done:
+                    return task.result()
+                self.check()
+        finally:
+            if not task.done():
+                task.cancel()
+
+
+def watchdog(adapter):
+    if getattr(adapter, 'watchdog', None) is None:
+        adapter.watchdog = StallWatchdog(adapter.j)
+    return adapter.watchdog
+
+
+def tool_command(tool_input):
+    """The command a tool call runs, or its whole input for other tools."""
+    if isinstance(tool_input, dict):
+        for key in ('command', 'CommandLine', 'cmd'):
+            if isinstance(tool_input.get(key), str) and tool_input[key].strip():
+                return tool_input[key]
+    return encode(tool_input)
+
+
+def codex_tool_calls(event):
+    """(started, finished) commandExecution items of a Codex notification."""
+    item = (event.get('params') or {}).get('item') or {}
+    if item.get('type') != 'commandExecution' or not item.get('id'):
+        return {}, ()
+    if event.get('method') == 'item/started':
+        return {item['id']: ('commandExecution', str(item.get('command') or ''))}, ()
+    if event.get('method') == 'item/completed':
+        return {}, (item['id'],)
+    return {}, ()
+
+
+def claude_tool_calls(event):
+    """(started, finished) tool calls of a Claude SDK message.
+
+    The Node bridge forwards SDK messages (`message.content`, typed blocks);
+    the Python bridge flattens dataclasses (`content`, untyped blocks).
+    """
+    content = (event.get('message') or {}).get('content') if isinstance(event.get('message'), dict) else event.get('content')
+    started, finished = {}, []
+    for block in content if isinstance(content, list) else ():
+        if not isinstance(block, dict):
+            continue
+        if block.get('type') == 'tool_use' or ('type' not in block and {'id', 'name', 'input'} <= set(block)):
+            started[block['id']] = (str(block['name']), tool_command(block.get('input')))
+        elif block.get('tool_use_id'):
+            finished.append(block['tool_use_id'])
+    return started, finished
+
+
+def cursor_tool_calls(event):
+    """(started, finished) of a Cursor stream-json `tool_call` event."""
+    if event.get('type') != 'tool_call' or not event.get('call_id'):
+        return {}, ()
+    if event.get('subtype') == 'completed':
+        return {}, (event['call_id'],)
+    body = event.get('tool_call') or {}
+    key = next((k for k in body if k.endswith('ToolCall')), None) if isinstance(body, dict) else None
+    call = (body.get(key) or {}) if key else {}
+    name = key[:-len('ToolCall')] if key else 'tool'
+    return {event['call_id']: (name, tool_command(call.get('args') if isinstance(call, dict) else None))}, ()
+
+
+def opencode_tool_calls(messages, chain):
+    """Tool parts still pending or running in this turn's assistant messages."""
+    running = {}
+    for message in messages:
+        info = message.get('info') or {}
+        if info.get('role') != 'assistant' or info.get('parentID') not in chain:
+            continue
+        for part in message.get('parts', []):
+            state = part.get('state') or {}
+            if part.get('type') == 'tool' and state.get('status') in ('pending', 'running'):
+                ident = part.get('callID') or part.get('id') or encode(part)
+                running[ident] = (str(part.get('tool')), tool_command(state.get('input')))
+    return running
+
+
 def agent_environment(adapter, base=None):
     """The native agent's environment: the runner's plus the run credential.
 
@@ -926,12 +1075,21 @@ class Codex(JsonProcess):
         return QuotaPaused('codex', resets_at, message)
 
     async def turn(self, prompt):
-        await self.rpc('turn/start', dict(threadId=self.native, input=[dict(type='text', text=prompt)]))
+        stall = watchdog(self)
+        stall.begin()
+        try:
+            await self.rpc('turn/start', dict(threadId=self.native, input=[dict(type='text', text=prompt)]))
+            await self.events(stall)
+        finally:
+            stall.end()
+
+    async def events(self, stall):
         limited = None
         while True:
-            event = await self.notifications.get()
+            event = await stall.wait(self.notifications.get())
             if 'disconnected' in event:
                 raise RuntimeError(event['disconnected'])
+            stall.event(*codex_tool_calls(event))
             method, params = event.get('method', ''), event.get('params', {})
             if method == 'account/rateLimits/updated' and isinstance(params.get('rateLimits'), dict):
                 usage = usage_snapshot('codex', params['rateLimits'], self.j.get('usage'))
@@ -958,6 +1116,8 @@ class Codex(JsonProcess):
                     if method == 'item/fileChange/requestApproval':
                         action['changes'] = self.items.get(params.get('itemId'), {}).get('changes')
                     allowed = await permission(self.j, method, action, self.a['workspace'])
+                    # Time spent waiting for a person is not tool silence.
+                    stall.event()
                     await self.send(dict(id=event['id'], result=dict(decision='accept' if allowed else ('decline' if 'decline' in params.get('availableDecisions', ['decline']) else 'cancel'))))
                 else:
                     await self.send(dict(id=event['id'], error=dict(code=-32601, message='Unsupported control; action denied')))
@@ -983,13 +1143,23 @@ class Claude(JsonProcess):
         await self.send(dict(type='configure', assignment=assignment, resume=journal.get('native_conversation_id')))
 
     async def turn(self, prompt):
-        await self.send(dict(type='prompt', text=prompt))
+        stall = watchdog(self)
+        stall.begin()
+        try:
+            await self.send(dict(type='prompt', text=prompt))
+            await self.events(stall)
+        finally:
+            stall.end()
+
+    async def events(self, stall):
         while True:
-            event = await self.notifications.get()
+            event = await stall.wait(self.notifications.get())
             if 'disconnected' in event:
                 raise RuntimeError(event['disconnected'])
+            stall.event(*claude_tool_calls(event))
             if event.get('type') == 'permission':
                 allowed = await permission(self.j, event['tool'], event['input'], self.a['workspace'])
+                stall.event()
                 await self.send(dict(type='decision', id=event['request_id'], allowed=allowed))
             elif event.get('type') == 'peer':
                 if event.get('to') not in [p['id'] for p in self.j.get('assignment').get('peers', [])]:
@@ -1161,15 +1331,18 @@ class Cursor:
                 if text:
                     errors.append(text)
         drained = asyncio.create_task(drain_stderr())
+        stall = watchdog(self)
+        stall.begin()
         try:
             while True:
-                raw = await self.proc.stdout.readline()
+                raw = await stall.wait(self.proc.stdout.readline())
                 if not raw:
                     break
                 try:
                     event = json.loads(raw)
                 except ValueError:
                     continue
+                stall.event(*cursor_tool_calls(event))
                 stream.add(event)
                 kind = event.get('type')
                 if kind == 'error':
@@ -1194,6 +1367,7 @@ class Cursor:
             if result.get('is_error') or result.get('subtype') != 'success':
                 raise RuntimeError('Cursor turn ended with '+str(result.get('subtype'))+': '+str(result.get('error') or result.get('result', ''))[:2000])
         finally:
+            stall.end()
             stream.flush()
             if self.proc.returncode is None:
                 self.proc.kill()
@@ -1348,6 +1522,15 @@ class OpenCode:
         # earlier messages out of the newest page. Creation times, not ids,
         # order them: the 48-bit id timestamp wraps.
         chain = {message_id}
+        stall = watchdog(self)
+        stall.begin()
+        try:
+            await self.poll(message_id, started, actions, chain, stall)
+        finally:
+            stall.end()
+
+    async def poll(self, message_id, started, actions, chain, stall):
+        seen = None
         while True:
             for request in await self.http('GET', '/permission'):
                 if request.get('sessionID') != self.native:
@@ -1379,6 +1562,7 @@ class OpenCode:
                     tool = 'opencode-permission/'+request['permission']
                     arguments = dict(request=request, tool_input=arguments)
                 allowed = await permission(self.j, tool, arguments, self.a['workspace'])
+                stall.event()
                 await self.http('POST', '/permission/'+request['id']+'/reply', {'reply': 'once' if allowed else 'reject'})
             # OpenCode returns the newest `limit` messages in chronological order.
             messages = await self.http('GET', '/session/'+self.native+'/message?limit=100')
@@ -1387,6 +1571,14 @@ class OpenCode:
                 created = (info.get('time') or {}).get('created')
                 if info.get('role') == 'user' and info.get('id') and isinstance(created, (int, float)) and created >= started:
                     chain.add(info['id'])
+            # Journaled revisions skip streaming text and tool output; any
+            # change to the polled messages is activity.
+            digest = hashlib.sha256(encode(messages).encode()).hexdigest()
+            if digest != seen:
+                seen = digest
+                stall.event(running=opencode_tool_calls(messages, chain))
+            else:
+                stall.check()
             terminal = []
             for message in messages:
                 info = message.get('info', {})
@@ -1593,7 +1785,10 @@ async def run(assignment, journal):
         prompt = ('You are the real worker for this Hive assignment. Work only on your assigned device and workspace. '
                   'Implement, test, and verify the acceptance criteria. Keep services independent of this process. '
                   'Use the native hive peer tool when available, otherwise the peer command below, for questions, answers, interface agreements, and deployment results; '
-                  'never impersonate peers or SSH into their machines. After a peer question, end this turn briefly if a reply is needed; Hive delivers it into this same session. Do not sleep or poll for peer replies. Include evidence and actual commands in your final response.\n'
+                  'never impersonate peers or SSH into their machines. After a peer question, end this turn briefly if a reply is needed; Hive delivers it into this same session. Do not sleep or poll for peer replies. '
+                  'Never leave background processes attached to the tool\'s stdout/stderr: the tool call cannot finish while one holds its output open. '
+                  'Start them with nohup or setsid and `>file 2>&1 </dev/null`, or avoid background loops. '
+                  'Include evidence and actual commands in your final response.\n'
                   + encode(assignment)+'\nPeer command: '+shlex.join([sys.executable, str(Path(__file__).resolve()), 'peer', '--run-id', assignment['id']])
                   +' --to PEER_RUN_ID --kind question|answer|agreement|deployment --body "message"\nTeam (peer roles, owned paths, status and dependencies): '+encode(peers))
         if not journal.db.execute("SELECT 1 FROM inbox WHERE id='initial'").fetchone():
@@ -1866,6 +2061,10 @@ def main():
     if args.operation == 'peer':
         peer(ident, args, credential)
         return
+    # Reads must not create a journal: during launch the runner has not made
+    # one yet, and an empty journal would be reported as a run with no state.
+    if args.operation in ('snapshot', 'acceptance') and not (BASE/ident/'journal.db').is_file():
+        raise SystemExit('No journal yet for run '+ident)
     journal = Journal(BASE/ident)
     if args.operation == 'mcp':
         mcp_peer(journal)

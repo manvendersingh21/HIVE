@@ -7,9 +7,12 @@ import {
   RunEvent,
   TERMINAL_STATES,
   Quota,
+  Stall,
+  activeStall,
   describeAction,
   lastError,
   pausedLabel,
+  stalledLabel,
   stateTone,
   transcript,
 } from "../lib/runEvents";
@@ -49,6 +52,7 @@ export type Run = {
     actual_model?: string;
     approvals?: Approval[];
     quota?: Quota | null;
+    stall?: Stall | null;
   };
   review?: { status?: string; summary?: string } | null;
   contracts?: Agreement[];
@@ -74,14 +78,22 @@ const STATE_LABELS: Record<string, string> = {
   "verifying": "Checking acceptance",
   "no_agreement": "No agreement",
 };
-// With its run, a quota pause names the agent and when its quota resets.
+// With its run, a quota pause names the agent and when its quota resets, and a
+// stalled tool call names its command.
 export function StateChip({ state, run }: { state: string; run?: Run }) {
-  const label =
-    state === "paused-quota" && run
+  const stall = run && activeStall(state, run.metadata?.stall);
+  const label = stall
+    ? stalledLabel(stall)
+    : state === "paused-quota" && run
       ? pausedLabel(run.metadata?.quota || undefined, run.assignment.agent)
       : STATE_LABELS[state] || state;
   return (
-    <span className={`chip ${stateTone(state)}`} data-state={state}>
+    <span
+      className={`chip ${stall ? "attention" : stateTone(state)}`}
+      data-state={state}
+      data-stalled={stall ? "" : undefined}
+      title={stall ? label : undefined}
+    >
       {label}
     </span>
   );
@@ -288,6 +300,7 @@ export function RunAttention({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const pending = (run.metadata?.approvals || []).filter((a) => !a.consumed);
+  const stall = activeStall(run.state, run.metadata?.stall);
   const failure =
     run.metadata?.error || (events && run.state === "failed" ? lastError(events) : undefined);
   const waitingOn = (run.assignment.dependencies || []).map((key) => ({
@@ -325,6 +338,16 @@ export function RunAttention({
         <div className="banner bad" role="alert">
           <strong>Why it failed</strong>
           <div>{failure}</div>
+        </div>
+      )}
+      {stall && (
+        <div className="banner" role="status" data-testid="tool-stalled">
+          <strong>{stalledLabel(stall)}</strong>
+          <div>
+            The agent&apos;s {stall.tool || "tool"} call is still running but has produced nothing.
+            A background process left attached to its output can keep it from ever finishing;
+            the run stays working until it does. Message the agent or stop the session.
+          </div>
         </div>
       )}
       {run.state === "paused-quota" && (
@@ -484,6 +507,8 @@ function EntryView({ entry }: { entry: Entry }) {
       );
     case "error":
       return <div className="t-error">{entry.text}</div>;
+    case "stalled":
+      return <div className="t-state t-stalled">{entry.text}</div>;
     case "result":
       return (
         entry.error ? (

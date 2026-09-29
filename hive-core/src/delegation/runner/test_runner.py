@@ -39,6 +39,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(observed), 1)
         team = observed[0].split('Team (peer roles, owned paths, status and dependencies): ')[1]
         self.assertEqual(json.loads(team), [peer])
+        # BUG18: a background loop holding the tool's output pipe kept a finished call running.
+        self.assertIn("Never leave background processes attached to the tool's stdout/stderr", observed[0])
+        self.assertIn('nohup or setsid and `>file 2>&1 </dev/null`, or avoid background loops', observed[0])
 
     def acceptance_request(self, checks):
         self.j.set('assignment', dict(autonomy='yolo'))
@@ -204,6 +207,17 @@ class RunnerTests(unittest.TestCase):
             assignment['objective']='changed'
             with patch.object(runner.sys,'argv',['runner.py','launch','--run-id',ident]), patch.object(runner.sys,'stdin',io.StringIO(json.dumps(assignment))), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ValueError):
                 runner.main()
+
+    def test_reads_of_a_run_without_journal_never_create_one(self):
+        import uuid
+        ident=str(uuid.uuid4())
+        base=self.root/'.hive/runs'
+        with patch.object(Path,'home',return_value=self.root), patch.object(runner,'BASE',base):
+            for operation in ('snapshot','acceptance'):
+                with patch.object(runner.sys,'argv',['runner.py',operation,'--run-id',ident]), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        runner.main()
+        self.assertFalse((base/ident).exists())
 
     def test_safe_compounds_and_dangerous_variants(self):
         for command in ('pwd && ls -la', 'python3 -m py_compile app.py; git status --short', 'tailscale status 2>/dev/null | head -20'):

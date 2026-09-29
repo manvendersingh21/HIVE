@@ -946,5 +946,241 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
             launch.assert_not_called()
 
 
+class Clock:
+    def __init__(self, now=1_790_000_000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, minutes):
+        self.now += minutes*60
+
+
+class StallWatchdogContracts(unittest.IsolatedAsyncioTestCase):
+    """BUG18: a background loop inherited a bash tool's output pipe, so the
+    finished build's tool call never saw EOF and the run sat 'working'."""
+
+    BUILD = "/bin/zsh -lc 'cargo build --workspace --locked; ( while true; do date; sleep 20; done > progress.log ) &'"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.ident = str(uuid.uuid4())
+        self.j = runner.Journal(self.root / self.ident)
+        self.j.quiet = True
+        self.assignment = dict(id=self.ident, agent='codex', workspace=str(self.root), objective='test')
+        self.j.set('assignment', self.assignment)
+        self.clock = Clock()
+        self.watchdog = runner.StallWatchdog(self.j, clock=self.clock)
+
+    def tearDown(self):
+        self.j.db.close()
+        self.temp.cleanup()
+
+    def stalled(self):
+        return [json.loads(row[0]) for row in self.j.db.execute("SELECT payload FROM events WHERE kind='stalled' ORDER BY seq")]
+
+    def test_a_silent_tool_stalls_exactly_once_and_names_its_command(self):
+        self.watchdog.event(started={'call_1': ('commandExecution', self.BUILD)})
+        self.clock.advance(runner.STALL_MINUTES - 0.5)
+        self.assertIsNone(self.watchdog.check())
+        self.assertEqual(self.stalled(), [])
+        self.clock.advance(0.5)
+        self.watchdog.check()
+        for _ in range(20):
+            self.clock.advance(1)
+            self.watchdog.check()
+        stalled = self.stalled()
+        self.assertEqual(len(stalled), 1)
+        self.assertEqual(stalled[0]['tool'], 'commandExecution')
+        self.assertEqual(stalled[0]['command'], self.BUILD)
+        self.assertEqual(stalled[0]['silent_minutes'], runner.STALL_MINUTES)
+        self.assertEqual(stalled[0]['reason'], 'Stalled: '+self.BUILD+' silent for 10 min')
+        # The run's metadata keeps the current silence; the event is not repeated.
+        self.assertEqual(self.j.get('stall')['silent_minutes'], runner.STALL_MINUTES+20)
+        self.assertEqual(self.j.get('stall')['reason'], 'Stalled: '+self.BUILD+' silent for 30 min')
+
+    def test_the_command_is_bounded(self):
+        self.watchdog.event(started={'call_1': ('bash', 'x'*1000)})
+        self.clock.advance(runner.STALL_MINUTES)
+        stall = self.watchdog.check()
+        self.assertEqual(len(stall['command']), 300)
+        self.assertEqual(self.j.get('stall')['command'], 'x'*300)
+
+    def test_new_output_clears_the_stall_and_a_fresh_one_needs_another_full_silence(self):
+        self.watchdog.event(started={'call_1': ('bash', 'cargo build')})
+        self.clock.advance(runner.STALL_MINUTES)
+        self.watchdog.check()
+        self.assertEqual(len(self.stalled()), 1)
+        self.watchdog.event()
+        self.assertIsNone(self.j.get('stall'))
+        self.clock.advance(runner.STALL_MINUTES - 1)
+        self.watchdog.check()
+        self.assertEqual(len(self.stalled()), 1)
+        self.clock.advance(1)
+        self.watchdog.check()
+        self.assertEqual(len(self.stalled()), 2)
+
+    def test_no_stall_while_events_keep_flowing_or_no_tool_runs(self):
+        self.watchdog.event(started={'call_1': ('bash', 'cargo test')})
+        for _ in range(120):
+            self.clock.advance(1)
+            self.watchdog.event()
+            self.watchdog.check()
+        self.watchdog.event(finished=['call_1'])
+        self.clock.advance(runner.STALL_MINUTES*6)
+        self.watchdog.check()
+        self.assertEqual(self.stalled(), [])
+        self.assertIsNone(self.j.get('stall'))
+
+    def test_recorded_shapes_name_their_tool_and_command(self):
+        started = dict(method='item/started', params=dict(threadId='thr', turnId='turn', item=dict(
+            type='commandExecution', id='call_1', command=self.BUILD, cwd='/w', status='inProgress',
+            commandActions=[], aggregatedOutput=None, exitCode=None)))
+        completed = dict(started, method='item/completed')
+        agent = dict(method='item/started', params=dict(item=dict(type='agentMessage', id='msg_1', text='')))
+        self.assertEqual(runner.codex_tool_calls(started), ({'call_1': ('commandExecution', self.BUILD)}, ()))
+        self.assertEqual(runner.codex_tool_calls(completed), ({}, ('call_1',)))
+        self.assertEqual(runner.codex_tool_calls(agent), ({}, ()))
+        # Node bridge: SDK messages. Python bridge: flattened dataclasses.
+        node_use = dict(type='assistant', message=dict(content=[dict(type='text', text='Building'),
+            dict(type='tool_use', id='toolu_1', name='Bash', input=dict(command='cargo build'))]))
+        python_use = dict(type='assistant', content=[dict(text='Building'),
+            dict(id='toolu_2', name='Read', input=dict(file_path='a.py'))])
+        node_result = dict(type='user', message=dict(content=[dict(type='tool_result', tool_use_id='toolu_1', content='ok')]))
+        python_result = dict(type='user', content=[dict(tool_use_id='toolu_2', content='x', is_error=False)])
+        self.assertEqual(runner.claude_tool_calls(node_use), ({'toolu_1': ('Bash', 'cargo build')}, []))
+        self.assertEqual(runner.claude_tool_calls(python_use), ({'toolu_2': ('Read', '{"file_path":"a.py"}')}, []))
+        self.assertEqual(runner.claude_tool_calls(node_result), ({}, ['toolu_1']))
+        self.assertEqual(runner.claude_tool_calls(python_result), ({}, ['toolu_2']))
+        self.assertEqual(runner.claude_tool_calls(dict(type='user', message=dict(content='prompt'))), ({}, []))
+        shell = dict(shellToolCall=dict(args=dict(command='ls -la')))
+        self.assertEqual(runner.cursor_tool_calls(dict(type='tool_call', subtype='started', call_id='c1', tool_call=shell)),
+                         ({'c1': ('shell', 'ls -la')}, ()))
+        self.assertEqual(runner.cursor_tool_calls(dict(type='tool_call', subtype='completed', call_id='c1', tool_call=shell)),
+                         ({}, ('c1',)))
+
+    async def test_codex_turn_reports_a_silent_command_once_and_clears_on_output(self):
+        adapter = runner.Codex()
+        adapter.a, adapter.j, adapter.native, adapter.items = self.assignment, self.j, 'thr', {}
+        adapter.notifications = asyncio.Queue()
+        adapter.rpc, adapter.send = AsyncMock(), AsyncMock()
+        adapter.watchdog = self.watchdog
+        item = dict(type='commandExecution', id='call_1', command=self.BUILD, cwd='/w', status='inProgress')
+        put = adapter.notifications.put_nowait
+        put(dict(method='turn/started', params=dict(threadId='thr', turn=dict(id='turn', status='inProgress'))))
+        put(dict(method='item/started', params=dict(threadId='thr', turnId='turn', item=item)))
+        with patch.object(runner, 'STALL_CHECK', 0.01):
+            turn = asyncio.create_task(adapter.turn('build'))
+            await asyncio.sleep(0.05)
+            self.assertEqual(self.stalled(), [])
+            self.clock.advance(runner.STALL_MINUTES)
+            await asyncio.sleep(0.1)
+            self.assertEqual(len(self.stalled()), 1)
+            self.assertEqual(self.j.get('stall')['command'], self.BUILD)
+            put(dict(method='item/commandExecution/outputDelta', params=dict(itemId='call_1', delta='Finished\n')))
+            await asyncio.sleep(0.05)
+            self.assertIsNone(self.j.get('stall'))
+            self.clock.advance(runner.STALL_MINUTES)
+            await asyncio.sleep(0.1)
+            self.assertEqual(len(self.stalled()), 2)
+            put(dict(method='item/completed', params=dict(threadId='thr', turnId='turn', item=dict(item, status='completed', exitCode=0))))
+            put(dict(method='turn/completed', params=dict(threadId='thr', turn=dict(id='turn', status='completed', error=None))))
+            await asyncio.wait_for(turn, 1)
+        self.assertEqual(len(self.stalled()), 2)
+        self.assertIsNone(self.j.get('stall'))
+        # The turn's own events are all still journaled: checks lose nothing.
+        methods = [json.loads(row[0]).get('method') for row in self.j.db.execute("SELECT payload FROM events WHERE kind='native' ORDER BY seq")]
+        self.assertEqual(methods, ['turn/started', 'item/started', 'item/commandExecution/outputDelta', 'item/completed', 'turn/completed'])
+
+    async def test_codex_time_waiting_for_an_approval_is_not_a_stall(self):
+        adapter = runner.Codex()
+        adapter.a, adapter.j, adapter.native, adapter.items = self.assignment, self.j, 'thr', {}
+        adapter.notifications = asyncio.Queue()
+        adapter.rpc, adapter.send = AsyncMock(), AsyncMock()
+        adapter.watchdog = self.watchdog
+        async def decided_after_half_an_hour(*args):
+            self.clock.advance(30)
+            return True
+        item = dict(type='commandExecution', id='call_1', command='cargo publish', status='inProgress')
+        put = adapter.notifications.put_nowait
+        put(dict(method='item/started', params=dict(threadId='thr', turnId='turn', item=item)))
+        put(dict(id=7, method='item/commandExecution/requestApproval', params=dict(threadId='thr', itemId='call_1', command='cargo publish')))
+        with patch.object(runner, 'STALL_CHECK', 0.01), patch.object(runner, 'permission', new=decided_after_half_an_hour):
+            turn = asyncio.create_task(adapter.turn('publish'))
+            await asyncio.sleep(0.1)
+            self.assertEqual(self.stalled(), [])
+            put(dict(method='item/completed', params=dict(threadId='thr', turnId='turn', item=dict(item, status='completed', exitCode=0))))
+            put(dict(method='turn/completed', params=dict(threadId='thr', turn=dict(id='turn', status='completed', error=None))))
+            await asyncio.wait_for(turn, 1)
+        self.assertEqual(self.stalled(), [])
+
+    async def test_claude_turn_with_flowing_events_never_stalls(self):
+        adapter = runner.Claude()
+        adapter.a, adapter.j = self.assignment, self.j
+        adapter.notifications = asyncio.Queue()
+        adapter.send = AsyncMock()
+        adapter.watchdog = self.watchdog
+        with patch.object(runner, 'STALL_CHECK', 0.01):
+            turn = asyncio.create_task(adapter.turn('build'))
+            adapter.notifications.put_nowait(dict(type='assistant', message=dict(content=[
+                dict(type='tool_use', id='toolu_1', name='Bash', input=dict(command='cargo build'))])))
+            for _ in range(30):
+                await asyncio.sleep(0.02)
+                self.clock.advance(1)
+                adapter.notifications.put_nowait(dict(type='system', subtype='status'))
+            await asyncio.sleep(0.05)
+            self.assertEqual(self.stalled(), [])
+            self.clock.advance(runner.STALL_MINUTES)
+            await asyncio.sleep(0.1)
+            self.assertEqual([s['tool'] for s in self.stalled()], ['Bash'])
+            adapter.notifications.put_nowait(dict(type='user', message=dict(content=[dict(type='tool_result', tool_use_id='toolu_1', content='ok')])))
+            adapter.notifications.put_nowait(dict(type='result', subtype='success', is_error=False, result='done'))
+            await asyncio.wait_for(turn, 1)
+        self.assertEqual(len(self.stalled()), 1)
+        self.assertIsNone(self.j.get('stall'))
+
+    async def test_opencode_running_bash_part_stalls_once_per_silence(self):
+        adapter = runner.OpenCode()
+        adapter.j, adapter.a = self.j, dict(self.assignment, agent='opencode')
+        adapter.native = 'ses_native'
+        adapter.model = dict(providerID='provider', modelID='model')
+        adapter.watchdog = self.watchdog
+        message_id, polls, observed = None, 0, []
+        def tool(status, output=''):
+            return dict(type='tool', tool='bash', callID='call_1', state=dict(
+                status=status, input=dict(command=self.BUILD, description='Build'),
+                metadata=dict(output=output), time=dict(start=1)))
+        async def http(method, path, body=None):
+            nonlocal message_id, polls
+            if path.endswith('/prompt_async'):
+                message_id = body['messageID']
+            elif path == '/permission':
+                return []
+            elif '?limit=' in path:
+                polls += 1
+                # Poll: 1 starts the tool; 2 is silent for a full interval; 3 is
+                # silent still; 4 has new output; 5 is silent for less than an
+                # interval, 6 for a full one; 7 finishes the tool and the turn.
+                self.clock.advance({2: runner.STALL_MINUTES, 3: 5, 5: runner.STALL_MINUTES-1, 6: 1}.get(polls, 0))
+                output = 'Compiling' if polls < 4 else 'Compiling\nFinished'
+                done = polls >= 7
+                info = dict(id='msg_reply', role='assistant', parentID=message_id, time=dict(created=1, **({'completed': 2} if done else {})),
+                            finish='stop' if done else None, providerID='provider', modelID='model')
+                return [dict(info=info, parts=[tool('completed' if done else 'running', output)])]
+            elif path == '/session/status':
+                observed.append(len(self.stalled()))
+                return {adapter.native: dict(type='idle' if polls >= 7 else 'busy')}
+            else:
+                self.fail(path)
+        adapter.http = AsyncMock(side_effect=http)
+        with patch.object(runner.asyncio, 'sleep', new=AsyncMock()):
+            await adapter.turn('build')
+        self.assertEqual(observed, [0, 1, 1, 1, 1, 2, 2])
+        self.assertEqual([(s['tool'], s['command']) for s in self.stalled()], [('bash', self.BUILD)]*2)
+        self.assertIsNone(self.j.get('stall'))
+
+
 if __name__ == '__main__':
     unittest.main()
