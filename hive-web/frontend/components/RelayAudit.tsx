@@ -11,11 +11,11 @@ type Audit = {
   head: { position: number; digest: string };
   entries: { digest: string; record: {
     position: number; event: string; at: string; message_id: string;
-    seq: number; detail: { reason?: string };
+    seq: number; detail?: { reason?: string } | null;
   } }[];
 };
 
-export function RelayAudit({ run }: { run: Run }) {
+export function RelayAudit({ run, live = true }: { run: Run; live?: boolean }) {
   const [audit, setAudit] = useState<Audit>();
   const [error, setError] = useState("");
   const load = useCallback(async () => {
@@ -24,7 +24,7 @@ export function RelayAudit({ run }: { run: Run }) {
       setError("");
     } catch (e) { setError((e as Error).message); }
   }, [run.id]);
-  usePoll(load, 5000, [load]);
+  usePoll(load, 5000, [load], live);
   return (
     <section className="card relay-audit" aria-label="Relay audit">
       <h3>Relay-attested (HACP Secure degraded mode)</h3>
@@ -43,7 +43,7 @@ export function RelayAudit({ run }: { run: Run }) {
             {audit.entries.map(({ record, digest }) => <li key={record.position}>
               <strong>{record.event}</strong> · {record.at} · sequence {record.seq}
               <div className="mono small">{record.message_id}</div>
-              {record.detail.reason && <p>{record.detail.reason}</p>}
+              {record.detail?.reason && <p>{record.detail.reason}</p>}
               <details><summary>Row digest</summary><code>{digest}</code></details>
             </li>)}
           </ol>}
