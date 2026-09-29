@@ -198,7 +198,7 @@ test("F-07 the topbar with an attention badge fits a 390px viewport", async ({ p
   expect(width.scroll).toBeLessThanOrEqual(390);
 });
 
-test("F-08 the selected chat is kept in the URL and survives reload and Back", async ({ page }) => {
+test("F-08 the selected chat is kept in the URL and survives reload, Back and Forward", async ({ page }) => {
   await sessionApi(page);
   await page.goto("/");
   await page.getByRole("button", { name: /Machine work/ }).click();
@@ -231,6 +231,15 @@ test("F-08 the selected chat is kept in the URL and survives reload and Back", a
   await expect(page).toHaveURL(/\?chat=chat-2$/);
   await page.getByRole("link", { name: "Sessions", exact: true }).click();
   await expect(page).toHaveURL(/\/sessions\/$/);
+  await page.goBack();
+  await expect(page).toHaveURL(/\?chat=chat-2$/);
+  await expect(page.getByText("Opened chat-2")).toBeVisible();
+
+  // Forward goes to the sessions list, and Back returns to the same chat: the
+  // deep link is history, not a one-way write.
+  await page.goForward();
+  await expect(page).toHaveURL(/\/sessions\/$/);
+  await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
   await page.goBack();
   await expect(page).toHaveURL(/\?chat=chat-2$/);
   await expect(page.getByText("Opened chat-2")).toBeVisible();

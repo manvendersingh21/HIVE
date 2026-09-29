@@ -31,7 +31,12 @@ pub fn eligible(run: &Run, runs: &[Run], now: i64) -> bool {
         })
 }
 pub async fn collect(agent: &MasterAgent, store: &RunStore) -> anyhow::Result<()> {
-    let runs = store.list()?;
+    let (runs, errors) = store.list()?;
+    // An unreadable row may be a live run sharing a workspace; its caches must survive.
+    if errors > 0 {
+        tracing::warn!(errors, "workspace cache collection skipped: unreadable delegated runs");
+        return Ok(());
+    }
     for run in &runs {
         if !eligible(run, &runs, chrono::Utc::now().timestamp()) {
             continue;

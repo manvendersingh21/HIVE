@@ -23,3 +23,5 @@ pub mod skills;
 pub mod tools;
 pub mod watchdog;
 pub mod workers;
+
+pub use rusqlite;

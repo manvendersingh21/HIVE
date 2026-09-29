@@ -24,6 +24,10 @@ pub struct Assignment {
     pub model: Option<String>,
     pub workspace: String,
     pub objective: String,
+    /// The user's original request, copied by Hive after planning so the
+    /// planner cannot shorten or paraphrase rules the worker must follow.
+    #[serde(default)]
+    pub user_brief: String,
     pub dependencies: Vec<String>,
     /// Peers whose replies or agreements are needed during this assignment.
     /// These are communication requirements, not completion prerequisites.
@@ -99,6 +103,14 @@ fn repair_workspaces(plan: &mut DelegationPlan) {
             let id = uuid::Uuid::new_v4().simple().to_string();
             a.workspace = format!("~/hive-workspaces/{}-{}", &id[..8], key);
         }
+    }
+}
+
+/// Add the distinct `User brief` runner section from trusted coordinator
+/// input, never from the planner's potentially condensed objective.
+fn attach_user_brief(plan: &mut DelegationPlan, request: &str) {
+    for assignment in &mut plan.assignments {
+        assignment.user_brief = request.to_string();
     }
 }
 
@@ -438,6 +450,11 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             anyhow::ensure!(keys.contains(peer), "Unknown peer dependency {peer} for {}", a.key);
             anyhow::ensure!(peer != &a.key, "Assignment {} cannot be its own peer dependency", a.key);
             anyhow::ensure!(
+                !a.dependencies.contains(peer),
+                "Assignment {} lists {peer} as both a completion dependency and a peer dependency; keep it only as a completion dependency so this assignment cannot launch early",
+                a.key
+            );
+            anyhow::ensure!(
                 !queued_behind.contains(peer.as_str()),
                 "Assignment {} needs replies from {peer}, which is queued behind it by completion dependencies; remove the blocking dependencies so these peers can run concurrently",
                 a.key
@@ -729,7 +746,7 @@ pub async fn plan(
     let fleet = crate::memory::machines::describe_for_prompt(&agent.memory.graph)?;
     let agents = inventory::describe(&agent.memory.graph)?;
     let coordinator = coordinator_note(agent);
-    let mut prompt = format!("You are Hive's coordinator. Plan work for real agent conversations on configured devices. \
+    let prompt = format!("You are Hive's coordinator. Plan work for real agent conversations on configured devices. \
         Return structured assignments, never implementation scripts or file contents. The complete fleet is below. \
         Select device, installed agent and available model automatically; explicit user device/agent/model choices take precedence. \
         For opencode, set model to a verified id from that device's agent inventory (provider/model ids) and never a qwq/qvq reasoning model: those never call tools, so a turn can end with no actions. \
@@ -745,7 +762,7 @@ pub async fn plan(
         Every workspace is a fresh unique child of ~/hive-workspaces/. Each assignment has a unique key. \
         owned_paths are repository-relative globs exclusively owned by that assignment; never assign equal, parent, or child paths to two assignments. \
         dependencies are assignment keys that normally complete before this starts; a waiting dependency may wake its dependent early with a peer message. \
-        peer_dependencies lists assignment keys whose replies or agreements this assignment needs during its work, or [] when none are required. These do not delay launch. \
+        peer_dependencies lists assignment keys whose replies or agreements this assignment needs during its work, or [] when none are required. These do not delay launch and must never duplicate dependencies. \
         Peers that must negotiate concurrently have no completion dependency on each other: validation rejects a required peer queued directly or transitively behind its asker. \
         Acceptance criteria must require implementation, independent verification, deployment evidence when requested and peer agreement. \
         acceptance_checks is a nonempty list of mechanical checks the coordinator will execute after each final turn: file_exists with a workspace-relative path, or command with argv, workspace-relative cwd (use . for the workspace root), and timeout_seconds (1–120, at most 600 total). \
@@ -758,6 +775,16 @@ pub async fn plan(
         Hive creates them with its own image and the host's agent logins before any assignment starts; you never choose images, mounts or flags.\n\
         Fleet:\n{fleet}\n{coordinator}Agent inventory (installation, authentication, runtime, models and invocation evidence are distinct):\n{agents}\n\
         Prior conversation (context only):\n{history}\nUser request:\n{request}");
+    plan_from_prompt(agent, request, prompt, conversation_id).await
+}
+
+/// Asks the model for a plan, then parses, repairs and validates it.
+async fn plan_from_prompt(
+    agent: &MasterAgent,
+    request: &str,
+    mut prompt: String,
+    conversation_id: Option<&str>,
+) -> anyhow::Result<DelegationPlan> {
     let check_schema = json!({"type":"array","minItems":1,"maxItems":32,"items":{"anyOf":[
         {"type":"object","additionalProperties":false,"required":["kind","path"],"properties":{"kind":{"const":"file_exists"},"path":{"type":"string"}}},
         {"type":"object","additionalProperties":false,"required":["kind","argv","cwd","timeout_seconds"],"properties":{"kind":{"const":"command"},"argv":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120}}}
@@ -799,6 +826,7 @@ pub async fn plan(
             let mut p = plan;
             anyhow::ensure!(p.assignments.iter().all(|a| !a.acceptance_checks.is_empty()),
                 "Every new assignment requires mechanical acceptance_checks");
+            attach_user_brief(&mut p, request);
             repair_workspaces(&mut p);
             repair_models(&mut p, agent)?;
             validate(&p, agent)?;
@@ -956,8 +984,11 @@ pub fn remote_assignment(
 mod tests {
     use super::*;
     fn agent() -> MasterAgent {
+        agent_with(crate::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()))
+    }
+    fn agent_with(llm: crate::llm::LlmRouter) -> MasterAgent {
         let agent = MasterAgent::new(
-            crate::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            llm,
             crate::workers::WorkerPool::new(vec![hive_common::protocol::WorkerInfo {
                 name: "air".into(),
                 host: "ssh-alias".into(),
@@ -987,6 +1018,54 @@ mod tests {
     }
     fn nc(name: &str, host: &str) -> NewContainer {
         NewContainer { name: name.into(), host: host.into() }
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn planner__token_strip_objective_survives_delegation_planning() {
+        let objective = "Count rows in corpus.jsonl, write stats.json, and run \
+            python3 -c 'import json;json.loads(open(\"corpus.jsonl\").readline())'. Keep JSON output.";
+        let request = format!("Plan this: {objective}");
+        let answer = json!({"summary":"summarise corpus.jsonl","containers":[],"assignments":[{
+            "key":"stats","device":"air","agent":"claude","model":null,
+            "workspace":"~/hive-workspaces/stats","objective":objective,
+            "dependencies":[],"peer_dependencies":[],
+            "acceptance_criteria":["stats.json lists the row count of corpus.jsonl"],
+            "acceptance_checks":[{"kind":"file_exists","path":"stats.json"}],
+            "max_rework":2,"owned_paths":["stats.json"],"required_capabilities":[]
+        }]})
+        .to_string();
+        let (url, requests, task) = crate::llm::zai::tests::glm_server(vec![answer]).await;
+        let llm = crate::llm::LlmRouter::from_config(&hive_common::config::LlmConfig {
+            single_provider: Some(hive_common::AiProvider::Zai),
+            nvidia: Default::default(),
+            local: hive_common::config::LocalLlmConfig {
+                base_url: "http://127.0.0.1:1".into(),
+                ..Default::default()
+            },
+            gemini: None,
+            claude: None,
+            codex: None,
+            zai: Some(hive_common::config::CloudLlmConfig {
+                model: "glm-test".into(),
+                api_key: Some("zai-test-key".into()),
+                api_key_env: None,
+                base_url: Some(url),
+            }),
+        });
+        let plan = plan_from_prompt(&agent_with(llm), &request, request.clone(), None)
+            .await
+            .unwrap();
+        task.await.unwrap();
+        assert_eq!(plan.assignments[0].objective, objective);
+        assert_eq!(plan.summary, "summarise corpus.jsonl");
+        assert_eq!(
+            plan.assignments[0].acceptance_criteria,
+            vec!["stats.json lists the row count of corpus.jsonl"]
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].1.get("response_format").is_none(), "{}", requests[0].1);
     }
 
     #[test]
@@ -1118,6 +1197,15 @@ mod tests {
     }
 
     #[test]
+    fn original_user_brief_is_attached_verbatim_to_every_assignment() {
+        let mut p = peer_plan();
+        let brief = "Keep  two spaces.\n\nRun `cargo test` exactly.";
+        attach_user_brief(&mut p, brief);
+        assert!(p.assignments.iter().all(|a| a.user_brief == brief));
+        assert!(p.assignments.iter().all(|a| a.objective != brief));
+    }
+
+    #[test]
     fn peer_dependencies_allow_verification_and_concurrent_conversations() {
         let agent = agent();
         let mut p = peer_plan();
@@ -1128,9 +1216,14 @@ mod tests {
         p.assignments[0].peer_dependencies = vec!["verifier".into()];
         let error = validate(&p, &agent).unwrap_err().to_string();
         assert!(error.contains("needs replies from verifier, which is queued behind it"), "{error}");
+        // A verifier that waits for implementation cannot also treat the
+        // implementer as a concurrent peer: that could release it early.
+        p.assignments[0].peer_dependencies.clear();
+        p.assignments[1].peer_dependencies = vec!["a".into()];
+        let error = validate(&p, &agent).unwrap_err().to_string();
+        assert!(error.contains("both a completion dependency and a peer dependency"), "{error}");
         // Mutual peer requirements are legal once both can launch concurrently.
         p.assignments[1].dependencies.clear();
-        p.assignments[1].peer_dependencies = vec!["a".into()];
         validate(&p, &agent).unwrap();
     }
 
