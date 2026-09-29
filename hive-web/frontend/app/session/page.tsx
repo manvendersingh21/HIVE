@@ -41,7 +41,9 @@ export default function SessionPage() {
       setError((e as Error).message);
     }
   }, [id]);
-  usePoll(load, 3000, [load]);
+  // Once every run in the task has finished, nothing on this page can change.
+  const live = !runs || runs.some((r) => !TERMINAL_STATES.includes(r.state));
+  usePoll(load, 3000, [load], live);
   const run = runs?.find((r) => r.id === id);
   const siblings = run ? runs!.filter((r) => r.task_id === run.task_id) : [];
   const { events, error: eventsError, earlier, loadingEarlier } = useRunEvents(
@@ -94,8 +96,14 @@ export default function SessionPage() {
               <RunComposer run={run} refresh={load} />
             </section>
             <aside className="session-side">
-              <TeamPanel key={run.task_id} taskId={run.task_id} currentId={run.id} select={setId} />
-              <RelayAudit key={run.id} run={run} />
+              <TeamPanel
+                key={run.task_id}
+                taskId={run.task_id}
+                currentId={run.id}
+                select={setId}
+                live={live}
+              />
+              <RelayAudit key={run.id} run={run} live={live} />
               <div className="card">
                 <h3>Details</h3>
                 <dl>
