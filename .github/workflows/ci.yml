@@ -23,6 +23,22 @@ jobs:
       - run: python3 scripts/check-chat-history.py
       - run: python3 scripts/changelog.py check
       - run: git diff --check
+  delivery-acknowledgment:
+    name: acceptance: revived runs stay synced
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      # Static half: the delivered-ID tracking, the idle predicate consulting it,
+      # and the test that pins the behaviour all still have to be present.
+      - run: python3 scripts/check-delivery-acknowledgment.py
+      # Behaviour half: a completed run with a delivered message is not idle
+      # until the acknowledgment and a later state are synced, and idle again after.
+      - run: cargo test --locked -p hive-web a_revived_completed_run_is_synced_until_its_message_is_acknowledged
   frontend:
     runs-on: ubuntu-latest
     defaults:
