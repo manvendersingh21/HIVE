@@ -87,6 +87,13 @@ def check_probe_measures_the_cli():
     branch = source.split("elif name == 'cursor':", 1)[1].split("\n            elif", 1)[0]
     for flag in REQUIRED_FLAGS:
         require(flag in branch, "the cursor probe never checks the " + flag + " flag")
+    # A textual match alone would survive `all(...)` becoming `any(...)`, which
+    # would report a CLI missing flags as ready. test_adapters exercises the
+    # real condition; this only pins the shape that test depends on.
+    require(
+        re.search(r"runtime_ready'\] = all\(flag in help_text for flag in \(", branch) is not None,
+        "the cursor probe does not require every documented flag to be present",
+    )
     require("record['runtime_ready']" in branch, "the cursor probe never reports runtime_ready")
     require("record['authentication']" in branch, "the cursor probe never reports authentication")
     require("record['models']" in branch, "the cursor probe never lists models")
@@ -103,8 +110,8 @@ def check_adapter_contracts():
     ran = re.search(r"Ran (\d+) tests?", output)
     require(ran is not None, "the cursor adapter tests did not run:\n" + output[-2000:])
     require(
-        int(ran.group(1)) >= 8,
-        "expected the 8 documented cursor adapter tests, ran " + ran.group(1),
+        int(ran.group(1)) >= 9,
+        "expected the 9 documented cursor adapter tests, ran " + ran.group(1),
     )
     require(
         output.rstrip().endswith("OK"),
@@ -190,6 +197,16 @@ def check_frontend_spec_pins_cursor():
         len(tests) >= 9,
         "expected 9 cursor rendering tests, found %d" % len(tests),
     )
+    # Counting declarations is not enough on its own: a skipped or focused test
+    # keeps its `test(` line while its assertions stop running.
+    for pattern, label in (
+        (r"^\s*test\.(?:skip|fixme)\(", "a skipped"),
+        (r"^\s*(?:test|test\.describe)\.only\(", "a focused"),
+    ):
+        require(
+            re.search(pattern, block, re.M) is None,
+            "%s cursor rendering test would not run" % label,
+        )
     return "%d cursor rendering tests pinned" % len(tests)
 
 

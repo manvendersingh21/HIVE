@@ -52,6 +52,13 @@ jobs:
       - run: npx playwright test
         env:
           CI: true
+      - name: Cursor event rendering spec
+        run: |
+          set -o pipefail
+          npx playwright test tests/runEvents.spec.ts --grep 'cursor-agent stream-json events' 2>&1 | tee /tmp/cursor-ui.log
+          grep -qE '^ +9 passed' /tmp/cursor-ui.log
+        env:
+          CI: true
       - name: Keep failure traces
         if: failure()
         uses: actions/upload-artifact@v4
