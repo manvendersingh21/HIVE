@@ -22,6 +22,10 @@ pub struct Assignment {
     pub model: Option<String>,
     pub workspace: String,
     pub objective: String,
+    /// The user's original request, copied by Hive after planning so the
+    /// planner cannot shorten or paraphrase rules the worker must follow.
+    #[serde(default)]
+    pub user_brief: String,
     pub dependencies: Vec<String>,
     /// Peers whose replies or agreements are needed during this assignment.
     /// These are communication requirements, not completion prerequisites.
@@ -97,6 +101,14 @@ fn repair_workspaces(plan: &mut DelegationPlan) {
             let id = uuid::Uuid::new_v4().simple().to_string();
             a.workspace = format!("~/hive-workspaces/{}-{}", &id[..8], key);
         }
+    }
+}
+
+/// Add the distinct `User brief` runner section from trusted coordinator
+/// input, never from the planner's potentially condensed objective.
+fn attach_user_brief(plan: &mut DelegationPlan, request: &str) {
+    for assignment in &mut plan.assignments {
+        assignment.user_brief = request.to_string();
     }
 }
 
@@ -435,6 +447,11 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             anyhow::ensure!(keys.contains(peer), "Unknown peer dependency {peer} for {}", a.key);
             anyhow::ensure!(peer != &a.key, "Assignment {} cannot be its own peer dependency", a.key);
             anyhow::ensure!(
+                !a.dependencies.contains(peer),
+                "Assignment {} lists {peer} as both a completion dependency and a peer dependency; keep it only as a completion dependency so this assignment cannot launch early",
+                a.key
+            );
+            anyhow::ensure!(
                 !queued_behind.contains(peer.as_str()),
                 "Assignment {} needs replies from {peer}, which is queued behind it by completion dependencies; remove the blocking dependencies so these peers can run concurrently",
                 a.key
@@ -741,7 +758,7 @@ pub async fn plan(
         Every workspace is a fresh unique child of ~/hive-workspaces/. Each assignment has a unique key. \
         owned_paths are repository-relative globs exclusively owned by that assignment; never assign equal, parent, or child paths to two assignments. \
         dependencies are assignment keys that normally complete before this starts; a waiting dependency may wake its dependent early with a peer message. \
-        peer_dependencies lists assignment keys whose replies or agreements this assignment needs during its work, or [] when none are required. These do not delay launch. \
+        peer_dependencies lists assignment keys whose replies or agreements this assignment needs during its work, or [] when none are required. These do not delay launch and must never duplicate dependencies. \
         Peers that must negotiate concurrently have no completion dependency on each other: validation rejects a required peer queued directly or transitively behind its asker. \
         Acceptance criteria must require implementation, independent verification, deployment evidence when requested and peer agreement. \
         acceptance_checks is a nonempty list of mechanical checks the coordinator will execute after each final turn: file_exists with a workspace-relative path, or command with argv, workspace-relative cwd (use . for the workspace root), and timeout_seconds (1–120, at most 600 total). \
@@ -805,6 +822,7 @@ async fn plan_from_prompt(
             let mut p = plan;
             anyhow::ensure!(p.assignments.iter().all(|a| !a.acceptance_checks.is_empty()),
                 "Every new assignment requires mechanical acceptance_checks");
+            attach_user_brief(&mut p, request);
             repair_workspaces(&mut p);
             repair_models(&mut p, agent)?;
             validate(&p, agent)?;
@@ -1175,6 +1193,15 @@ mod tests {
     }
 
     #[test]
+    fn original_user_brief_is_attached_verbatim_to_every_assignment() {
+        let mut p = peer_plan();
+        let brief = "Keep  two spaces.\n\nRun `cargo test` exactly.";
+        attach_user_brief(&mut p, brief);
+        assert!(p.assignments.iter().all(|a| a.user_brief == brief));
+        assert!(p.assignments.iter().all(|a| a.objective != brief));
+    }
+
+    #[test]
     fn peer_dependencies_allow_verification_and_concurrent_conversations() {
         let agent = agent();
         let mut p = peer_plan();
@@ -1185,9 +1212,14 @@ mod tests {
         p.assignments[0].peer_dependencies = vec!["verifier".into()];
         let error = validate(&p, &agent).unwrap_err().to_string();
         assert!(error.contains("needs replies from verifier, which is queued behind it"), "{error}");
+        // A verifier that waits for implementation cannot also treat the
+        // implementer as a concurrent peer: that could release it early.
+        p.assignments[0].peer_dependencies.clear();
+        p.assignments[1].peer_dependencies = vec!["a".into()];
+        let error = validate(&p, &agent).unwrap_err().to_string();
+        assert!(error.contains("both a completion dependency and a peer dependency"), "{error}");
         // Mutual peer requirements are legal once both can launch concurrently.
         p.assignments[1].dependencies.clear();
-        p.assignments[1].peer_dependencies = vec!["a".into()];
         validate(&p, &agent).unwrap();
     }
 
