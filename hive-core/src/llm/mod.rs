@@ -511,7 +511,6 @@ impl LlmRouter {
                 // would poison the lock if this task is cancelled mid-hold.
                 let client = self.zai.read().unwrap().clone();
                 match client {
-                    Some(client) if schema.is_some() => client.complete_json(cloud_prompt).await,
                     Some(client) => client.complete(cloud_prompt).await,
                     None => Err(anyhow::anyhow!(
                         "Z.AI is not configured (set Z_AI or [llm.zai] in hive.toml, or select it from the master-agent settings with an API key)"
