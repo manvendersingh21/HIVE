@@ -17,20 +17,14 @@ pub struct ZaiClient {
     base_url: String,
 }
 
+/// Never carries `response_format`: GLM's `json_object` mode deletes every
+/// lowercase `json` from its answer (`corpus.jsonl` becomes `corpus.l`), see
+/// https://github.com/zai-org/GLM-5/issues/133. Structured calls rely on the
+/// schema instructions in the prompt, JSON extraction and one retry instead.
 #[derive(Serialize)]
 struct ChatCompletionsRequest<'a> {
     model: &'a str,
     messages: Vec<Message<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<ResponseFormat>,
-}
-
-/// Z.AI's JSON mode guarantees syntactically valid JSON; the shape still
-/// comes from the schema instructions in the prompt.
-#[derive(Serialize)]
-struct ResponseFormat {
-    #[serde(rename = "type")]
-    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -117,21 +111,6 @@ impl ZaiClient {
 
     /// Send a single-turn completion request.
     pub async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
-        self.send(prompt, None).await
-    }
-
-    /// Send a single-turn completion request in JSON mode, for structured
-    /// (schema) calls. Plain chat must use [`Self::complete`].
-    pub async fn complete_json(&self, prompt: &str) -> anyhow::Result<String> {
-        self.send(prompt, Some(ResponseFormat { kind: "json_object" }))
-            .await
-    }
-
-    async fn send(
-        &self,
-        prompt: &str,
-        response_format: Option<ResponseFormat>,
-    ) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let req = ChatCompletionsRequest {
             model: &self.model,
@@ -139,7 +118,6 @@ impl ZaiClient {
                 role: "user",
                 content: prompt,
             }],
-            response_format,
         };
 
         let resp = self
@@ -219,11 +197,31 @@ impl ZaiClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::llm::nvidia::tests::server;
+    use crate::llm::nvidia::tests::{server, server_fn, Requests};
     use serde_json::json;
     use std::time::Duration;
+
+    /// A mocked Z.AI endpoint that answers `answers` in order and behaves like
+    /// GLM (zai-org/GLM-5#133): under `response_format: json_object` every
+    /// lowercase `json` disappears from the answer; otherwise it is verbatim.
+    pub(crate) async fn glm_server(
+        answers: Vec<String>,
+    ) -> (String, Requests, tokio::task::JoinHandle<()>) {
+        let count = answers.len();
+        let answers = std::sync::Mutex::new(answers.into_iter());
+        server_fn(count, move |body| {
+            let answer = answers.lock().unwrap().next().expect("scripted answer");
+            let content = if body["response_format"]["type"] == "json_object" {
+                answer.replace("json", "")
+            } else {
+                answer
+            };
+            (200, json!({"choices":[{"finish_reason":"stop","message":{"content":content}}]}))
+        })
+        .await
+    }
 
     fn cfg(base_url: String) -> CloudLlmConfig {
         CloudLlmConfig {
@@ -306,7 +304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_mode_is_requested_for_schema_calls_only() {
+    async fn schema_calls_never_request_json_mode() {
         let ok = |text: &str| {
             (
                 200,
@@ -333,17 +331,64 @@ mod tests {
         assert_eq!(requests.len(), 2);
         let (headers, body) = &requests[0];
         assert!(headers.starts_with("POST /v1/chat/completions"), "{headers}");
-        assert_eq!(body["response_format"], json!({"type":"json_object"}));
+        assert!(
+            body.get("response_format").is_none(),
+            "GLM JSON mode drops lowercase json tokens: {body}"
+        );
         assert!(body["messages"][0]["content"]
             .as_str()
             .unwrap()
             .starts_with("give json"));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Respond with only one JSON object"));
         let (_, body) = &requests[1];
         assert!(
             body.get("response_format").is_none(),
             "plain chat must not request JSON mode: {body}"
         );
         assert_eq!(body["messages"][0]["content"], "say hi");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn planner__token_strip_the_glm_mock_strips_only_under_json_mode() {
+        let answer = r#"{"objective":"read corpus.jsonl; import json; keep JSON"}"#;
+        let (url, _requests, task) = glm_server(vec![answer.into(), answer.into()]).await;
+        let post = |format: Option<serde_json::Value>| {
+            let mut body = json!({"model":"m","messages":[{"role":"user","content":"p"}]});
+            if let Some(format) = format {
+                body["response_format"] = format;
+            }
+            let url = format!("{url}/chat/completions");
+            async move {
+                let reply: serde_json::Value =
+                    reqwest::Client::new().post(url).json(&body).send().await.unwrap().json().await.unwrap();
+                reply["choices"][0]["message"]["content"].as_str().unwrap().to_string()
+            }
+        };
+        assert_eq!(
+            post(Some(json!({"type":"json_object"}))).await,
+            r#"{"objective":"read corpus.l; import ; keep JSON"}"#
+        );
+        assert_eq!(post(None).await, answer);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn planner__token_strip_structured_zai_answers_keep_lowercase_json() {
+        let answer = r#"{"objective":"read corpus.jsonl; import json;json.loads(x); stats.json"}"#;
+        let (url, requests, task) = glm_server(vec![answer.into()]).await;
+        let schema = json!({"type":"object","properties":{"objective":{"type":"string"}}});
+        let reply = zai_router(url)
+            .complete_json_with("plan", hive_common::AiProvider::Claude, &schema)
+            .await
+            .unwrap();
+        task.await.unwrap();
+        assert_eq!(reply.text, answer);
+        assert!(requests.lock().unwrap()[0].1.get("response_format").is_none());
     }
 
     /// Hits the real Z.AI coding-plan API. Run with:
