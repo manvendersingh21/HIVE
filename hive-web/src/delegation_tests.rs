@@ -118,6 +118,20 @@ fn failed_dependency_is_not_released_by_its_pending_message() {
 }
 
 #[test]
+fn no_agreement_dependency_releases_verifier() {
+    let (store, runs) = fixture();
+    store
+        .state(
+            &runs[0].id,
+            "no_agreement",
+            "implementation was pushed but peer agreement was not reached",
+        )
+        .unwrap();
+    assert_eq!(ready(&store, &runs[1]), Ok(true));
+    assert_eq!(store.get(&runs[1].id).unwrap().state, "queued");
+}
+
+#[test]
 fn a_peer_message_cannot_bypass_other_prerequisites_or_hide_failure() {
     let (store, mut runs) = fixture();
     sync(&store, &runs[0], &mut question(&runs[1])).unwrap();
