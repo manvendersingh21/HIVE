@@ -135,10 +135,11 @@ fn capabilities_for(tools: &[String]) -> Vec<&'static str> {
 /// Scheduler health from `sinfo` node-state output: one state per node,
 /// possibly compound (`DRAIN+INVALID_REG`), separated by newlines, commas or
 /// spaces. A node cannot accept new jobs while its state names DRAIN (also
-/// DRAINED/DRAINING), DOWN or any INVALID* condition. The scheduler stays
-/// usable while at least one node is schedulable — a large cluster with one
-/// drained node still works — and is unusable when every reported node is
-/// not. No reported states at all means the health is unknown.
+/// DRAINED/DRAINING), DOWN, FAIL (also FAILING/FAILED), or any INVALID*/INVAL*
+/// condition. The scheduler stays usable while at least one node is
+/// schedulable — a large cluster with one drained node still works — and is
+/// unusable when every reported node is not. No reported states at all means
+/// the health is unknown.
 pub fn scheduler_health(states: &str) -> Option<&'static str> {
     let mut reported = false;
     let mut usable = false;
@@ -152,7 +153,11 @@ pub fn scheduler_health(states: &str) -> Option<&'static str> {
             let part = part
                 .trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
                 .to_ascii_uppercase();
-            part.starts_with("DRAIN") || part.starts_with("DOWN") || part.starts_with("INVALID")
+            part.starts_with("DRAIN")
+                || part.starts_with("DOWN")
+                || part.starts_with("FAIL")
+                || part.starts_with("INVALID")
+                || part.starts_with("INVAL")
         });
         usable |= healthy;
     }
@@ -831,7 +836,7 @@ pub fn describe_for_prompt(kg: &KnowledgeGraph) -> anyhow::Result<String> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         out.push_str(&format!(
-            "- {} ({}): {}, {} cores, {} RAM, {:.0} GB disk free{}{}. Capabilities: {}. Tools: {}.\n",
+            "- {} ({}): {}, {} cores, {} RAM, {:.0} GB disk free{}{}{}. Capabilities: {}. Tools: {}.\n",
             m.name,
             if reachable { "online" } else { "OFFLINE" },
             os,
@@ -865,6 +870,14 @@ pub fn describe_for_prompt(kg: &KnowledgeGraph) -> anyhow::Result<String> {
                     format!(", scheduler {}: {}", s.trim(), health)
                 })
                 .unwrap_or_default(),
+            // The operator's override sits beside the scheduler health so the
+            // planner can see that direct heavy placement is legal here even
+            // when the scheduler is unusable.
+            if m.attrs["allow_direct_gpu"] == true {
+                ", allow_direct_gpu: direct GPU/heavy work allowed"
+            } else {
+                ""
+            },
             if caps.is_empty() { "none detected".into() } else { caps.join(", ") },
             if tools.is_empty() { "none detected".into() } else { tools.join(", ") },
         ));
@@ -951,6 +964,9 @@ mod tests {
             "DOWN",
             "INVALID",
             "INVALID_REG",
+            "INVAL",
+            "FAIL",
+            "FAILING",
             "DRAIN+INVALID_REG",
             "DRAINED",
             "DRAINING",
@@ -996,6 +1012,15 @@ mod tests {
             "the planner must see the broken scheduler: {fleet}"
         );
         assert!(fleet.contains("scheduler slurm: usable"), "{fleet}");
+        // The operator's override is surfaced beside the scheduler health so
+        // the planner knows direct heavy placement is legal despite it.
+        let overridden = fleet.lines().find(|l| l.starts_with("- cis-a6000")).unwrap();
+        assert!(
+            overridden.contains("allow_direct_gpu: direct GPU/heavy work allowed"),
+            "{fleet}"
+        );
+        // Without the override the machine keeps its plain line.
+        assert!(!fleet.lines().any(|l| l.starts_with("- cluster") && l.contains("allow_direct_gpu")), "{fleet}");
     }
 
     #[test]

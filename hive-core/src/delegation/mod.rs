@@ -74,12 +74,13 @@ pub const SCHEDULER_INSTRUCTIONS: &str = "Scheduler allocation (mandatory): this
     Never run sustained GPU or heavy compute outside the scheduler on this device.";
 
 /// Coordinator-owned rules appended to every scheduler-execution objective.
-/// Idempotent, so a re-validated plan never grows two copies.
+/// Idempotent, so a re-validated plan never grows two copies. Attachment is
+/// detected by the exact block, never by its heading: a planner objective
+/// that merely says "Scheduler allocation (mandatory)" still gets the real
+/// rules appended.
 fn attach_scheduler_instructions(plan: &mut DelegationPlan) {
     for a in &mut plan.assignments {
-        if a.execution == Execution::Scheduler
-            && !a.objective.contains("Scheduler allocation (mandatory)")
-        {
+        if a.execution == Execution::Scheduler && !a.objective.contains(SCHEDULER_INSTRUCTIONS) {
             a.objective = format!("{}\n\n{}", a.objective, SCHEDULER_INSTRUCTIONS);
         }
     }
@@ -388,6 +389,11 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
         coordination::validate_checks(&a.acceptance_checks)?;
         anyhow::ensure!(a.max_rework <= 10, "At most 10 acceptance rework rounds");
         if new_container {
+            anyhow::ensure!(
+                a.execution != Execution::Scheduler,
+                "{} is a new container; scheduler execution needs a slurm-tagged fleet machine, and a container has no inventory yet",
+                a.device
+            );
             anyhow::ensure!(
                 !a.required_capabilities.iter().any(|c| c == "gpu-compute" || c == "heavy-compute"),
                 "{} is a new container; it can't be promised GPU or heavy compute",
@@ -1188,8 +1194,15 @@ mod tests {
         p.containers = vec![nc("sandbox-1", "air")];
         p.assignments[0].required_capabilities = vec!["gpu-compute".into()];
         assert!(validate(&p, &agent).unwrap_err().to_string().contains("new container"));
-        // Dependency checks still apply.
+        // Nor scheduler execution: a container has no inventory, so its
+        // slurm fitness cannot be checked before it exists.
         p.assignments[0].required_capabilities.clear();
+        p.assignments[0].execution = Execution::Scheduler;
+        let err = validate(&p, &agent).unwrap_err().to_string();
+        assert!(err.contains("new container"), "{err}");
+        assert!(err.contains("scheduler execution"), "{err}");
+        p.assignments[0].execution = Execution::Direct;
+        // Dependency checks still apply.
         p.assignments[0].dependencies = vec!["missing".into()];
         assert!(validate(&p, &agent).unwrap_err().to_string().contains("dependencies"));
     }
@@ -1351,6 +1364,16 @@ mod tests {
         // The block is mandatory but never duplicated.
         attach_scheduler_instructions(&mut p);
         assert_eq!(p.assignments[0].objective, objective);
+        // Attachment is detected by the block itself, never by its heading:
+        // a planner objective that merely parrots the heading still gets the
+        // real rules appended after it.
+        let mut parrot = plan();
+        parrot.assignments[0].execution = Execution::Scheduler;
+        parrot.assignments[0].objective =
+            "Train the model. Scheduler allocation (mandatory): I promise.".into();
+        attach_scheduler_instructions(&mut parrot);
+        assert!(parrot.assignments[0].objective.contains(SCHEDULER_INSTRUCTIONS));
+        assert!(parrot.assignments[0].objective.ends_with(SCHEDULER_INSTRUCTIONS));
         // Direct assignments keep their objective untouched.
         let mut direct = plan();
         attach_scheduler_instructions(&mut direct);
