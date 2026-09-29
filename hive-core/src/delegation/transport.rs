@@ -214,6 +214,23 @@ pub async fn update_peers(worker: &WorkerInfo, id: &str, peers: &Value) -> anyho
 mod tests {
     use super::*;
 
+    /// A peer command may only speak for the run whose runner issued the
+    /// presented credential (audit regression, peer_spoof_repro.py).
+    #[test]
+    fn peer_commands_cannot_impersonate_another_run() {
+        let output = std::process::Command::new("python3")
+            .args(["-m", "unittest", "-v", "test_peer_identity"])
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src/delegation/runner"))
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn roster_transition_queues_exactly_one_prompt_refresh() {
         use std::io::Write;
