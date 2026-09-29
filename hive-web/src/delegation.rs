@@ -408,9 +408,9 @@ async fn recovery_control(
     anyhow::ensure!(
         matches!(
             run.state.as_str(),
-            "failed" | "disconnected" | "needs-setup"
+            "failed" | "disconnected" | "needs-setup" | "launching"
         ),
-        "Only failed or disconnected native runs can be reconciled"
+        "Only failed, disconnected, needs-setup, or launching native runs can be reconciled"
     );
     let runner = run
         .runner_path
@@ -473,18 +473,23 @@ pub fn start(h: AgentHandle) {
     tokio::spawn(async move {
         loop {
             if let (Some(agent), Ok(store)) = (&reviewer.agent, store(&reviewer)) {
-                if let Ok(runs) = store.list() {
-                    let mut tasks: std::collections::BTreeMap<String, Vec<Run>> =
-                        std::collections::BTreeMap::new();
-                    for run in runs {
-                        if run.state != "superseded" {
-                            tasks.entry(run.task_id.clone()).or_default().push(run);
+                match store.list() {
+                    Ok(runs) => {
+                        let mut tasks: std::collections::BTreeMap<String, Vec<Run>> =
+                            std::collections::BTreeMap::new();
+                        for run in runs {
+                            if run.state != "superseded" {
+                                tasks.entry(run.task_id.clone()).or_default().push(run);
+                            }
+                        }
+                        for runs in tasks.values() {
+                            if let Err(error) = delegation::review::task(agent, &store, runs).await {
+                                tracing::warn!(task_id=%runs[0].task_id,error=%error,"coordinator review incomplete");
+                            }
                         }
                     }
-                    for runs in tasks.values() {
-                        if let Err(error) = delegation::review::task(agent, &store, runs).await {
-                            tracing::warn!(task_id=%runs[0].task_id,error=%error,"coordinator review incomplete");
-                        }
+                    Err(error) => {
+                        tracing::warn!(error=%error, "failed to list delegated runs for review");
                     }
                 }
             }
@@ -498,38 +503,43 @@ pub fn start(h: AgentHandle) {
         let unacknowledged = Unacknowledged::default();
         loop {
             if let Ok(store) = store(&h) {
-                if let Ok(runs) = store.list() {
-                    // A run that no longer exists can never acknowledge anything.
-                    unacknowledged
-                        .lock()
-                        .unwrap()
-                        .retain(|id, _| runs.iter().any(|run| &run.id == id));
-                    for run in &runs {
-                        if active.get(&run.id).is_some_and(|task| !task.is_finished()) {
-                            continue;
+                match store.list() {
+                    Ok(runs) => {
+                        // A run that no longer exists can never acknowledge anything.
+                        unacknowledged
+                            .lock()
+                            .unwrap()
+                            .retain(|id, _| runs.iter().any(|run| &run.id == id));
+                        for run in &runs {
+                            if active.get(&run.id).is_some_and(|task| !task.is_finished()) {
+                                continue;
+                            }
+                            let (h, store, run, runs, unacknowledged) = (
+                                h.clone(),
+                                store.clone(),
+                                run.clone(),
+                                runs.clone(),
+                                unacknowledged.clone(),
+                            );
+                            active.insert(
+                                run.id.clone(),
+                                tokio::spawn(async move {
+                                    if let Err(error) =
+                                        sync_run(&h, &store, &run, &runs, &unacknowledged).await
+                                    {
+                                        let _ =
+                                            store.state(&run.id, "disconnected", &error.to_string());
+                                        // Holding the task open keeps this run out of the
+                                        // loop, so an unreachable or overloaded worker is
+                                        // not hit with a fresh SSH session every 3s.
+                                        tokio::time::sleep(SYNC_RETRY_BACKOFF).await;
+                                    }
+                                }),
+                            );
                         }
-                        let (h, store, run, runs, unacknowledged) = (
-                            h.clone(),
-                            store.clone(),
-                            run.clone(),
-                            runs.clone(),
-                            unacknowledged.clone(),
-                        );
-                        active.insert(
-                            run.id.clone(),
-                            tokio::spawn(async move {
-                                if let Err(error) =
-                                    sync_run(&h, &store, &run, &runs, &unacknowledged).await
-                                {
-                                    let _ =
-                                        store.state(&run.id, "disconnected", &error.to_string());
-                                    // Holding the task open keeps this run out of the
-                                    // loop, so an unreachable or overloaded worker is
-                                    // not hit with a fresh SSH session every 3s.
-                                    tokio::time::sleep(SYNC_RETRY_BACKOFF).await;
-                                }
-                            }),
-                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(error=%error, "failed to list delegated runs for sync");
                     }
                 }
             }
@@ -662,8 +672,15 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
 }
 
 /// States in which a launched run's tmux session must still exist.
-const LIVE_STATES: [&str; 5] =
-    ["working", "awaiting-approval", "waiting-for-peer", "reviewing", "paused-quota"];
+const LIVE_STATES: [&str; 6] =
+    ["working", "awaiting-approval", "waiting-for-peer", "reviewing", "paused-quota", "launching"];
+
+fn launch_timeout_secs() -> i64 {
+    std::env::var("HIVE_LAUNCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
 
 /// Whether the run's tmux session exists. `None` when the device couldn't be
 /// asked: an unreachable machine says nothing about the session.
@@ -710,10 +727,27 @@ async fn sync_run(
     // journal of a runner that no longer exists.
     if run.runner_path.is_some()
         && LIVE_STATES.contains(&run.state.as_str())
-        && session_alive(&worker, run).await == Some(false)
     {
-        store.state(&run.id, "disconnected", SESSION_ENDED)?;
-        return Ok(());
+        let check_session = if run.state == "launching" {
+            let claimed_at = run
+                .metadata
+                .get("claimed_at")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let now = chrono::Utc::now().timestamp();
+            now.saturating_sub(claimed_at) >= launch_timeout_secs()
+        } else {
+            true
+        };
+        if check_session && session_alive(&worker, run).await == Some(false) {
+            let (target_state, reason) = if run.state == "launching" {
+                ("failed", "Launch timed out: agent tmux session never appeared")
+            } else {
+                ("disconnected", SESSION_ENDED)
+            };
+            store.state(&run.id, target_state, reason)?;
+            return Ok(());
+        }
     }
     if run.state == "queued" {
         match dependency_ready(runs, run, &store.pending_messages(&run.id)?) {
@@ -812,7 +846,7 @@ async fn sync_run(
             .cloned()
             .collect::<Vec<_>>();
         let assignment = delegation::remote_assignment(run, &peers, executable);
-        transport::control(
+        if let Err(error) = transport::control(
             &worker,
             &runner,
             "launch",
@@ -820,7 +854,10 @@ async fn sync_run(
             0,
             Some(&assignment),
         )
-        .await?;
+        .await {
+            store.state(&run.id, "failed", &format!("Launch failed: {error}"))?;
+            return Err(error);
+        }
         return Ok(());
     }
     let Some(runner) = &run.runner_path else {

@@ -305,3 +305,17 @@ fn a_handoff_from_a_paused_run_cannot_bypass_another_prerequisite() {
     let messages = store.pending_messages(&runs[1].id).unwrap();
     assert_eq!(dependency_ready(&runs, &runs[1], &messages), Ok(false));
 }
+
+#[test]
+fn launching_without_session_has_recovery_path() {
+    let (store, runs) = fixture();
+    let run = &runs[0];
+    assert!(LIVE_STATES.contains(&"launching"));
+    assert!(store.claim(&run.id, "runner.py").unwrap());
+    assert_eq!(store.get(&run.id).unwrap().state, "launching");
+    // retry_setup is eligible for launching runs
+    store.retry_setup(&run.id).unwrap();
+    let recovered = store.get(&run.id).unwrap();
+    assert_eq!(recovered.state, "queued");
+    assert!(recovered.runner_path.is_none());
+}
