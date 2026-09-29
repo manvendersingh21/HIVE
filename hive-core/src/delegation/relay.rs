@@ -434,6 +434,7 @@ pub(super) fn next(
         }
         let peer = envelope.source != "user" && envelope.source != "coordinator";
         if peer {
+            db.execute("DELETE FROM delegated_relay_budget WHERE attempted_at<=?", [now-60])?;
             let (per_run, per_task): (u32,u32) = db.query_row("SELECT count(CASE WHEN source=? THEN 1 END),count(*) FROM delegated_relay_budget WHERE task_id=? AND attempted_at>?", params![envelope.source,envelope.task_id,now-60], |r| Ok((r.get(0)?,r.get(1)?)))?;
             if per_run >= budget.per_run || per_task >= budget.per_task {
                 let reason = if per_run >= budget.per_run {

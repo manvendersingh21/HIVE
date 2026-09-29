@@ -44,6 +44,7 @@ export type Entry =
   | { type: "approval"; seq: number; id?: string; command: string; cwd?: string; reason?: string }
   | { type: "approval-resolved"; seq: number; decision: string }
   | { type: "error"; seq: number; text: string }
+  | { type: "stalled"; seq: number; text: string }
   | { type: "result"; seq: number; text: string; error: boolean };
 
 const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : JSON.stringify(v));
@@ -425,6 +426,9 @@ export function transcript(events: RunEvent[]): Entry[] {
       case "approval-consumed":
         out.push({ type: "approval-resolved", seq: e.seq, decision: str(p.decision) });
         break;
+      case "stalled":
+        out.push({ type: "stalled", seq: e.seq, text: stalledLabel(p) });
+        break;
       case "native":
         (typeof p.method === "string"
           ? codex(e.seq, p)
@@ -451,22 +455,40 @@ export function lastError(events: RunEvent[]): string | undefined {
   return undefined;
 }
 
-export const TERMINAL_STATES = ["completed", "failed", "superseded", "disconnected"];
+export const TERMINAL_STATES = ["completed", "failed", "no_agreement", "superseded", "disconnected"];
 
 export function stateTone(
   state: string,
 ): "attention" | "running" | "queued" | "done" | "bad" | "stale" {
   if (["awaiting-approval", "needs-setup"].includes(state)) return "attention";
-  if (state === "failed") return "bad";
+  if (["failed", "no_agreement"].includes(state)) return "bad";
   // The runner lost contact; nothing it was doing will finish on its own.
   if (state === "disconnected") return "stale";
-  if (["launching", "working", "reviewing", "waiting-for-peer"].includes(state)) return "running";
+  if (["launching", "working", "reviewing", "verifying", "waiting-for-peer"].includes(state)) return "running";
   // A quota pause resumes by itself after the reset, like a queued run starts.
   if (["queued", "paused-quota"].includes(state)) return "queued";
   return "done";
 }
 
 export type Quota = { agent?: string; resets_at?: number; message?: string };
+
+// The runner's watchdog: a tool call in progress with no native event for
+// `silent_minutes`. The run is still working; the tool may yet finish.
+export type Stall = {
+  tool?: string;
+  command?: string;
+  silent_since?: number;
+  silent_minutes?: number;
+  reason?: string;
+};
+
+export function stalledLabel(stall: Stall): string {
+  return `Stalled: ${stall.command || stall.tool || "tool call"} silent for ${stall.silent_minutes ?? 0} min`;
+}
+
+// A stall only means something while the run is still working on that turn.
+export const activeStall = (state: string, stall?: Stall | null): Stall | undefined =>
+  state === "working" && stall && (stall.command || stall.tool) ? stall : undefined;
 
 // "Paused: codex quota resets at 3:05 PM" in the viewer's own time zone; a
 // reset beyond the next day also names the day.

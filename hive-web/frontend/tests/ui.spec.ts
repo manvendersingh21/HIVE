@@ -956,6 +956,30 @@ test("a quota-paused session says when its agent's quota resets, and so does its
   const waiting = page.locator(".banner", { hasText: "Waiting to start" });
   await expect(waiting.locator("[data-state=paused-quota]")).toHaveText(label);
 });
+test("a stalled tool call shows on the session page and its state chip", async ({ page }) => {
+  const command = "cargo build --workspace --locked; ( while true; do date; sleep 20; done > progress.log ) &";
+  const label = `Stalled: ${command} silent for 14 min`;
+  const stall = { tool: "bash", command, silent_since: 1_790_000_000, silent_minutes: 14, reason: label };
+  const stalled = { ...run, metadata: { stall } };
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [stalled] }));
+  await page.route("**/api/runs/*/events*", (route) =>
+    route.fulfill({ json: [{ seq: 1, kind: "stalled", payload: { ...stall, silent_minutes: 10 } }] }),
+  );
+  await page.goto("/session/?run=run-1");
+  const chip = page.locator(".bar [data-state=working]");
+  await expect(chip).toHaveText(label);
+  await expect(chip).toHaveAttribute("title", label);
+  await expect(page.getByTestId("tool-stalled")).toContainText(label);
+  await expect(page.getByTestId("tool-stalled")).toContainText("still running but has produced nothing");
+  await expect(page.locator(".t-stalled")).toHaveText(`Stalled: ${command} silent for 10 min`);
+  // A stall is not a failure, and a finished run no longer shows one.
+  await expect(page.locator(".banner.bad")).toHaveCount(0);
+  await page.unroute(/\/api\/runs(\?.*)?$/);
+  await page.route(/\/api\/runs(\?.*)?$/, (route) => route.fulfill({ json: [{ ...stalled, state: "completed" }] }));
+  await page.reload();
+  await expect(page.locator(".bar [data-state=completed]")).toHaveText("completed");
+  await expect(page.getByTestId("tool-stalled")).toHaveCount(0);
+});
 test("sessions page separates agent sessions by attention from terminals", async ({ page }) => {
   await page.route("**/api/sessions", (route) =>
     route.fulfill({

@@ -8,7 +8,9 @@ import {
   describeAction,
   errorText,
   lastError,
+  activeStall,
   pausedLabel,
+  stalledLabel,
   stateTone,
   transcript,
 } from "../lib/runEvents";
@@ -433,8 +435,8 @@ test.describe("helpers", () => {
   });
 
   test("terminal states stop live polling", () => {
-    expect([...TERMINAL_STATES].sort()).toEqual(["completed", "disconnected", "failed", "superseded"]);
-    for (const live of ["working", "awaiting-approval", "queued", "launching", "paused-quota"]) expect(TERMINAL_STATES).not.toContain(live);
+    expect([...TERMINAL_STATES].sort()).toEqual(["completed", "disconnected", "failed", "no_agreement", "superseded"]);
+    for (const live of ["working", "awaiting-approval", "queued", "launching", "paused-quota", "verifying"]) expect(TERMINAL_STATES).not.toContain(live);
   });
 
   test("a quota pause names the agent and its reset in local time", () => {
@@ -450,6 +452,18 @@ test.describe("helpers", () => {
       new Date(later * 1000).toLocaleString([], { weekday: "short" }),
     );
     expect(pausedLabel(undefined, "codex", now)).toBe("Paused: codex quota");
+  });
+
+  test("a stalled tool call names its command and silence, only while working", () => {
+    const stall = { tool: "bash", command: "cargo build --workspace", silent_since: 1_790_000_000, silent_minutes: 12 };
+    expect(stalledLabel(stall)).toBe("Stalled: cargo build --workspace silent for 12 min");
+    expect(stalledLabel({ tool: "Read", silent_minutes: 10 })).toBe("Stalled: Read silent for 10 min");
+    expect(activeStall("working", stall)).toBe(stall);
+    for (const state of ["completed", "failed", "awaiting-approval", "disconnected"]) expect(activeStall(state, stall)).toBeUndefined();
+    expect(activeStall("working", null)).toBeUndefined();
+    expect(activeStall("working", {})).toBeUndefined();
+    const entries = transcript([ev("stalled", { ...stall, silent_minutes: 10 })]);
+    expect(entries).toEqual([{ type: "stalled", seq, text: "Stalled: cargo build --workspace silent for 10 min" }]);
   });
 });
 

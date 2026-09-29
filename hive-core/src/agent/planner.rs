@@ -650,7 +650,7 @@ mod tests {
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 2, "exactly one retry");
             for (_, body) in requests.iter() {
-                assert_eq!(body["response_format"], json!({"type":"json_object"}));
+                assert!(body.get("response_format").is_none(), "{body}");
             }
             let first = requests[0].1["messages"][0]["content"].as_str().unwrap();
             let retry = requests[1].1["messages"][0]["content"].as_str().unwrap();
@@ -701,6 +701,28 @@ mod tests {
             let requests = requests.lock().unwrap();
             let retry = requests[1].1["messages"][0]["content"].as_str().unwrap();
             assert!(retry.contains("missing field `summary`"), "{retry}");
+        }
+
+        #[tokio::test]
+        #[allow(non_snake_case)]
+        async fn planner__token_strip_chat_plan_keeps_lowercase_json() {
+            let description = "count rows in corpus.jsonl with import json;json.loads";
+            let command = "python3 -c 'import json;print(json.load(open(\"stats.json\")))'";
+            let answer = json!({"targets":["local"],"phase":"work","summary":"read corpus.jsonl","subtasks":[
+                {"description":description,"target_machine":"local","commands":[command],"required_capabilities":[]}
+            ]})
+            .to_string();
+            let (url, requests, task) =
+                crate::llm::zai::tests::glm_server(vec![answer]).await;
+            let plan = Planner::new()
+                .plan(&router(url), "say hi", Complexity::Simple, &FleetContext::none(), None, None, None)
+                .await
+                .unwrap();
+            task.await.unwrap();
+            assert_eq!(plan.summary, "read corpus.jsonl");
+            assert_eq!(plan.subtasks[0].description, description);
+            assert_eq!(plan.subtasks[0].commands, vec![command]);
+            assert!(requests.lock().unwrap()[0].1.get("response_format").is_none());
         }
     }
 }

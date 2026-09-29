@@ -11,16 +11,16 @@ type Chat = { id: string; title?: string; updated_at?: string };
 type Reply = {
   run?: {
     id: string;
-    steps: {
+    steps?: {
       id: number;
-      command: string;
-      target: { kind: string; worker?: string };
-      risk?: { reason: string };
+      command?: string;
+      target?: { kind?: string; worker?: string };
+      risk?: { reason?: string };
     }[];
   };
   result?: {
-    awaiting_approval: number[];
-    sessions: { session_name: string; worker_name: string }[];
+    awaiting_approval?: number[];
+    sessions?: { session_name: string; worker_name: string }[];
   };
   delegation?: { task_id?: string; runs: Run[] };
 };
@@ -430,17 +430,17 @@ export default function AgentPage() {
                 ))}
                 {message.status === "awaiting_approval" &&
                   message.reply?.run?.steps
-                    .filter((step) =>
-                      message.reply?.result?.awaiting_approval.includes(
+                    ?.filter((step) =>
+                      (message.reply?.result?.awaiting_approval || []).includes(
                         step.id,
                       ),
                     )
                     .map((step) => (
                       <ApprovalPrompt
                         key={step.id}
-                        title={`Hive wants to run a command on ${step.target.worker || step.target.kind}`}
+                        title={`Hive wants to run a command on ${step.target?.worker || step.target?.kind || "a machine"}`}
                         reason={step.risk?.reason}
-                        command={step.command}
+                        command={step.command || "(command unavailable)"}
                         denyLabel="Deny"
                         busy={busy}
                         onApprove={() => void approve(message.reply!.run!.id, step.id, true)}

@@ -32,6 +32,7 @@ async fn fixture() -> Fixture {
         agent: handle.clone(),
         workers: workers::WorkerIngest::from_env(),
         incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()),
+        db_ok: true,
     };
     let app = app_router(state, std::env::temp_dir().to_str().unwrap());
     let login = app
@@ -184,6 +185,31 @@ async fn delete_unknown_chat_is_404_and_requires_auth() {
         .await
         .unwrap();
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn delete_removes_only_that_chats_acceptance_evidence() {
+    let f = fixture().await;
+    let (chat, runs) = f.chat_with_history("completed");
+    let (_, keep) = f.chat_with_history("completed");
+    // Legacy assignments have no mechanical checks, so no passing measurement
+    // can be manufactured. Exercise the bounded failure path before deletion.
+    for run in [&runs[0], &keep[0]] {
+        for turn in 1..=3 {
+            f.runs.sync(&run.id, &json!({"metadata":{"state":"completed","acceptance_turn":turn},"events":[],"approvals":[]})).unwrap();
+            f.runs.assess_completion(&run.id, turn, &[]).unwrap();
+            if let Some(delivery) = f.runs.next_delivery(&run.id).unwrap() {
+                f.runs.message_delivered(&delivery).unwrap();
+            }
+        }
+        assert_eq!(f.runs.get(&run.id).unwrap().state, "no_agreement");
+    }
+    assert_eq!(f.count("SELECT count(*) FROM delegated_completions"), 2);
+    let (status, body) = f.send("DELETE", &format!("/api/chats/{chat}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(f.count("SELECT count(*) FROM delegated_completions"), 1);
+    assert!(f.runs.get(&keep[0].id).unwrap().completion.is_some());
+    assert!(f.runs.verify_audit_chain().unwrap());
 }
 
 #[tokio::test]

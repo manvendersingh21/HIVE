@@ -7,10 +7,14 @@ side effects. The persistent process owns the native conversation and approvals.
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
+import selectors
+import signal
 import shlex
 import shutil
 import sqlite3
@@ -24,6 +28,10 @@ AGENTS = ('claude', 'codex', 'opencode', 'agy', 'cursor')
 # Agent type -> CLI binary, for the ones whose executable is not the type name.
 EXECUTABLES = {'cursor': 'cursor-agent'}
 BASE = Path.home() / '.hive' / 'runs'
+# The per-run peer credential reaches the native agent only through this
+# environment variable. Codex's default shell policy drops names containing
+# KEY, SECRET or TOKEN, so the name avoids them.
+RUN_CREDENTIAL_ENV = 'HIVE_RUN_CREDENTIAL'
 
 
 def encode(value):
@@ -145,12 +153,21 @@ class Journal:
         CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, kind TEXT, payload TEXT);
         CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued');
         CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL, decision TEXT, consumed INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS credentials (name TEXT PRIMARY KEY, sha256 TEXT NOT NULL);
         ''')
         self.db.commit()
+        # Values that must never be journaled or printed, e.g. the run credential
+        # if an agent echoes its own environment.
+        self.redact = set()
+
+    def scrub(self, text):
+        for value in self.redact:
+            text = text.replace(value, '[redacted]')
+        return text
 
     def set(self, key, value):
         with self.db:
-            self.db.execute('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, encode(value)))
+            self.db.execute('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, self.scrub(encode(value))))
 
     def get(self, key, default=None):
         row = self.db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
@@ -163,9 +180,23 @@ class Journal:
 
     def emit(self, kind, payload, event_id=None):
         with self.db:
-            self.db.execute('INSERT OR IGNORE INTO events(id,kind,payload) VALUES (?,?,?)', (event_id or str(uuid.uuid4()), kind, encode(payload)))
+            self.db.execute('INSERT OR IGNORE INTO events(id,kind,payload) VALUES (?,?,?)', (event_id or str(uuid.uuid4()), kind, self.scrub(encode(payload))))
         if not self.quiet:
-            print(encode(dict(kind=kind, payload=payload)), flush=True)
+            print(self.scrub(encode(dict(kind=kind, payload=payload))), flush=True)
+
+    def issue_credential(self):
+        """A fresh per-run peer credential; only its SHA-256 is stored.
+
+        The raw value lives in this runner's memory and the native agent's
+        environment (RUN_CREDENTIAL_ENV). It is never journaled: metadata,
+        events and snapshots do not include the credentials table.
+        """
+        credential = secrets.token_urlsafe(32)
+        with self.db:
+            self.db.execute('INSERT INTO credentials VALUES (?,?) ON CONFLICT(name) DO UPDATE SET sha256=excluded.sha256',
+                            ('peer', hashlib.sha256(credential.encode()).hexdigest()))
+        self.redact.add(credential)
+        return credential
 
     def state(self, state):
         self.set('state', state)
@@ -185,9 +216,16 @@ class Journal:
                 os.kill(pid, 0)
             except ProcessLookupError:
                 self.set('state', 'disconnected')
-        return dict(metadata={r['key']: json.loads(r['value']) for r in self.db.execute('SELECT * FROM metadata')},
+        metadata = {r['key']: json.loads(r['value']) for r in self.db.execute('SELECT * FROM metadata')}
+        # Derived from the journal, not from mutable worker metadata. This also
+        # works for persistent runners launched before acceptance checks existed.
+        metadata['acceptance_turn'] = self.completed_turn()
+        return dict(metadata=metadata,
                     events=[dict(seq=r['seq'], id=r['id'], kind=r['kind'], payload=json.loads(r['payload'])) for r in self.db.execute('SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT 300', (after,))],
                     approvals=[dict(r) for r in self.db.execute('SELECT * FROM approvals WHERE consumed=0')])
+
+    def completed_turn(self):
+        return self.db.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE kind='acknowledgment'").fetchone()[0]
 
     def pending(self, action, reason):
         fingerprint = hashlib.sha256(encode(action).encode()).hexdigest()
@@ -264,7 +302,12 @@ def shell_parts(command):
 
 # Unknown tools/commands ask. Shell metacharacters and interpreters never pass
 # through the routine-command allowlist. Native sandboxes remain enabled.
-def policy(tool, args, workspace):
+def policy(tool, args, workspace, run_id=None):
+    """None when an action is routine for the calling run, else the reason to ask.
+
+    `run_id` is the run whose agent requested the action. Without it, no peer
+    command is ever routine: a peer command may only speak for its own run.
+    """
     if tool in ('ListAgents', 'TodoWrite', 'ToolSearch', 'mcp__hive__peer'):
         return None
     root = Path(workspace).resolve()
@@ -297,7 +340,7 @@ def policy(tool, args, workspace):
             return str(error)
         if len(parts) != 1:
             for words in parts:
-                reason = policy(tool, dict(command=shlex.join(words)), workspace)
+                reason = policy(tool, dict(command=shlex.join(words)), workspace, run_id)
                 if reason:
                     return reason
             return None if parts else 'Empty command'
@@ -307,14 +350,19 @@ def policy(tool, args, workspace):
         # Native Codex exposes an explicit shell wrapper. Inspect its literal
         # body using the same deterministic parser, never an eval or execution.
         if len(words) == 3 and words[0] in ('/usr/bin/bash', '/bin/bash', '/bin/sh', '/bin/zsh') and words[1] in ('-c', '-lc'):
-            return policy(tool, dict(command=words[2]), workspace)
+            return policy(tool, dict(command=words[2]), workspace, run_id)
         if words[0] == 'nl' and len(words) == 3 and words[1] == '-ba' and inside(words[2]):
             return None
-        # The task-scoped peer command validates both run IDs itself.
-        if len(words) == 11 and words[0] in ('python3', sys.executable) and Path(words[1]).resolve() == Path(__file__).resolve() and words[2] == 'peer':
+        # The task-scoped peer command is routine only when it speaks for the
+        # calling run. Any other --run-id is an impersonation attempt and asks;
+        # the peer subcommand independently requires this run's credential.
+        if len(words) >= 3 and words[0] in ('python3', sys.executable) and Path(words[1]).resolve() == Path(__file__).resolve() and words[2] == 'peer':
             flags = dict(zip(words[3::2], words[4::2]))
-            if set(flags) == {'--run-id', '--to', '--kind', '--body'} and flags['--kind'] in ('question','answer','agreement','deployment'):
+            if (len(words) == 11 and len(flags) == 4 and set(flags) == {'--run-id', '--to', '--kind', '--body'} and
+                    flags['--kind'] in ('question','answer','agreement','deployment') and
+                    run_id is not None and flags['--run-id'] == str(run_id)):
                 return None
+            return 'Peer command does not speak for the calling run'
         # Routine test/build and isolated dependencies are explicitly authorized.
         # Shell composition, interpreter snippets and arbitrary install targets
         # still require review; native containment stays enabled.
@@ -334,7 +382,7 @@ def policy(tool, args, workspace):
         if words[0] == 'sort' and len(words)==1:
             return None
         if words[0] == 'timeout' and len(words)>2 and words[1].isdigit() and int(words[1])<=30:
-            return policy(tool, dict(command=shlex.join(words[2:])), workspace)
+            return policy(tool, dict(command=shlex.join(words[2:])), workspace, run_id)
         if words[0] == 'find' and words[1:] in (['.','-maxdepth','2','-type','f','-print'], ['.','-type','f','-print']):
             return None
         if words[:2]==['command','-v'] and len(words)==3 and re.fullmatch(r'[A-Za-z0-9_.-]+',words[2]):
@@ -391,8 +439,12 @@ def yolo(journal):
     return (journal.get('assignment') or {}).get('autonomy') == 'yolo'
 
 
+def calling_run(journal):
+    return (journal.get('assignment') or {}).get('id')
+
+
 async def permission(journal, tool, args, workspace):
-    reason = policy(tool, args, workspace)
+    reason = policy(tool, args, workspace, calling_run(journal))
     if reason is None or yolo(journal):
         return True
     ident = journal.pending(dict(tool=tool, arguments=args, workspace=workspace), reason)
@@ -432,9 +484,174 @@ class Coalescer:
             self.block = []
 
 
+# A tool call with no native event for this long is reported once as stalled.
+# The run stays working: the tool may still finish, and only a person can tell
+# a slow build from one whose output pipe a background process holds open.
+STALL_MINUTES = 10
+STALL_CHECK = 30
+STALL_COMMAND_LIMIT = 300
+
+
+class StallWatchdog:
+    """Reports a tool call that has gone silent, once per silence.
+
+    Adapters call `event` for every native event, naming the tool calls it
+    started or finished (call id -> (tool, command)), or with `running`, the
+    complete set in progress when the protocol reports whole state. `check`
+    runs on a timer; `clock` is injectable so tests need not wait.
+    """
+
+    def __init__(self, journal, clock=time.time, limit=STALL_MINUTES*60):
+        self.j, self.clock, self.limit = journal, clock, limit
+        self.begin()
+
+    def begin(self):
+        self.running, self.last, self.stall = {}, self.clock(), None
+
+    def event(self, started=None, finished=(), running=None):
+        self.last = self.clock()
+        if running is not None:
+            self.running = dict(running)
+        self.running.update(started or {})
+        for ident in finished:
+            self.running.pop(ident, None)
+        self.end()
+
+    def check(self):
+        silent = self.clock() - self.last
+        if not self.running or silent < self.limit:
+            return None
+        minutes = int(silent // 60)
+        if self.stall:
+            # Still the same silence: keep the shown duration current, never re-emit.
+            if minutes != self.stall['silent_minutes']:
+                self.stall = dict(self.stall, silent_minutes=minutes,
+                                  reason='Stalled: '+self.stall['command']+' silent for '+str(minutes)+' min')
+                self.j.set('stall', self.stall)
+            return None
+        tool, command = next(iter(self.running.values()))
+        command = command[:STALL_COMMAND_LIMIT]
+        self.stall = dict(tool=tool, command=command, silent_since=int(self.last), silent_minutes=minutes,
+                          reason='Stalled: '+command+' silent for '+str(minutes)+' min')
+        self.j.set('stall', self.stall)
+        self.j.emit('stalled', self.stall)
+        return self.stall
+
+    def end(self):
+        if self.stall:
+            self.stall = None
+            self.j.set('stall', None)
+
+    async def wait(self, awaitable):
+        """`awaitable`'s result, checking for a stall while it is pending.
+
+        The awaitable is never cancelled by a check, so no queued event or
+        partially read line is lost.
+        """
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=STALL_CHECK)
+                if done:
+                    return task.result()
+                self.check()
+        finally:
+            if not task.done():
+                task.cancel()
+
+
+def watchdog(adapter):
+    if getattr(adapter, 'watchdog', None) is None:
+        adapter.watchdog = StallWatchdog(adapter.j)
+    return adapter.watchdog
+
+
+def tool_command(tool_input):
+    """The command a tool call runs, or its whole input for other tools."""
+    if isinstance(tool_input, dict):
+        for key in ('command', 'CommandLine', 'cmd'):
+            if isinstance(tool_input.get(key), str) and tool_input[key].strip():
+                return tool_input[key]
+    return encode(tool_input)
+
+
+def codex_tool_calls(event):
+    """(started, finished) commandExecution items of a Codex notification."""
+    item = (event.get('params') or {}).get('item') or {}
+    if item.get('type') != 'commandExecution' or not item.get('id'):
+        return {}, ()
+    if event.get('method') == 'item/started':
+        return {item['id']: ('commandExecution', str(item.get('command') or ''))}, ()
+    if event.get('method') == 'item/completed':
+        return {}, (item['id'],)
+    return {}, ()
+
+
+def claude_tool_calls(event):
+    """(started, finished) tool calls of a Claude SDK message.
+
+    The Node bridge forwards SDK messages (`message.content`, typed blocks);
+    the Python bridge flattens dataclasses (`content`, untyped blocks).
+    """
+    content = (event.get('message') or {}).get('content') if isinstance(event.get('message'), dict) else event.get('content')
+    started, finished = {}, []
+    for block in content if isinstance(content, list) else ():
+        if not isinstance(block, dict):
+            continue
+        if block.get('type') == 'tool_use' or ('type' not in block and {'id', 'name', 'input'} <= set(block)):
+            started[block['id']] = (str(block['name']), tool_command(block.get('input')))
+        elif block.get('tool_use_id'):
+            finished.append(block['tool_use_id'])
+    return started, finished
+
+
+def cursor_tool_calls(event):
+    """(started, finished) of a Cursor stream-json `tool_call` event."""
+    if event.get('type') != 'tool_call' or not event.get('call_id'):
+        return {}, ()
+    if event.get('subtype') == 'completed':
+        return {}, (event['call_id'],)
+    body = event.get('tool_call') or {}
+    key = next((k for k in body if k.endswith('ToolCall')), None) if isinstance(body, dict) else None
+    call = (body.get(key) or {}) if key else {}
+    name = key[:-len('ToolCall')] if key else 'tool'
+    return {event['call_id']: (name, tool_command(call.get('args') if isinstance(call, dict) else None))}, ()
+
+
+def opencode_tool_calls(messages, chain):
+    """Tool parts still pending or running in this turn's assistant messages."""
+    running = {}
+    for message in messages:
+        info = message.get('info') or {}
+        if info.get('role') != 'assistant' or info.get('parentID') not in chain:
+            continue
+        for part in message.get('parts', []):
+            state = part.get('state') or {}
+            if part.get('type') == 'tool' and state.get('status') in ('pending', 'running'):
+                ident = part.get('callID') or part.get('id') or encode(part)
+                running[ident] = (str(part.get('tool')), tool_command(state.get('input')))
+    return running
+
+
+def agent_environment(adapter, base=None):
+    """The native agent's environment: the runner's plus the run credential.
+
+    `run` sets `adapter.credential`; inventory probes have none and inherit
+    the runner environment unchanged. The credential is never placed in the
+    runner's own os.environ, so tmux, services and probes do not see it.
+    """
+    credential = getattr(adapter, 'credential', None)
+    if base is None and not credential:
+        return None
+    env = dict(os.environ if base is None else base)
+    if credential:
+        env[RUN_CREDENTIAL_ENV] = credential
+    return env
+
+
 class JsonProcess:
     async def start(self, args, cwd, quiet=False):
-        self.proc = await asyncio.create_subprocess_exec(*args, cwd=cwd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL if quiet else sys.stderr, limit=4*1024*1024)
+        self.proc = await asyncio.create_subprocess_exec(*args, cwd=cwd, env=agent_environment(self), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL if quiet else sys.stderr, limit=4*1024*1024)
         self.serial = 0
         self.waiters = {}
         self.notifications = asyncio.Queue()
@@ -858,12 +1075,21 @@ class Codex(JsonProcess):
         return QuotaPaused('codex', resets_at, message)
 
     async def turn(self, prompt):
-        await self.rpc('turn/start', dict(threadId=self.native, input=[dict(type='text', text=prompt)]))
+        stall = watchdog(self)
+        stall.begin()
+        try:
+            await self.rpc('turn/start', dict(threadId=self.native, input=[dict(type='text', text=prompt)]))
+            await self.events(stall)
+        finally:
+            stall.end()
+
+    async def events(self, stall):
         limited = None
         while True:
-            event = await self.notifications.get()
+            event = await stall.wait(self.notifications.get())
             if 'disconnected' in event:
                 raise RuntimeError(event['disconnected'])
+            stall.event(*codex_tool_calls(event))
             method, params = event.get('method', ''), event.get('params', {})
             if method == 'account/rateLimits/updated' and isinstance(params.get('rateLimits'), dict):
                 usage = usage_snapshot('codex', params['rateLimits'], self.j.get('usage'))
@@ -890,6 +1116,8 @@ class Codex(JsonProcess):
                     if method == 'item/fileChange/requestApproval':
                         action['changes'] = self.items.get(params.get('itemId'), {}).get('changes')
                     allowed = await permission(self.j, method, action, self.a['workspace'])
+                    # Time spent waiting for a person is not tool silence.
+                    stall.event()
                     await self.send(dict(id=event['id'], result=dict(decision='accept' if allowed else ('decline' if 'decline' in params.get('availableDecisions', ['decline']) else 'cancel'))))
                 else:
                     await self.send(dict(id=event['id'], error=dict(code=-32601, message='Unsupported control; action denied')))
@@ -915,13 +1143,23 @@ class Claude(JsonProcess):
         await self.send(dict(type='configure', assignment=assignment, resume=journal.get('native_conversation_id')))
 
     async def turn(self, prompt):
-        await self.send(dict(type='prompt', text=prompt))
+        stall = watchdog(self)
+        stall.begin()
+        try:
+            await self.send(dict(type='prompt', text=prompt))
+            await self.events(stall)
+        finally:
+            stall.end()
+
+    async def events(self, stall):
         while True:
-            event = await self.notifications.get()
+            event = await stall.wait(self.notifications.get())
             if 'disconnected' in event:
                 raise RuntimeError(event['disconnected'])
+            stall.event(*claude_tool_calls(event))
             if event.get('type') == 'permission':
                 allowed = await permission(self.j, event['tool'], event['input'], self.a['workspace'])
+                stall.event()
                 await self.send(dict(type='decision', id=event['request_id'], allowed=allowed))
             elif event.get('type') == 'peer':
                 if event.get('to') not in [p['id'] for p in self.j.get('assignment').get('peers', [])]:
@@ -1079,7 +1317,7 @@ class Cursor:
         return []
 
     async def turn(self, prompt):
-        self.proc = await asyncio.create_subprocess_exec(*self.command(prompt), cwd=self.a['workspace'],
+        self.proc = await asyncio.create_subprocess_exec(*self.command(prompt), cwd=self.a['workspace'], env=agent_environment(self),
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=4*1024*1024)
         errors, result = [], None
         stream = Coalescer(self.j, self.delta_block, self.merge_deltas)
@@ -1093,15 +1331,18 @@ class Cursor:
                 if text:
                     errors.append(text)
         drained = asyncio.create_task(drain_stderr())
+        stall = watchdog(self)
+        stall.begin()
         try:
             while True:
-                raw = await self.proc.stdout.readline()
+                raw = await stall.wait(self.proc.stdout.readline())
                 if not raw:
                     break
                 try:
                     event = json.loads(raw)
                 except ValueError:
                     continue
+                stall.event(*cursor_tool_calls(event))
                 stream.add(event)
                 kind = event.get('type')
                 if kind == 'error':
@@ -1126,6 +1367,7 @@ class Cursor:
             if result.get('is_error') or result.get('subtype') != 'success':
                 raise RuntimeError('Cursor turn ended with '+str(result.get('subtype'))+': '+str(result.get('error') or result.get('result', ''))[:2000])
         finally:
+            stall.end()
             stream.flush()
             if self.proc.returncode is None:
                 self.proc.kill()
@@ -1220,8 +1462,8 @@ class OpenCode:
         self.url = 'http://127.0.0.1:'+str(port)
         self.auth = 'Basic '+base64.b64encode(('opencode:'+password).encode()).decode()
         mode = 'allow' if assignment.get('autonomy') == 'yolo' else 'ask'
-        env = dict(os.environ, OPENCODE_SERVER_PASSWORD=password,
-                   OPENCODE_CONFIG_CONTENT=encode({'permission': {'*': mode}, 'agent': {'build': {'permission': {'*': mode}}}}))
+        env = agent_environment(self, dict(os.environ, OPENCODE_SERVER_PASSWORD=password,
+                   OPENCODE_CONFIG_CONTENT=encode({'permission': {'*': mode}, 'agent': {'build': {'permission': {'*': mode}}}})))
         self.proc = await asyncio.create_subprocess_exec(executable('opencode'), 'serve', '--pure', '--hostname', '127.0.0.1', '--port', str(port),
                     cwd=assignment['workspace'], env=env, stdout=asyncio.subprocess.DEVNULL, stderr=sys.stderr)
         for attempt in range(40):
@@ -1280,6 +1522,15 @@ class OpenCode:
         # earlier messages out of the newest page. Creation times, not ids,
         # order them: the 48-bit id timestamp wraps.
         chain = {message_id}
+        stall = watchdog(self)
+        stall.begin()
+        try:
+            await self.poll(message_id, started, actions, chain, stall)
+        finally:
+            stall.end()
+
+    async def poll(self, message_id, started, actions, chain, stall):
+        seen = None
         while True:
             for request in await self.http('GET', '/permission'):
                 if request.get('sessionID') != self.native:
@@ -1311,6 +1562,7 @@ class OpenCode:
                     tool = 'opencode-permission/'+request['permission']
                     arguments = dict(request=request, tool_input=arguments)
                 allowed = await permission(self.j, tool, arguments, self.a['workspace'])
+                stall.event()
                 await self.http('POST', '/permission/'+request['id']+'/reply', {'reply': 'once' if allowed else 'reject'})
             # OpenCode returns the newest `limit` messages in chronological order.
             messages = await self.http('GET', '/session/'+self.native+'/message?limit=100')
@@ -1319,6 +1571,14 @@ class OpenCode:
                 created = (info.get('time') or {}).get('created')
                 if info.get('role') == 'user' and info.get('id') and isinstance(created, (int, float)) and created >= started:
                     chain.add(info['id'])
+            # Journaled revisions skip streaming text and tool output; any
+            # change to the polled messages is activity.
+            digest = hashlib.sha256(encode(messages).encode()).hexdigest()
+            if digest != seen:
+                seen = digest
+                stall.event(running=opencode_tool_calls(messages, chain))
+            else:
+                stall.check()
             terminal = []
             for message in messages:
                 info = message.get('info', {})
@@ -1487,6 +1747,23 @@ def reconcile(journal, request):
     return dict(resuming=True, recovery_id=recovery_id, native_conversation_id=native, tmux_name=pane['tmux_name'])
 
 
+def initial_prompt(assignment):
+    peers = assignment.get('peers', [])
+    return ('You are the real worker for this Hive assignment. Work only on your assigned device and workspace. '
+            'Implement, test, and verify the acceptance criteria. Keep services independent of this process. '
+            'Use the native hive peer tool when available, otherwise the peer command below, for questions, answers, interface agreements, and deployment results; '
+            'never impersonate peers or SSH into their machines. After a peer question, end this turn briefly if a reply is needed; Hive delivers it into this same session. Do not sleep or poll for peer replies. '
+            'Never leave background processes attached to the tool\'s stdout/stderr: the tool call cannot finish while one holds its output open. '
+            'Start them with nohup or setsid and `>file 2>&1 </dev/null`, or avoid background loops. '
+            'Include evidence and actual commands in your final response.\n\n'
+            'Planner objective:\n'+assignment.get('objective', '')+'\n\n'
+            'User brief:\n'+assignment.get('user_brief', '')+'\n\n'
+            'Assignment metadata:\n'+encode(assignment)+'\n'
+            'Peer command: '+shlex.join([sys.executable, str(Path(__file__).resolve()), 'peer', '--run-id', assignment['id']])
+            +' --to PEER_RUN_ID --kind question|answer|agreement|deployment --body "message"\n'
+            'Team (peer roles, owned paths, status and dependencies): '+encode(peers))
+
+
 async def run(assignment, journal):
     # Holding a filesystem lock for the process lifetime prevents duplicate owners.
     import fcntl
@@ -1515,15 +1792,13 @@ async def run(assignment, journal):
     journal.set('pid', os.getpid())
     journal.state('working')
     adapter = {'codex': Codex, 'claude': Claude, 'agy': Agy, 'opencode': OpenCode, 'cursor': Cursor}[assignment['agent']]()
+    # Every runner process issues a fresh credential for its own native agent,
+    # replacing any hash from an earlier process of this run. It reaches the
+    # agent only through its environment, never the prompt or the journal.
+    adapter.credential = journal.issue_credential()
     try:
         await adapter.connect(assignment, journal)
-        peers = assignment.get('peers', [])
-        prompt = ('You are the real worker for this Hive assignment. Work only on your assigned device and workspace. '
-                  'Implement, test, and verify the acceptance criteria. Keep services independent of this process. '
-                  'Use the native hive peer tool when available, otherwise the peer command below, for questions, answers, interface agreements, and deployment results; '
-                  'never impersonate peers or SSH into their machines. After a peer question, end this turn briefly if a reply is needed; Hive delivers it into this same session. Do not sleep or poll for peer replies. Include evidence and actual commands in your final response.\n'
-                  + encode(assignment)+'\nPeer command: '+shlex.join([sys.executable, str(Path(__file__).resolve()), 'peer', '--run-id', assignment['id']])
-                  +' --to PEER_RUN_ID --kind question|answer|agreement|deployment --body "message"\nTeam (peer roles, owned paths, status and dependencies): '+encode(peers))
+        prompt = initial_prompt(assignment)
         if not journal.db.execute("SELECT 1 FROM inbox WHERE id='initial'").fetchone():
             journal.enqueue(dict(id='initial', text=prompt))
         recovery_message = 'recovery-'+authorization['id'] if authorization else None
@@ -1614,14 +1889,166 @@ def without_hive_env(argv):
     return ['env', *[arg for name in names for arg in ('-u', name)], *argv] if names else list(argv)
 
 
+def peer_authorized(root, credential):
+    """True only if `credential` is the one issued to this run's native agent.
+
+    Reads without the Journal constructor so a refused command writes nothing:
+    no journal directory, schema, event or state for a forged or unknown run.
+    """
+    database = Path(root)/'journal.db'
+    if not credential or not database.is_file():
+        return False
+    db = sqlite3.connect(str(database), timeout=30)
+    try:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='credentials'").fetchone():
+            return False
+        row = db.execute("SELECT sha256 FROM credentials WHERE name='peer'").fetchone()
+    finally:
+        db.close()
+    return bool(row) and hmac.compare_digest(row[0], hashlib.sha256(credential.encode()).hexdigest())
+
+
+def peer(ident, args, credential):
+    """The peer shell command for agents without a native Hive peer tool.
+
+    It speaks only for the run whose runner issued the presented credential;
+    the credential is checked against the target journal's stored hash before
+    anything is written.
+    """
+    if not peer_authorized(BASE/ident, credential):
+        raise SystemExit('Peer command refused: it must run inside run '+ident+"'s own agent process")
+    if not args.to or not args.kind or not args.body or len(args.body) > 16000:
+        raise SystemExit('Peer, kind and 1–16000 byte body required')
+    journal = Journal(BASE/ident)
+    journal.redact.add(credential)
+    assignment = journal.get('assignment') or {}
+    if args.to not in [p['id'] for p in assignment.get('peers', [])]:
+        raise SystemExit('Peer is not in this task')
+    journal.emit('peer', dict(to=args.to, kind=args.kind, text=args.body))
+    if args.kind == 'question':
+        journal.state('waiting-for-peer')
+
+
+def acceptance_path(root, relative, allow_root=False):
+    if not isinstance(relative, str) or not relative or relative.startswith(('/', '~')) or any(c in relative for c in '\n\r\0\\'):
+        raise ValueError('Acceptance path must be workspace-relative')
+    if not (allow_root and relative == '.') and any(p in ('', '.', '..') for p in relative.split('/')):
+        raise ValueError('Acceptance path must not traverse outside its workspace')
+    path = (root/relative).resolve()
+    path.relative_to(root)
+    return path
+
+
+def acceptance_command(argv, cwd, timeout):
+    """Measure an argv directly, retaining bounded output and killing its own
+    process group on timeout (including children that keep stdout open)."""
+    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    output = bytearray()
+    timed_out = False
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                for key, _ in selector.select(min(remaining, .1)):
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    output.extend(chunk)
+                    del output[:-8192]
+            if not timed_out:
+                try:
+                    proc.wait(timeout=max(.001, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+    finally:
+        if timed_out or proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        proc.wait()
+        proc.stdout.close()
+    detail = ('timeout' if timed_out else 'exit='+str(proc.returncode)) + '\n' + output.decode('utf-8', errors='replace')
+    return not timed_out and proc.returncode == 0, detail
+
+
+def acceptance(journal, request):
+    """Coordinator-invoked checks, never worker-reported test results. The
+    request supplies the frozen workspace/checks from the coordinator DB."""
+    turn = request['turn_seq']
+    settled = lambda: (journal.get('state') == 'completed' and journal.completed_turn() == turn
+                       and not journal.db.execute("SELECT 1 FROM inbox WHERE state!='acknowledged'").fetchone()
+                       and not journal.db.execute('SELECT 1 FROM approvals WHERE consumed=0 AND decision IS NULL').fetchone())
+    if not settled():
+        return dict(stale=True)
+    checks = request['checks']
+    if not isinstance(checks, list) or len(checks) > 32:
+        raise ValueError('At most 32 acceptance checks')
+    total = 0
+    for check in checks:
+        if check.get('kind') == 'command':
+            argv, timeout = check.get('argv'), check.get('timeout_seconds')
+            if not isinstance(argv, list) or not 1 <= len(argv) <= 128 or not all(isinstance(a, str) and '\0' not in a for a in argv) or not argv[0].strip():
+                raise ValueError('Acceptance command requires argv')
+            if type(timeout) is not int or not 1 <= timeout <= 120:
+                raise ValueError('Acceptance timeout must be 1–120 seconds')
+            total += timeout
+        elif check.get('kind') != 'file_exists':
+            raise ValueError('Unknown acceptance check kind')
+    if total > 600:
+        raise ValueError('Acceptance checks exceed 600 seconds')
+    # A lost control-plane response must not rerun commands. Interrupted checks
+    # fail closed and can be repaired in a new native turn, with bounded rework.
+    journal.db.execute('CREATE TABLE IF NOT EXISTS acceptance (turn_seq INTEGER PRIMARY KEY, request TEXT NOT NULL, result TEXT)')
+    with journal.db:
+        inserted = journal.db.execute('INSERT OR IGNORE INTO acceptance VALUES (?,?,NULL)', (turn, encode(request))).rowcount
+    if not inserted:
+        row = journal.db.execute('SELECT request,result FROM acceptance WHERE turn_seq=?', (turn,)).fetchone()
+        if row['request'] != encode(request):
+            raise ValueError('Acceptance checks changed for an already measured turn')
+        if row['result']:
+            return json.loads(row['result'])
+        return dict(turn_seq=turn, measurements=[dict(check=c, passed=False, detail='Prior acceptance execution interrupted or still running; commands were not replayed') for c in checks])
+    measured = []
+    for check in checks:
+        try:
+            root = Path(request['workspace']).expanduser().resolve(strict=True)
+            if check['kind'] == 'file_exists':
+                path = acceptance_path(root, check['path'])
+                passed = path.is_file()
+                detail = check['path'] + (': file exists' if passed else ': required file missing')
+            else:
+                cwd = acceptance_path(root, check['cwd'], allow_root=True)
+                reason = policy('Bash', dict(command=shlex.join(check['argv']), cwd=str(cwd)), str(root), calling_run(journal))
+                if reason and not yolo(journal):
+                    raise ValueError('Acceptance command needs explicit authorization under the reviewed policy: '+reason)
+                passed, detail = acceptance_command(check['argv'], cwd, check['timeout_seconds'])
+        except (OSError, ValueError) as error:
+            passed, detail = False, str(error)
+        measured.append(dict(check=check, passed=passed, detail=detail))
+    result = dict(turn_seq=turn, measurements=measured) if settled() else dict(stale=True)
+    with journal.db:
+        journal.db.execute('UPDATE acceptance SET result=? WHERE turn_seq=?', (encode(result), turn))
+    return result
+
+
 def main():
     os.umask(0o077)
-    # Nothing here reads Hive's own variables; agents started below must not
-    # see them either.
+    # Only the peer subcommand reads a Hive variable: the credential its own
+    # runner gave the native agent. Everything else, and every agent started
+    # below, must not see Hive's variables.
+    credential = os.environ.get(RUN_CREDENTIAL_ENV)
     for name in hive_env_names(os.environ):
         del os.environ[name]
-    parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=['probe', 'assess', 'launch', 'run', 'snapshot', 'enqueue', 'decide', 'peer', 'hook', 'mcp', 'reconcile-inspect', 'reconcile'])
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument('operation', choices=['probe', 'assess', 'acceptance', 'launch', 'run', 'snapshot', 'enqueue', 'decide', 'peer', 'hook', 'mcp', 'reconcile-inspect', 'reconcile'])
     parser.add_argument('--run-id')
     parser.add_argument('--after', type=int, default=0)
     parser.add_argument('--to')
@@ -1630,12 +2057,22 @@ def main():
     args = parser.parse_args()
     if args.operation == 'assess':
         action = json.load(sys.stdin)
-        print(encode({'reason': policy(action['tool'], action['arguments'], action['workspace'])}))
+        # --run-id names the run that requested the action; without it no
+        # peer command is assessed as routine.
+        run_id = str(uuid.UUID(args.run_id)) if args.run_id else None
+        print(encode({'reason': policy(action['tool'], action['arguments'], action['workspace'], run_id)}))
         return
     if args.operation == 'probe':
         print(encode(probe()))
         return
     ident = str(uuid.UUID(args.run_id))
+    if args.operation == 'peer':
+        peer(ident, args, credential)
+        return
+    # Reads must not create a journal: during launch the runner has not made
+    # one yet, and an empty journal would be reported as a run with no state.
+    if args.operation in ('snapshot', 'acceptance') and not (BASE/ident/'journal.db').is_file():
+        raise SystemExit('No journal yet for run '+ident)
     journal = Journal(BASE/ident)
     if args.operation == 'mcp':
         mcp_peer(journal)
@@ -1672,6 +2109,8 @@ def main():
             time.sleep(30)
     elif args.operation == 'snapshot':
         print(encode(journal.snapshot(args.after)))
+    elif args.operation == 'acceptance':
+        print(encode(acceptance(journal, json.load(sys.stdin))))
     elif args.operation == 'reconcile-inspect':
         print(encode(recovery_snapshot(journal)))
     elif args.operation == 'reconcile':
@@ -1684,21 +2123,12 @@ def main():
         if journal.get('assignment', {}).get('agent') == 'agy':
             row = journal.db.execute('SELECT action FROM approvals WHERE id=?', (request['id'],)).fetchone()
             journal.enqueue(dict(id='approval-'+request['id'], text='The user chose '+request['decision']+' for this exact action: '+row[0]+'. Continue the same task; the hook has a single-use grant only if approved.'))
-    elif args.operation == 'peer':
-        if not args.to or not args.kind or not args.body or len(args.body) > 16000:
-            raise ValueError('Peer, kind and 1–16000 byte body required')
-        assignment = journal.get('assignment')
-        if args.to not in [p['id'] for p in assignment.get('peers', [])]:
-            raise ValueError('Peer is not in this task')
-        journal.emit('peer', dict(to=args.to, kind=args.kind, text=args.body))
-        if args.kind == 'question':
-            journal.state('waiting-for-peer')
     elif args.operation == 'hook':
         request = json.load(sys.stdin)
         call = request.get('toolCall', {})
         assignment = journal.get('assignment')
         action = dict(tool=call.get('name'), arguments=call.get('args', {}), workspace=assignment['workspace'])
-        reason = policy(action['tool'], action['arguments'], action['workspace'])
+        reason = policy(action['tool'], action['arguments'], action['workspace'], assignment.get('id'))
         if not reason or assignment.get('autonomy') == 'yolo':
             print(encode(dict(decision='allow')))
             return

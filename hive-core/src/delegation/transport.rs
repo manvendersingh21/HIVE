@@ -158,6 +158,7 @@ pub async fn control(
         [
             "launch",
             "snapshot",
+            "acceptance",
             "enqueue",
             "decide",
             "reconcile-inspect",
@@ -167,14 +168,22 @@ pub async fn control(
         "Invalid runner operation"
     );
     uuid::Uuid::parse_str(id)?;
-    ssh(
+    // Current read/check code also understands legacy journals. Keep their
+    // persistent native runner and conversation intact during upgrades.
+    let executable = if matches!(operation, "snapshot" | "acceptance") {
+        let source = format!("__file__ = {}\n{}", serde_json::to_string(runner)?, RUNNER);
+        format!("python3 -c {}", quote(&source))
+    } else {
+        format!("python3 {}", quote(runner))
+    };
+    ssh_timeout(
         worker,
         &format!(
-            "python3 {} {operation} --run-id {} --after {after}",
-            quote(runner),
+            "{executable} {operation} --run-id {} --after {after}",
             quote(id)
         ),
         input,
+        if operation == "acceptance" { 660 } else { 45 },
     )
     .await
 }
@@ -214,13 +223,32 @@ pub async fn update_peers(worker: &WorkerInfo, id: &str, peers: &Value) -> anyho
 mod tests {
     use super::*;
 
+    /// A peer command may only speak for the run whose runner issued the
+    /// presented credential (audit regression, peer_spoof_repro.py).
+    #[test]
+    fn peer_commands_cannot_impersonate_another_run() {
+        let output = std::process::Command::new("python3")
+            .args(["-m", "unittest", "-v", "test_peer_identity"])
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src/delegation/runner"))
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn roster_transition_queues_exactly_one_prompt_refresh() {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let path = std::env::temp_dir().join(format!("hive-team-{}.db", uuid::Uuid::new_v4()));
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE inbox(id TEXT PRIMARY KEY,payload TEXT); INSERT INTO metadata VALUES ('assignment','{\"peers\":[]}');").unwrap();
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE inbox(id TEXT PRIMARY KEY,payload TEXT); INSERT INTO metadata VALUES ('assignment','{\"peers\":[]}');").unwrap();
+        }
         let script = UPDATE_PEERS_SCRIPT.replace(
             "pathlib.Path.home()/'.hive'/'runs'/v['id']/'journal.db'",
             &format!("pathlib.Path({})", serde_json::to_string(&path).unwrap()),
@@ -234,14 +262,21 @@ mod tests {
         let peers = json!([{"id":"peer", "role":"backend", "owned_paths":["src/**"], "status":"working", "dependencies":[]}]);
         update(peers.clone());
         update(peers.clone()); // Lost reply / repeated synchronization.
-        assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
-        let prompt: String = db.query_row("SELECT payload FROM inbox", [], |r| r.get(0)).unwrap();
-        assert!(prompt.contains("backend") && prompt.contains("src/**") && prompt.contains("working"));
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+            let prompt: String = db.query_row("SELECT payload FROM inbox", [], |r| r.get(0)).unwrap();
+            assert!(prompt.contains("backend") && prompt.contains("src/**") && prompt.contains("working"));
+        }
         update(json!([]));
         update(peers); // A -> B -> A is another change, not a duplicate.
-        assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 3);
-        drop(db);
-        std::fs::remove_file(path).unwrap();
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 3);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     fn coordinator() -> WorkerInfo {

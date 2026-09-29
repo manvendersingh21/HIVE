@@ -23,6 +23,19 @@ const GROUPS: [string, (state: string) => boolean][] = [
   ["Finished", (s) => ["done", "stale"].includes(stateTone(s))],
 ];
 type Host = { host: string; name: string };
+// The header is a JSON array of messages; anything else (a proxy's rewrite,
+// an older server) is shown as-is rather than breaking the page.
+function sessionErrors(header: string | null): string {
+  const text = header?.trim();
+  if (!text) return "";
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed.map(String).join("; ");
+    return typeof parsed === "string" ? parsed : text;
+  } catch {
+    return text;
+  }
+}
 export default function SessionsPage() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [hosts, setHosts] = useState<Host[]>([
@@ -43,13 +56,7 @@ export default function SessionsPage() {
     try {
       const response = await request("/api/sessions");
       setSessions(await response.json());
-      setWarning(
-        (
-          JSON.parse(
-            response.headers.get("x-hive-session-errors") || "[]",
-          ) as string[]
-        ).join("; "),
-      );
+      setWarning(sessionErrors(response.headers.get("x-hive-session-errors")));
       setHosts(await api<Host[]>("/api/session-hosts"));
       setLoadError("");
     } catch (e) {
