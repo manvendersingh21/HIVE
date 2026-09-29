@@ -34,6 +34,7 @@ use hive_core::memory::MemorySystem;
 use hive_core::skills::SkillRegistry;
 use hive_core::workers::WorkerPool;
 use serde::Deserialize;
+use serde_json::{json, Value};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
@@ -52,6 +53,7 @@ struct AppState {
     agent: chat::AgentHandle,
     workers: workers::WorkerIngest,
     incidents: incidents::IncidentReview,
+    db_ok: bool,
 }
 
 impl FromRef<AppState> for auth::Auth {
@@ -82,7 +84,7 @@ impl FromRef<AppState> for incidents::IncidentReview {
 ///
 /// Workers without master configuration still serve terminals. Configured
 /// masters keep saved chats available when inference is temporarily offline.
-async fn build_agent(master_name: &str) -> chat::AgentHandle {
+async fn build_agent(master_name: &str) -> (chat::AgentHandle, bool) {
     let root = std::env::var("HIVE_CONFIG_ROOT").unwrap_or_else(|_| ".".to_string());
     let root = std::path::Path::new(&root);
 
@@ -90,9 +92,27 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
         Ok(c) => c,
         Err(e) => {
             info!(error = %e, "no hive config found — serving terminals only, chat disabled");
-            return chat::AgentHandle::disabled();
+            return (chat::AgentHandle::disabled(), false);
         }
     };
+
+    let db_path = config.database.resolved_path();
+    let db_ok = if db_path.exists() {
+        match hive_core::rusqlite::Connection::open(&db_path) {
+            Ok(conn) => {
+                let res: Result<String, _> = conn.query_row("PRAGMA quick_check", [], |r| r.get(0));
+                matches!(res, Ok(s) if s == "ok")
+            }
+            Err(_) => false,
+        }
+    } else {
+        true
+    };
+
+    if !db_ok {
+        warn!(path = %db_path.display(), "database failed quick_check");
+        return (chat::AgentHandle::disabled(), false);
+    }
 
     let workers_config =
         WorkersConfig::from_project_root(root).unwrap_or(WorkersConfig { workers: vec![] });
@@ -117,11 +137,11 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
 
     // Web messages must be durable; never advertise saved chats over an
     // in-memory fallback when opening the configured database fails.
-    let memory = match MemorySystem::open_for_reindex(config.database.resolved_path(), &config) {
+    let memory = match MemorySystem::open_for_reindex(&db_path, &config) {
         Ok(memory) => memory,
         Err(e) => {
             warn!(error = %e, "chat database unavailable");
-            return chat::AgentHandle::disabled();
+            return (chat::AgentHandle::disabled(), false);
         }
     };
     // Loaded, not empty: the web chat resolves skills at request time; a
@@ -173,7 +193,7 @@ async fn build_agent(master_name: &str) -> chat::AgentHandle {
     if handle.agent.is_some() {
         delegation::start(handle.clone());
     }
-    handle
+    (handle, true)
 }
 
 #[tokio::main]
@@ -214,11 +234,13 @@ async fn main() -> anyhow::Result<()> {
     let static_dir =
         std::env::var("HIVE_WEB_STATIC").unwrap_or_else(|_| "hive-web/static".to_string());
     let master_name = std::env::var("HIVE_MASTER_NAME").unwrap_or_else(|_| hostname_or("master"));
+    let (agent, db_ok) = build_agent(&master_name).await;
     let state = AppState {
         auth: auth::Auth::new(password),
-        agent: build_agent(&master_name).await,
+        agent,
         workers,
         incidents: incidents::IncidentReview::from_env(),
+        db_ok,
     };
 
     let app = app_router(state, &static_dir);
@@ -226,6 +248,16 @@ async fn main() -> anyhow::Result<()> {
     info!(%bind_addr, static_dir = %static_dir, "Hive Web listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn health(State(s): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "status": if s.db_ok { "ok" } else { "degraded" },
+        "db": {
+            "db_ok": s.db_ok
+        },
+        "db_ok": s.db_ok
+    }))
 }
 
 fn app_router(state: AppState, static_dir: &str) -> Router {
@@ -244,7 +276,7 @@ fn app_router(state: AppState, static_dir: &str) -> Router {
         )
         .route("/logout", post(auth::logout))
         .route("/api/session-hosts", get(session_hosts))
-        .route("/api/health", get(|| async { "ok" }))
+        .route("/api/health", get(health))
         .route("/api/capabilities", get(chat::capabilities))
         .route(
             "/api/settings/master-agent",
@@ -373,6 +405,7 @@ mod router_tests {
             agent: chat::AgentHandle::disabled(),
             workers: workers::WorkerIngest::from_env(),
             incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()),
+            db_ok: true,
         };
         // The frontend export isn't in git; stand in for the pages it ships.
         let dir = std::env::temp_dir().join(format!("hive-web-gate-{}", uuid::Uuid::new_v4()));
@@ -484,6 +517,7 @@ mod router_tests {
             agent: chat::AgentHandle::disabled(),
             workers: workers::WorkerIngest::from_env(),
             incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()),
+            db_ok: true,
         };
         let app = app_router(state, dir.to_str().unwrap());
         let login = app
@@ -520,6 +554,53 @@ mod router_tests {
                 .unwrap();
             assert_eq!(body, format!("<p>runtime {file}</p>").as_bytes(), "{path}");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn health_reports_db_ok_false_for_corrupt_fixture() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!("hive-corrupt-health-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("corrupt.db");
+        {
+            let conn = hive_core::rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT); INSERT INTO t VALUES (1, 'test'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&db_path).unwrap();
+        file.seek(SeekFrom::Start(100)).unwrap();
+        file.write_all(&vec![0xff; 200]).unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let quick_check_ok = match hive_core::rusqlite::Connection::open(&db_path) {
+            Ok(conn) => {
+                let res: Result<String, _> = conn.query_row("PRAGMA quick_check", [], |r| r.get(0));
+                matches!(res, Ok(s) if s == "ok")
+            }
+            Err(_) => false,
+        };
+        assert!(!quick_check_ok);
+
+        let state = AppState {
+            auth: auth::Auth::new("test".into()),
+            agent: chat::AgentHandle::disabled(),
+            workers: workers::WorkerIngest::from_env(),
+            incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()),
+            db_ok: quick_check_ok,
+        };
+        let app = app_router(state, dir.to_str().unwrap());
+        let res = app
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["db"]["db_ok"], false);
+        assert_eq!(body["db_ok"], false);
+        assert_eq!(body["status"], "degraded");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
@@ -614,7 +695,7 @@ async fn list_sessions(State(h): State<chat::AgentHandle>) -> Response {
         }
     }
     if let Ok(store) = delegation::store(&h) {
-        if let Ok(runs) = store.list() {
+        if let Ok((runs, _)) = store.list() {
             for run in runs {
                 // Runs on the coordinator live in its local tmux server.
                 let host = match h.agent.as_deref().and_then(|a| {

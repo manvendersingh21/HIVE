@@ -28,7 +28,7 @@ config=(ROOT/'config/hive.toml').read_text().replace('path = "~/.hive/hive.db"',
 (root/'config/workers.toml').write_text((ROOT/'config/workers.toml').read_text())
 with socket.socket() as sock:
     sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
-env=dict(os.environ,HIVE_CONFIG_ROOT=str(root),HIVE_WEB_ADDR=f'127.0.0.1:{port}',HIVE_WEB_PASSWORD='workflow-test-password',HIVE_MASTER_NAME='manus-mac-mini',HIVE_WEB_STATIC=str(ROOT/'hive-web/static'),RUST_LOG='hive_web=info,hive_core=info')
+env=dict(os.environ,HOME=str(root),HIVE_CONFIG_ROOT=str(root),HIVE_WEB_ADDR=f'127.0.0.1:{port}',HIVE_WEB_PASSWORD='workflow-test-password',HIVE_MASTER_NAME='manus-mac-mini',HIVE_WEB_STATIC=str(ROOT/'hive-web/static'),RUST_LOG='hive_web=info,hive_core=info')
 log=(root/'web.log').open('w+')
 web=subprocess.Popen([str(ROOT/'target/debug/hive-web')],cwd=root,env=env,stdout=log,stderr=log)
 cookie=''

@@ -756,6 +756,47 @@ class AdapterContracts(unittest.IsolatedAsyncioTestCase):
     def test_cursor_probe_uses_the_cursor_agent_binary(self):
         self.assertEqual(runner.executable('cursor'), runner.executable('cursor-agent'))
 
+    CURSOR_HELP_FLAGS = ('--print', '--output-format', 'stream-json', '--trust',
+                         '--workspace', '--force', '--resume', '--model')
+
+    def cursor_cli(self, help_flags, logged_in=True):
+        """A fake `cursor-agent` that answers the four calls probe() makes."""
+        script = self.root/'fake-cursor-agent'
+        lines = [
+            '#!/bin/sh',
+            'case "$1" in',
+            '  --version) echo 2026.09.26-dd393fe ;;',
+            '  --help) printf \'%s\\n\' '+shlex.quote('  '+' '.join(help_flags))+' ;;',
+            '  status) echo '+shlex.quote('Logged in as someone@example.com' if logged_in else 'Not logged in')+' ;;',
+            '  --list-models) printf \'%s\\n\' "Available models" "gpt-5.2 - GPT-5.2 Medium" ;;',
+            'esac',
+        ]
+        script.write_text('\n'.join(lines)+'\n')
+        script.chmod(0o755)
+        return script
+
+    def probe_cursor(self, **kwargs):
+        script = self.cursor_cli(**kwargs)
+        with patch.object(runner, 'AGENTS', ('cursor',)), \
+                patch.object(runner, 'executable', return_value=str(script)):
+            return runner.probe()[0]
+
+    def test_cursor_probe_needs_every_documented_flag(self):
+        ready = self.probe_cursor(help_flags=self.CURSOR_HELP_FLAGS)
+        self.assertTrue(ready['runtime_ready'])
+        self.assertEqual(ready['authentication'], 'authenticated')
+        self.assertEqual(ready['models'], ['gpt-5.2'])
+        # A build that has dropped any one documented flag cannot run a
+        # headless turn, so the probe must not call it ready. This is what
+        # keeps an `any(...)` slip from quietly passing a broken CLI.
+        for index, flag in enumerate(self.CURSOR_HELP_FLAGS):
+            partial = self.CURSOR_HELP_FLAGS[:index]+self.CURSOR_HELP_FLAGS[index+1:]
+            with self.subTest(missing=flag):
+                self.assertFalse(self.probe_cursor(help_flags=partial)['runtime_ready'])
+        # An unproven login stays unknown instead of claiming a session.
+        unproven = self.probe_cursor(help_flags=self.CURSOR_HELP_FLAGS, logged_in=False)
+        self.assertEqual(unproven['authentication'], 'unknown')
+
     def elicitation(self, tool, args):
         return dict(serverName='hive', threadId='native-thread', mode='form',
                     message='Allow the hive MCP server to run tool "'+tool+'"?',

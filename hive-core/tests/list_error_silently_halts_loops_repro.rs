@@ -52,10 +52,11 @@ fn test_list_error_silently_halts_loops_repro() {
     // On unmodified code, store.list() fails completely with Err, which causes
     // background loops to silently drop the error and halt processing all runs.
     // After the fix, one corrupt row is skipped with a logged reason and the valid run is returned.
-    let list_result = store.list().expect(
+    let (list_result, error_count) = store.list().expect(
         "one corrupted row must not fail the whole list; bad row should be skipped or quarantined instead of halting loops"
     );
 
+    assert_eq!(error_count, 1, "one unreadable row must surface in error count");
     assert_eq!(list_result.len(), 1, "the valid row must be returned");
     assert_eq!(&list_result[0].id, valid_id, "returned run must be the uncorrupted run");
 }
