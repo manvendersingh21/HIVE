@@ -865,9 +865,15 @@ async fn sync_run(
             serde_json::to_string(runner)?,
             transport::RUNNER
         );
+        // The run ID binds the assessment to the run that asked: a peer
+        // command naming any other run is never auto-approved.
         let raw = transport::ssh(
             &worker,
-            &format!("python3 -c {} assess", transport::quote(&source)),
+            &format!(
+                "python3 -c {} assess --run-id {}",
+                transport::quote(&source),
+                transport::quote(&run.id)
+            ),
             Some(&action),
         )
         .await?;

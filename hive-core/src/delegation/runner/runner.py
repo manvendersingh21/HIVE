@@ -7,10 +7,12 @@ side effects. The persistent process owns the native conversation and approvals.
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import sqlite3
@@ -24,6 +26,10 @@ AGENTS = ('claude', 'codex', 'opencode', 'agy', 'cursor')
 # Agent type -> CLI binary, for the ones whose executable is not the type name.
 EXECUTABLES = {'cursor': 'cursor-agent'}
 BASE = Path.home() / '.hive' / 'runs'
+# The per-run peer credential reaches the native agent only through this
+# environment variable. Codex's default shell policy drops names containing
+# KEY, SECRET or TOKEN, so the name avoids them.
+RUN_CREDENTIAL_ENV = 'HIVE_RUN_CREDENTIAL'
 
 
 def encode(value):
@@ -145,12 +151,21 @@ class Journal:
         CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, kind TEXT, payload TEXT);
         CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued');
         CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL, decision TEXT, consumed INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS credentials (name TEXT PRIMARY KEY, sha256 TEXT NOT NULL);
         ''')
         self.db.commit()
+        # Values that must never be journaled or printed, e.g. the run credential
+        # if an agent echoes its own environment.
+        self.redact = set()
+
+    def scrub(self, text):
+        for value in self.redact:
+            text = text.replace(value, '[redacted]')
+        return text
 
     def set(self, key, value):
         with self.db:
-            self.db.execute('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, encode(value)))
+            self.db.execute('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, self.scrub(encode(value))))
 
     def get(self, key, default=None):
         row = self.db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
@@ -163,9 +178,23 @@ class Journal:
 
     def emit(self, kind, payload, event_id=None):
         with self.db:
-            self.db.execute('INSERT OR IGNORE INTO events(id,kind,payload) VALUES (?,?,?)', (event_id or str(uuid.uuid4()), kind, encode(payload)))
+            self.db.execute('INSERT OR IGNORE INTO events(id,kind,payload) VALUES (?,?,?)', (event_id or str(uuid.uuid4()), kind, self.scrub(encode(payload))))
         if not self.quiet:
-            print(encode(dict(kind=kind, payload=payload)), flush=True)
+            print(self.scrub(encode(dict(kind=kind, payload=payload))), flush=True)
+
+    def issue_credential(self):
+        """A fresh per-run peer credential; only its SHA-256 is stored.
+
+        The raw value lives in this runner's memory and the native agent's
+        environment (RUN_CREDENTIAL_ENV). It is never journaled: metadata,
+        events and snapshots do not include the credentials table.
+        """
+        credential = secrets.token_urlsafe(32)
+        with self.db:
+            self.db.execute('INSERT INTO credentials VALUES (?,?) ON CONFLICT(name) DO UPDATE SET sha256=excluded.sha256',
+                            ('peer', hashlib.sha256(credential.encode()).hexdigest()))
+        self.redact.add(credential)
+        return credential
 
     def state(self, state):
         self.set('state', state)
@@ -264,7 +293,12 @@ def shell_parts(command):
 
 # Unknown tools/commands ask. Shell metacharacters and interpreters never pass
 # through the routine-command allowlist. Native sandboxes remain enabled.
-def policy(tool, args, workspace):
+def policy(tool, args, workspace, run_id=None):
+    """None when an action is routine for the calling run, else the reason to ask.
+
+    `run_id` is the run whose agent requested the action. Without it, no peer
+    command is ever routine: a peer command may only speak for its own run.
+    """
     if tool in ('ListAgents', 'TodoWrite', 'ToolSearch', 'mcp__hive__peer'):
         return None
     root = Path(workspace).resolve()
@@ -297,7 +331,7 @@ def policy(tool, args, workspace):
             return str(error)
         if len(parts) != 1:
             for words in parts:
-                reason = policy(tool, dict(command=shlex.join(words)), workspace)
+                reason = policy(tool, dict(command=shlex.join(words)), workspace, run_id)
                 if reason:
                     return reason
             return None if parts else 'Empty command'
@@ -307,14 +341,19 @@ def policy(tool, args, workspace):
         # Native Codex exposes an explicit shell wrapper. Inspect its literal
         # body using the same deterministic parser, never an eval or execution.
         if len(words) == 3 and words[0] in ('/usr/bin/bash', '/bin/bash', '/bin/sh', '/bin/zsh') and words[1] in ('-c', '-lc'):
-            return policy(tool, dict(command=words[2]), workspace)
+            return policy(tool, dict(command=words[2]), workspace, run_id)
         if words[0] == 'nl' and len(words) == 3 and words[1] == '-ba' and inside(words[2]):
             return None
-        # The task-scoped peer command validates both run IDs itself.
-        if len(words) == 11 and words[0] in ('python3', sys.executable) and Path(words[1]).resolve() == Path(__file__).resolve() and words[2] == 'peer':
+        # The task-scoped peer command is routine only when it speaks for the
+        # calling run. Any other --run-id is an impersonation attempt and asks;
+        # the peer subcommand independently requires this run's credential.
+        if len(words) >= 3 and words[0] in ('python3', sys.executable) and Path(words[1]).resolve() == Path(__file__).resolve() and words[2] == 'peer':
             flags = dict(zip(words[3::2], words[4::2]))
-            if set(flags) == {'--run-id', '--to', '--kind', '--body'} and flags['--kind'] in ('question','answer','agreement','deployment'):
+            if (len(words) == 11 and len(flags) == 4 and set(flags) == {'--run-id', '--to', '--kind', '--body'} and
+                    flags['--kind'] in ('question','answer','agreement','deployment') and
+                    run_id is not None and flags['--run-id'] == str(run_id)):
                 return None
+            return 'Peer command does not speak for the calling run'
         # Routine test/build and isolated dependencies are explicitly authorized.
         # Shell composition, interpreter snippets and arbitrary install targets
         # still require review; native containment stays enabled.
@@ -334,7 +373,7 @@ def policy(tool, args, workspace):
         if words[0] == 'sort' and len(words)==1:
             return None
         if words[0] == 'timeout' and len(words)>2 and words[1].isdigit() and int(words[1])<=30:
-            return policy(tool, dict(command=shlex.join(words[2:])), workspace)
+            return policy(tool, dict(command=shlex.join(words[2:])), workspace, run_id)
         if words[0] == 'find' and words[1:] in (['.','-maxdepth','2','-type','f','-print'], ['.','-type','f','-print']):
             return None
         if words[:2]==['command','-v'] and len(words)==3 and re.fullmatch(r'[A-Za-z0-9_.-]+',words[2]):
@@ -391,8 +430,12 @@ def yolo(journal):
     return (journal.get('assignment') or {}).get('autonomy') == 'yolo'
 
 
+def calling_run(journal):
+    return (journal.get('assignment') or {}).get('id')
+
+
 async def permission(journal, tool, args, workspace):
-    reason = policy(tool, args, workspace)
+    reason = policy(tool, args, workspace, calling_run(journal))
     if reason is None or yolo(journal):
         return True
     ident = journal.pending(dict(tool=tool, arguments=args, workspace=workspace), reason)
@@ -432,9 +475,25 @@ class Coalescer:
             self.block = []
 
 
+def agent_environment(adapter, base=None):
+    """The native agent's environment: the runner's plus the run credential.
+
+    `run` sets `adapter.credential`; inventory probes have none and inherit
+    the runner environment unchanged. The credential is never placed in the
+    runner's own os.environ, so tmux, services and probes do not see it.
+    """
+    credential = getattr(adapter, 'credential', None)
+    if base is None and not credential:
+        return None
+    env = dict(os.environ if base is None else base)
+    if credential:
+        env[RUN_CREDENTIAL_ENV] = credential
+    return env
+
+
 class JsonProcess:
     async def start(self, args, cwd, quiet=False):
-        self.proc = await asyncio.create_subprocess_exec(*args, cwd=cwd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL if quiet else sys.stderr, limit=4*1024*1024)
+        self.proc = await asyncio.create_subprocess_exec(*args, cwd=cwd, env=agent_environment(self), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL if quiet else sys.stderr, limit=4*1024*1024)
         self.serial = 0
         self.waiters = {}
         self.notifications = asyncio.Queue()
@@ -1079,7 +1138,7 @@ class Cursor:
         return []
 
     async def turn(self, prompt):
-        self.proc = await asyncio.create_subprocess_exec(*self.command(prompt), cwd=self.a['workspace'],
+        self.proc = await asyncio.create_subprocess_exec(*self.command(prompt), cwd=self.a['workspace'], env=agent_environment(self),
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=4*1024*1024)
         errors, result = [], None
         stream = Coalescer(self.j, self.delta_block, self.merge_deltas)
@@ -1220,8 +1279,8 @@ class OpenCode:
         self.url = 'http://127.0.0.1:'+str(port)
         self.auth = 'Basic '+base64.b64encode(('opencode:'+password).encode()).decode()
         mode = 'allow' if assignment.get('autonomy') == 'yolo' else 'ask'
-        env = dict(os.environ, OPENCODE_SERVER_PASSWORD=password,
-                   OPENCODE_CONFIG_CONTENT=encode({'permission': {'*': mode}, 'agent': {'build': {'permission': {'*': mode}}}}))
+        env = agent_environment(self, dict(os.environ, OPENCODE_SERVER_PASSWORD=password,
+                   OPENCODE_CONFIG_CONTENT=encode({'permission': {'*': mode}, 'agent': {'build': {'permission': {'*': mode}}}})))
         self.proc = await asyncio.create_subprocess_exec(executable('opencode'), 'serve', '--pure', '--hostname', '127.0.0.1', '--port', str(port),
                     cwd=assignment['workspace'], env=env, stdout=asyncio.subprocess.DEVNULL, stderr=sys.stderr)
         for attempt in range(40):
@@ -1515,6 +1574,10 @@ async def run(assignment, journal):
     journal.set('pid', os.getpid())
     journal.state('working')
     adapter = {'codex': Codex, 'claude': Claude, 'agy': Agy, 'opencode': OpenCode, 'cursor': Cursor}[assignment['agent']]()
+    # Every runner process issues a fresh credential for its own native agent,
+    # replacing any hash from an earlier process of this run. It reaches the
+    # agent only through its environment, never the prompt or the journal.
+    adapter.credential = journal.issue_credential()
     try:
         await adapter.connect(assignment, journal)
         peers = assignment.get('peers', [])
@@ -1614,13 +1677,55 @@ def without_hive_env(argv):
     return ['env', *[arg for name in names for arg in ('-u', name)], *argv] if names else list(argv)
 
 
+def peer_authorized(root, credential):
+    """True only if `credential` is the one issued to this run's native agent.
+
+    Reads without the Journal constructor so a refused command writes nothing:
+    no journal directory, schema, event or state for a forged or unknown run.
+    """
+    database = Path(root)/'journal.db'
+    if not credential or not database.is_file():
+        return False
+    db = sqlite3.connect(str(database), timeout=30)
+    try:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='credentials'").fetchone():
+            return False
+        row = db.execute("SELECT sha256 FROM credentials WHERE name='peer'").fetchone()
+    finally:
+        db.close()
+    return bool(row) and hmac.compare_digest(row[0], hashlib.sha256(credential.encode()).hexdigest())
+
+
+def peer(ident, args, credential):
+    """The peer shell command for agents without a native Hive peer tool.
+
+    It speaks only for the run whose runner issued the presented credential;
+    the credential is checked against the target journal's stored hash before
+    anything is written.
+    """
+    if not peer_authorized(BASE/ident, credential):
+        raise SystemExit('Peer command refused: it must run inside run '+ident+"'s own agent process")
+    if not args.to or not args.kind or not args.body or len(args.body) > 16000:
+        raise SystemExit('Peer, kind and 1–16000 byte body required')
+    journal = Journal(BASE/ident)
+    journal.redact.add(credential)
+    assignment = journal.get('assignment') or {}
+    if args.to not in [p['id'] for p in assignment.get('peers', [])]:
+        raise SystemExit('Peer is not in this task')
+    journal.emit('peer', dict(to=args.to, kind=args.kind, text=args.body))
+    if args.kind == 'question':
+        journal.state('waiting-for-peer')
+
+
 def main():
     os.umask(0o077)
-    # Nothing here reads Hive's own variables; agents started below must not
-    # see them either.
+    # Only the peer subcommand reads a Hive variable: the credential its own
+    # runner gave the native agent. Everything else, and every agent started
+    # below, must not see Hive's variables.
+    credential = os.environ.get(RUN_CREDENTIAL_ENV)
     for name in hive_env_names(os.environ):
         del os.environ[name]
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument('operation', choices=['probe', 'assess', 'launch', 'run', 'snapshot', 'enqueue', 'decide', 'peer', 'hook', 'mcp', 'reconcile-inspect', 'reconcile'])
     parser.add_argument('--run-id')
     parser.add_argument('--after', type=int, default=0)
@@ -1630,12 +1735,18 @@ def main():
     args = parser.parse_args()
     if args.operation == 'assess':
         action = json.load(sys.stdin)
-        print(encode({'reason': policy(action['tool'], action['arguments'], action['workspace'])}))
+        # --run-id names the run that requested the action; without it no
+        # peer command is assessed as routine.
+        run_id = str(uuid.UUID(args.run_id)) if args.run_id else None
+        print(encode({'reason': policy(action['tool'], action['arguments'], action['workspace'], run_id)}))
         return
     if args.operation == 'probe':
         print(encode(probe()))
         return
     ident = str(uuid.UUID(args.run_id))
+    if args.operation == 'peer':
+        peer(ident, args, credential)
+        return
     journal = Journal(BASE/ident)
     if args.operation == 'mcp':
         mcp_peer(journal)
@@ -1684,21 +1795,12 @@ def main():
         if journal.get('assignment', {}).get('agent') == 'agy':
             row = journal.db.execute('SELECT action FROM approvals WHERE id=?', (request['id'],)).fetchone()
             journal.enqueue(dict(id='approval-'+request['id'], text='The user chose '+request['decision']+' for this exact action: '+row[0]+'. Continue the same task; the hook has a single-use grant only if approved.'))
-    elif args.operation == 'peer':
-        if not args.to or not args.kind or not args.body or len(args.body) > 16000:
-            raise ValueError('Peer, kind and 1–16000 byte body required')
-        assignment = journal.get('assignment')
-        if args.to not in [p['id'] for p in assignment.get('peers', [])]:
-            raise ValueError('Peer is not in this task')
-        journal.emit('peer', dict(to=args.to, kind=args.kind, text=args.body))
-        if args.kind == 'question':
-            journal.state('waiting-for-peer')
     elif args.operation == 'hook':
         request = json.load(sys.stdin)
         call = request.get('toolCall', {})
         assignment = journal.get('assignment')
         action = dict(tool=call.get('name'), arguments=call.get('args', {}), workspace=assignment['workspace'])
-        reason = policy(action['tool'], action['arguments'], action['workspace'])
+        reason = policy(action['tool'], action['arguments'], action['workspace'], assignment.get('id'))
         if not reason or assignment.get('autonomy') == 'yolo':
             print(encode(dict(decision='allow')))
             return
