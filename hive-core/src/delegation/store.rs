@@ -663,6 +663,21 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
     #[test]
+    fn a_runner_stall_reason_is_recorded_on_the_working_run_and_cleared_with_it() {
+        let g = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
+        let s = RunStore::new(g.shared_conn()).unwrap();
+        let r = s.create("task", "chat", &plan()).unwrap().remove(0);
+        let stall = json!({"tool":"bash","command":"cargo build","silent_since":1_790_000_000,"silent_minutes":10,"reason":"Stalled: cargo build silent for 10 min"});
+        let events = json!([{"id":"stalled","seq":1,"kind":"stalled","payload":stall}]);
+        s.sync(&r.id, &json!({"metadata":{"state":"working","stall":stall},"events":events,"approvals":[]})).unwrap();
+        let run = s.get(&r.id).unwrap();
+        assert_eq!(run.state, "working");
+        assert_eq!(run.metadata["stall"]["reason"], "Stalled: cargo build silent for 10 min");
+        assert_eq!(s.events(&r.id, 0).unwrap().len(), 1);
+        s.sync(&r.id, &json!({"metadata":{"state":"working","stall":null},"events":[],"approvals":[]})).unwrap();
+        assert!(s.get(&r.id).unwrap().metadata["stall"].is_null());
+    }
+    #[test]
     fn decisions_are_exact_durable_and_nonreplaceable() {
         let g = crate::memory::graph::KnowledgeGraph::in_memory().unwrap();
         let s = RunStore::new(g.shared_conn()).unwrap();
