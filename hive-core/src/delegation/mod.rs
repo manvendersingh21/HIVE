@@ -28,6 +28,11 @@ pub struct Assignment {
     #[serde(default)]
     pub peer_dependencies: Vec<String>,
     pub acceptance_criteria: Vec<String>,
+    /// Coordinator-owned mechanical checks, never inferred from worker claims.
+    #[serde(default)]
+    pub acceptance_checks: Vec<coordination::AcceptanceCheck>,
+    #[serde(default = "coordination::default_max_rework")]
+    pub max_rework: u8,
     /// Repository-relative globs exclusively owned by this assignment.
     #[serde(default)]
     pub owned_paths: Vec<String>,
@@ -326,6 +331,8 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             !a.objective.trim().is_empty() && !a.acceptance_criteria.is_empty(),
             "Objective and acceptance criteria required"
         );
+        coordination::validate_checks(&a.acceptance_checks)?;
+        anyhow::ensure!(a.max_rework <= 10, "At most 10 acceptance rework rounds");
         if new_container {
             anyhow::ensure!(
                 !a.required_capabilities.iter().any(|c| c == "gpu-compute" || c == "heavy-compute"),
@@ -437,27 +444,34 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
     Ok(())
 }
 
-fn ownership_root(path: &str) -> anyhow::Result<&str> {
+fn ownership_root(path: &str) -> anyhow::Result<(&str, bool)> {
     let path = path.trim().trim_start_matches("./").trim_end_matches('/');
     anyhow::ensure!(!path.is_empty() && !path.starts_with('/')
         && !path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
         && !path.contains(['\n', '\r', '\0']),
         "Owned paths must be non-empty repository-relative globs");
     let wildcard = path.find(['*', '?', '[', '{']).unwrap_or(path.len());
-    Ok(path[..wildcard].trim_end_matches('/'))
+    Ok((&path[..wildcard], wildcard < path.len()))
 }
 
 fn paths_overlap(left: &str, right: &str) -> anyhow::Result<bool> {
-    let left = ownership_root(left)?;
-    let right = ownership_root(right)?;
-    Ok(left.is_empty() || right.is_empty() || left == right
-        || left.strip_prefix(right).is_some_and(|rest| rest.starts_with('/'))
-        || right.strip_prefix(left).is_some_and(|rest| rest.starts_with('/')))
+    let (left, left_glob) = ownership_root(left)?;
+    let (right, right_glob) = ownership_root(right)?;
+    // A glob reserves its literal prefix conservatively. A wildcard inside a
+    // filename can intersect another filename without a slash at the boundary.
+    let covers = |prefix: &str, glob: bool, path: &str| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| glob || rest.is_empty() || rest.starts_with('/'))
+    };
+    Ok(covers(left, left_glob, right) || covers(right, right_glob, left))
 }
 
 /// Reject equal or parent/child ownership across assignments in one task.
 pub fn validate_owned_paths(assignments: &[Assignment]) -> anyhow::Result<()> {
     for (index, left) in assignments.iter().enumerate() {
+        for path in &left.owned_paths {
+            ownership_root(path)?;
+        }
         for right in assignments.iter().skip(index + 1) {
             for left_path in &left.owned_paths {
                 for right_path in &right.owned_paths {
@@ -713,7 +727,7 @@ pub async fn plan(
     let agents = inventory::describe(&agent.memory.graph)?;
     let coordinator = coordinator_note(agent);
     let mut prompt = format!("You are Hive's coordinator. Plan work for real agent conversations on configured devices. \
-        Return structured assignments, never shell commands or file contents. The complete fleet is below. \
+        Return structured assignments, never implementation scripts or file contents. The complete fleet is below. \
         Select device, installed agent and available model automatically; explicit user device/agent/model choices take precedence. \
         For opencode, set model to a verified id from that device's agent inventory (provider/model ids) and never a qwq/qvq reasoning model: those never call tools, so a turn can end with no actions. \
         A null opencode model is filled from the device's verified models (the configured default first); a plan with no verified opencode model is rejected instead of guessing. \
@@ -730,6 +744,9 @@ pub async fn plan(
         peer_dependencies lists assignment keys whose replies or agreements this assignment needs during its work, or [] when none are required. These do not delay launch. \
         Peers that must negotiate concurrently have no completion dependency on each other: validation rejects a required peer queued directly or transitively behind its asker. \
         Acceptance criteria must require implementation, independent verification, deployment evidence when requested and peer agreement. \
+        acceptance_checks is a nonempty list of mechanical checks the coordinator will execute after each final turn: file_exists with a workspace-relative path, or command with argv, workspace-relative cwd (use . for the workspace root), and timeout_seconds (1–120, at most 600 total). \
+        Use the user's stated verification commands and required artifacts; these checks must survive worker cleanup and must not deploy, delete work, or perform the implementation. Prose criteria are additionally evaluated in objective review. Never accept a worker's claim as a check. \
+        max_rework bounds failed acceptance followups; use 2 unless the user specifies another bound (0–10). \
         Never instruct agents to edit CHANGELOG.md directly; instruct them to add a changelog.d/ fragment instead. \
         For questions that need no work, answer in summary and use an empty assignments list. \
         containers: leave it empty unless the user explicitly asks for a new container or sandbox; existing containers are already in the fleet with a container tag, so reuse them. \
@@ -737,16 +754,22 @@ pub async fn plan(
         Hive creates them with its own image and the host's agent logins before any assignment starts; you never choose images, mounts or flags.\n\
         Fleet:\n{fleet}\n{coordinator}Agent inventory (installation, authentication, runtime, models and invocation evidence are distinct):\n{agents}\n\
         Prior conversation (context only):\n{history}\nUser request:\n{request}");
+    let check_schema = json!({"type":"array","minItems":1,"maxItems":32,"items":{"anyOf":[
+        {"type":"object","additionalProperties":false,"required":["kind","path"],"properties":{"kind":{"const":"file_exists"},"path":{"type":"string"}}},
+        {"type":"object","additionalProperties":false,"required":["kind","argv","cwd","timeout_seconds"],"properties":{"kind":{"const":"command"},"argv":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120}}}
+    ]}});
     let schema = json!({"type":"object","additionalProperties":false,"required":["summary","assignments","containers"],"properties":{
     "summary":{"type":"string"},
     "containers":{"type":"array","maxItems":MAX_NEW_CONTAINERS,"items":{"type":"object","additionalProperties":false,
         "required":["name","host"],"properties":{"name":{"type":"string"},"host":{"type":"string"}}}},
     "assignments":{"type":"array","items":{"type":"object","additionalProperties":false,
-    "required":["key","device","agent","model","workspace","objective","dependencies","peer_dependencies","acceptance_criteria","owned_paths","required_capabilities"],"properties":{
+    "required":["key","device","agent","model","workspace","objective","dependencies","peer_dependencies","acceptance_criteria","acceptance_checks","max_rework","owned_paths","required_capabilities"],"properties":{
         "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode","cursor"]},
         "model":{"type":["string","null"]},"workspace":{"type":"string"},"objective":{"type":"string"},
         "dependencies":{"type":"array","items":{"type":"string"}},"peer_dependencies":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},
         "owned_paths":{"type":"array","items":{"type":"string"}},
+        "max_rework":{"type":"integer","minimum":0,"maximum":10},
+        "acceptance_checks":check_schema,
         "required_capabilities":{"type":"array","items":{"type":"string"}}
     }}}}});
     // One retry in total, whether the answer was malformed JSON or a plan
@@ -770,6 +793,8 @@ pub async fn plan(
         };
         let validated = (|| {
             let mut p = plan;
+            anyhow::ensure!(p.assignments.iter().all(|a| !a.acceptance_checks.is_empty()),
+                "Every new assignment requires mechanical acceptance_checks");
             repair_workspaces(&mut p);
             repair_models(&mut p, agent)?;
             validate(&p, agent)?;
@@ -972,6 +997,28 @@ mod tests {
         assert!(validate_owned_paths(&[left.clone(), right.clone()]).is_err());
         right.owned_paths = vec!["hive-core/src/delegation/mod.rs".into()];
         assert!(validate_owned_paths(&[left, right]).is_err());
+    }
+
+    #[test]
+    fn owned_paths_validate_single_assignments_and_wildcard_prefixes() {
+        let mut a = plan().assignments.remove(0);
+        for path in ["../escape", "/absolute", "", "src//file", "src/../file"] {
+            a.owned_paths = vec![path.into()];
+            assert!(validate_owned_paths(&[a.clone()]).is_err(), "{path}");
+        }
+        for (left, right) in [
+            ("src/foo*.rs", "src/foobar.rs"),
+            ("src/foo?.rs", "src/food.rs"),
+            ("src/[ab].rs", "src/a.rs"),
+            ("src/{foo,bar}/**", "src/foo/a.rs"),
+            ("**/*.rs", "hive-core/src/lib.rs"),
+            ("src/**", "src"),
+        ] {
+            assert!(paths_overlap(left, right).unwrap(), "{left}: {right}");
+            assert!(paths_overlap(right, left).unwrap());
+        }
+        assert!(!paths_overlap("src/foo", "src/foobar").unwrap());
+        assert!(!paths_overlap("src/foo/**", "src/foobar/**").unwrap());
     }
 
     #[test]

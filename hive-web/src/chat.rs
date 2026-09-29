@@ -290,13 +290,15 @@ pub async fn get_chat(State(h): State<AgentHandle>, Path(id): Path<String>) -> R
 /// Delegated-run states that still own a live agent session. A chat with any
 /// of these cannot be deleted: the run would keep working with nowhere to
 /// report, and its approvals would point at a conversation that is gone.
-pub(crate) const LIVE_RUN_STATES: [&str; 6] = [
+pub(crate) const LIVE_RUN_STATES: [&str; 8] = [
     "queued",
     "launching",
     "working",
     "waiting-for-peer",
     "awaiting-approval",
     "paused-quota",
+    "verifying",
+    "reviewing",
 ];
 
 /// What stopped a chat deletion, if anything.
@@ -377,6 +379,9 @@ pub(crate) fn delete_conversation(
                          AND task_id NOT IN (SELECT task_id FROM delegated_runs WHERE conversation_id!=?1)";
             db.execute(&format!("DELETE FROM delegated_events WHERE run_id IN ({runs})"), [id])?;
             db.execute(&format!("DELETE FROM delegated_decisions WHERE run_id IN ({runs})"), [id])?;
+            if table("delegated_completions")? {
+                db.execute(&format!("DELETE FROM delegated_completions WHERE run_id IN ({runs})"), [id])?;
+            }
             for scoped in ["delegated_contracts", "delegated_reviews"] {
                 if table(scoped)? {
                     db.execute(&format!("DELETE FROM {scoped} WHERE task_id IN ({tasks})"), [id])?;

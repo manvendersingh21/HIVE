@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import selectors
+import signal
 import shlex
 import shutil
 import sqlite3
@@ -214,9 +216,16 @@ class Journal:
                 os.kill(pid, 0)
             except ProcessLookupError:
                 self.set('state', 'disconnected')
-        return dict(metadata={r['key']: json.loads(r['value']) for r in self.db.execute('SELECT * FROM metadata')},
+        metadata = {r['key']: json.loads(r['value']) for r in self.db.execute('SELECT * FROM metadata')}
+        # Derived from the journal, not from mutable worker metadata. This also
+        # works for persistent runners launched before acceptance checks existed.
+        metadata['acceptance_turn'] = self.completed_turn()
+        return dict(metadata=metadata,
                     events=[dict(seq=r['seq'], id=r['id'], kind=r['kind'], payload=json.loads(r['payload'])) for r in self.db.execute('SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT 300', (after,))],
                     approvals=[dict(r) for r in self.db.execute('SELECT * FROM approvals WHERE consumed=0')])
+
+    def completed_turn(self):
+        return self.db.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE kind='acknowledgment'").fetchone()[0]
 
     def pending(self, action, reason):
         fingerprint = hashlib.sha256(encode(action).encode()).hexdigest()
@@ -1912,6 +1921,116 @@ def peer(ident, args, credential):
         journal.state('waiting-for-peer')
 
 
+def acceptance_path(root, relative, allow_root=False):
+    if not isinstance(relative, str) or not relative or relative.startswith(('/', '~')) or any(c in relative for c in '\n\r\0\\'):
+        raise ValueError('Acceptance path must be workspace-relative')
+    if not (allow_root and relative == '.') and any(p in ('', '.', '..') for p in relative.split('/')):
+        raise ValueError('Acceptance path must not traverse outside its workspace')
+    path = (root/relative).resolve()
+    path.relative_to(root)
+    return path
+
+
+def acceptance_command(argv, cwd, timeout):
+    """Measure an argv directly, retaining bounded output and killing its own
+    process group on timeout (including children that keep stdout open)."""
+    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    output = bytearray()
+    timed_out = False
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                for key, _ in selector.select(min(remaining, .1)):
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    output.extend(chunk)
+                    del output[:-8192]
+            if not timed_out:
+                try:
+                    proc.wait(timeout=max(.001, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+    finally:
+        if timed_out or proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        proc.wait()
+        proc.stdout.close()
+    detail = ('timeout' if timed_out else 'exit='+str(proc.returncode)) + '\n' + output.decode('utf-8', errors='replace')
+    return not timed_out and proc.returncode == 0, detail
+
+
+def acceptance(journal, request):
+    """Coordinator-invoked checks, never worker-reported test results. The
+    request supplies the frozen workspace/checks from the coordinator DB."""
+    turn = request['turn_seq']
+    settled = lambda: (journal.get('state') == 'completed' and journal.completed_turn() == turn
+                       and not journal.db.execute("SELECT 1 FROM inbox WHERE state!='acknowledged'").fetchone()
+                       and not journal.db.execute('SELECT 1 FROM approvals WHERE consumed=0 AND decision IS NULL').fetchone())
+    if not settled():
+        return dict(stale=True)
+    checks = request['checks']
+    if not isinstance(checks, list) or len(checks) > 32:
+        raise ValueError('At most 32 acceptance checks')
+    total = 0
+    for check in checks:
+        if check.get('kind') == 'command':
+            argv, timeout = check.get('argv'), check.get('timeout_seconds')
+            if not isinstance(argv, list) or not 1 <= len(argv) <= 128 or not all(isinstance(a, str) and '\0' not in a for a in argv) or not argv[0].strip():
+                raise ValueError('Acceptance command requires argv')
+            if type(timeout) is not int or not 1 <= timeout <= 120:
+                raise ValueError('Acceptance timeout must be 1–120 seconds')
+            total += timeout
+        elif check.get('kind') != 'file_exists':
+            raise ValueError('Unknown acceptance check kind')
+    if total > 600:
+        raise ValueError('Acceptance checks exceed 600 seconds')
+    # A lost control-plane response must not rerun commands. Interrupted checks
+    # fail closed and can be repaired in a new native turn, with bounded rework.
+    journal.db.execute('CREATE TABLE IF NOT EXISTS acceptance (turn_seq INTEGER PRIMARY KEY, request TEXT NOT NULL, result TEXT)')
+    with journal.db:
+        inserted = journal.db.execute('INSERT OR IGNORE INTO acceptance VALUES (?,?,NULL)', (turn, encode(request))).rowcount
+    if not inserted:
+        row = journal.db.execute('SELECT request,result FROM acceptance WHERE turn_seq=?', (turn,)).fetchone()
+        if row['request'] != encode(request):
+            raise ValueError('Acceptance checks changed for an already measured turn')
+        if row['result']:
+            return json.loads(row['result'])
+        return dict(turn_seq=turn, measurements=[dict(check=c, passed=False, detail='Prior acceptance execution interrupted or still running; commands were not replayed') for c in checks])
+    measured = []
+    for check in checks:
+        try:
+            root = Path(request['workspace']).expanduser().resolve(strict=True)
+            if check['kind'] == 'file_exists':
+                path = acceptance_path(root, check['path'])
+                passed = path.is_file()
+                detail = check['path'] + (': file exists' if passed else ': required file missing')
+            else:
+                cwd = acceptance_path(root, check['cwd'], allow_root=True)
+                reason = policy('Bash', dict(command=shlex.join(check['argv']), cwd=str(cwd)), str(root), calling_run(journal))
+                if reason and not yolo(journal):
+                    raise ValueError('Acceptance command needs explicit authorization under the reviewed policy: '+reason)
+                passed, detail = acceptance_command(check['argv'], cwd, check['timeout_seconds'])
+        except (OSError, ValueError) as error:
+            passed, detail = False, str(error)
+        measured.append(dict(check=check, passed=passed, detail=detail))
+    result = dict(turn_seq=turn, measurements=measured) if settled() else dict(stale=True)
+    with journal.db:
+        journal.db.execute('UPDATE acceptance SET result=? WHERE turn_seq=?', (encode(result), turn))
+    return result
+
+
 def main():
     os.umask(0o077)
     # Only the peer subcommand reads a Hive variable: the credential its own
@@ -1921,7 +2040,7 @@ def main():
     for name in hive_env_names(os.environ):
         del os.environ[name]
     parser = argparse.ArgumentParser(allow_abbrev=False)
-    parser.add_argument('operation', choices=['probe', 'assess', 'launch', 'run', 'snapshot', 'enqueue', 'decide', 'peer', 'hook', 'mcp', 'reconcile-inspect', 'reconcile'])
+    parser.add_argument('operation', choices=['probe', 'assess', 'acceptance', 'launch', 'run', 'snapshot', 'enqueue', 'decide', 'peer', 'hook', 'mcp', 'reconcile-inspect', 'reconcile'])
     parser.add_argument('--run-id')
     parser.add_argument('--after', type=int, default=0)
     parser.add_argument('--to')
@@ -1942,6 +2061,10 @@ def main():
     if args.operation == 'peer':
         peer(ident, args, credential)
         return
+    # Reads must not create a journal: during launch the runner has not made
+    # one yet, and an empty journal would be reported as a run with no state.
+    if args.operation in ('snapshot', 'acceptance') and not (BASE/ident/'journal.db').is_file():
+        raise SystemExit('No journal yet for run '+ident)
     journal = Journal(BASE/ident)
     if args.operation == 'mcp':
         mcp_peer(journal)
@@ -1978,6 +2101,8 @@ def main():
             time.sleep(30)
     elif args.operation == 'snapshot':
         print(encode(journal.snapshot(args.after)))
+    elif args.operation == 'acceptance':
+        print(encode(acceptance(journal, json.load(sys.stdin))))
     elif args.operation == 'reconcile-inspect':
         print(encode(recovery_snapshot(journal)))
     elif args.operation == 'reconcile':

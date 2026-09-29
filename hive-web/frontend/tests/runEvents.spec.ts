@@ -435,8 +435,8 @@ test.describe("helpers", () => {
   });
 
   test("terminal states stop live polling", () => {
-    expect([...TERMINAL_STATES].sort()).toEqual(["completed", "disconnected", "failed", "superseded"]);
-    for (const live of ["working", "awaiting-approval", "queued", "launching", "paused-quota"]) expect(TERMINAL_STATES).not.toContain(live);
+    expect([...TERMINAL_STATES].sort()).toEqual(["completed", "disconnected", "failed", "no_agreement", "superseded"]);
+    for (const live of ["working", "awaiting-approval", "queued", "launching", "paused-quota", "verifying"]) expect(TERMINAL_STATES).not.toContain(live);
   });
 
   test("a quota pause names the agent and its reset in local time", () => {
