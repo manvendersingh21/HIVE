@@ -38,6 +38,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(observed), 1)
         team = observed[0].split('Team (peer roles, owned paths, status and dependencies): ')[1]
         self.assertEqual(json.loads(team), [peer])
+        # BUG18: a background loop holding the tool's output pipe kept a finished call running.
+        self.assertIn("Never leave background processes attached to the tool's stdout/stderr", observed[0])
+        self.assertIn('nohup or setsid and `>file 2>&1 </dev/null`, or avoid background loops', observed[0])
 
     def test_service_panes_drop_hive_variables_from_the_tmux_environment(self):
         tmux_env = 'HIVE_WEB_PASSWORD=secret\nPATH=/bin\nHIVE_WORKER_TOKEN=t\n-HIVE_REMOVED'
