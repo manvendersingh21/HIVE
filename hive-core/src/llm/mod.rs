@@ -500,7 +500,14 @@ impl JsonReplyError {
             redacted
         };
         Self {
-            error: error.to_string(),
+            // serde can quote a whole offending value ("invalid type: string \"...\""),
+            // so the message is bounded and redacted like the excerpt.
+            error: {
+                let message = error.to_string();
+                let bounded = &message[..floor_boundary(&message, message.len().min(2 * EXCERPT_RADIUS))];
+                let ellipsis = if bounded.len() < message.len() { "…" } else { "" };
+                format!("{}{ellipsis}", redact_secrets(bounded))
+            },
             line: error.line(),
             column: error.column(),
             excerpt: format!(
@@ -706,6 +713,18 @@ mod tests {
             assert!(failure.excerpt.contains("[redacted]"), "{}", failure.excerpt);
         }
         assert_eq!(redact_secrets("plain words and a uuid-free path /tmp/x"), "plain words and a uuid-free path /tmp/x");
+    }
+
+    #[test]
+    fn schema_errors_quoting_a_value_are_bounded_and_redacted() {
+        // serde quotes the whole offending value in a type error.
+        let text = format!("\"sk-proj-ABCDEFGH12345678 {}\"", "x".repeat(5000));
+        let error = serde_json::from_str::<Vec<u8>>(&text).unwrap_err();
+        let failure = JsonReplyError::new(&text, &error);
+        assert!(!failure.error.contains("ABCDEFGH12345678"), "{}", failure.error);
+        assert!(failure.error.chars().count() <= 2 * EXCERPT_RADIUS + 20, "{}", failure.error);
+        assert!(!failure.retry_instruction().contains("ABCDEFGH12345678"));
+        assert!(!failure.after_retry().to_string().contains("ABCDEFGH12345678"));
     }
 
     #[test]
