@@ -88,6 +88,7 @@ impl MasterAgent {
         run: &PlannedRun,
         result: &RunResult,
         state: &WorkflowState,
+        conversation_id: &str,
     ) -> anyhow::Result<PlannedRun> {
         // Keep recent diagnostics detailed and older successful work identifiable.
         // Never feed a regenerated plan as if it were an observation.
@@ -130,6 +131,7 @@ impl MasterAgent {
                 &self.fleet_context(),
                 Some(&context),
                 skill,
+                Some(conversation_id),
             )
             .await?;
         self.materialize_plan(

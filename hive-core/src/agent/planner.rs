@@ -3,7 +3,7 @@
 use hive_common::{AiProvider, Complexity};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::LlmRouter;
+use crate::llm::{JsonReplyError, LlmRouter};
 
 /// Each round either does work, verifies it, or reports a final result.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +185,8 @@ impl Planner {
     /// the complexity-routed provider for this call: a skill that names
     /// Claude is asking for Claude's judgment, and a SIMPLE classification
     /// must not quietly downgrade it.
+    ///
+    /// `conversation_id` only labels warnings about a malformed answer.
     pub async fn plan(
         &self,
         llm: &LlmRouter,
@@ -193,6 +195,7 @@ impl Planner {
         fleet: &FleetContext,
         memory_context: Option<&str>,
         skill: Option<&crate::skills::Skill>,
+        conversation_id: Option<&str>,
     ) -> anyhow::Result<TaskPlan> {
         let fleet_header = fleet.header();
         let fleet_trailer = fleet.trailer();
@@ -341,11 +344,25 @@ If this evidence satisfies the request, return ONLY JSON {{"phase":"complete","t
             prompt
         };
 
-        let response = llm
-            .complete_json_with(&prompt, provider, &plan_schema())
-            .await?;
-
-        let mut plan = extract_plan(&response.text)?;
+        // A malformed answer gets exactly one corrective retry. Both attempts
+        // run inside the caller's planning deadline.
+        let schema = plan_schema();
+        let mut prompt = prompt;
+        let mut attempt = 0;
+        let (mut plan, response) = loop {
+            let response = llm.complete_json_with(&prompt, provider, &schema).await?;
+            match extract_plan(&response.text) {
+                Ok(plan) => break (plan, response),
+                Err(failure) => {
+                    failure.warn("plan", conversation_id);
+                    attempt += 1;
+                    if attempt >= 2 {
+                        return Err(failure.after_retry());
+                    }
+                    prompt.push_str(&failure.retry_instruction());
+                }
+            }
+        };
         anyhow::ensure!(
             !plan.summary.trim().is_empty()
                 && (!plan.subtasks.is_empty()
@@ -432,19 +449,12 @@ fn plan_schema() -> serde_json::Value {
 
 /// Extract a `TaskPlan` from an LLM response that may be wrapped in prose or
 /// markdown code fences.
-fn extract_plan(text: &str) -> anyhow::Result<TaskPlan> {
-    let start = text
-        .find('{')
-        .ok_or_else(|| anyhow::anyhow!("no JSON object found in response"))?;
-    let end = text
-        .rfind('}')
-        .ok_or_else(|| anyhow::anyhow!("no JSON object found in response"))?;
-    if end < start {
-        anyhow::bail!("malformed JSON in response");
-    }
-    let json_str = &text[start..=end];
-    let plan: TaskPlan = serde_json::from_str(json_str)?;
-    Ok(plan)
+fn extract_plan(text: &str) -> Result<TaskPlan, JsonReplyError> {
+    let json_str = match (text.find('{'), text.rfind('}')) {
+        (Some(start), Some(end)) if start < end => &text[start..=end],
+        _ => text.trim(),
+    };
+    serde_json::from_str(json_str).map_err(|e| JsonReplyError::new(json_str, &e))
 }
 
 #[cfg(test)]
@@ -544,5 +554,153 @@ mod tests {
     #[test]
     fn extract_plan_rejects_non_json() {
         assert!(extract_plan("I refuse to answer in JSON.").is_err());
+    }
+
+    mod zai_retry {
+        use super::*;
+        use crate::llm::nvidia::tests::{server, Requests};
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        const VALID: &str = r#"{"targets":["local"],"phase":"work","summary":"say hi","subtasks":[{"description":"greet","target_machine":"local","commands":["echo hi"],"required_capabilities":[]}]}"#;
+
+        /// Long objective with an unescaped quote near column 4959, like BUG16.
+        fn malformed() -> String {
+            format!(
+                "{{\"targets\":[\"local\"],\"phase\":\"work\",\"summary\":\"FAR_AWAY_START {} api_key=zai-SECRET0123456789 the \"quoted\" word\",\"subtasks\":[]}}",
+                "x".repeat(4880)
+            )
+        }
+
+        fn reply(text: &str) -> (u16, serde_json::Value, Duration) {
+            (
+                200,
+                json!({"choices":[{"finish_reason":"stop","message":{"content":text}}]}),
+                Duration::ZERO,
+            )
+        }
+
+        fn router(url: String) -> LlmRouter {
+            LlmRouter::from_config(&hive_common::config::LlmConfig {
+                single_provider: Some(AiProvider::Zai),
+                nvidia: Default::default(),
+                local: hive_common::config::LocalLlmConfig {
+                    base_url: "http://127.0.0.1:1".into(),
+                    ..Default::default()
+                },
+                gemini: None,
+                claude: None,
+                codex: None,
+                zai: Some(hive_common::config::CloudLlmConfig {
+                    model: "glm-test".into(),
+                    api_key: Some("zai-test-secret-key".into()),
+                    api_key_env: None,
+                    base_url: Some(url),
+                }),
+            })
+        }
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        async fn plan_logged(replies: Vec<&str>) -> (anyhow::Result<TaskPlan>, Requests, String) {
+            let (url, requests, task) = server(replies.into_iter().map(reply).collect()).await;
+            let logs = Captured::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let result = Planner::new()
+                .plan(
+                    &router(url),
+                    "say hi",
+                    Complexity::Simple,
+                    &FleetContext::none(),
+                    None,
+                    None,
+                    Some("conv-ebf497fc-test"),
+                )
+                .await;
+            task.await.unwrap();
+            let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            (result, requests, logs)
+        }
+
+        #[tokio::test]
+        async fn malformed_then_valid_plan_succeeds_after_one_retry() {
+            let bad = malformed();
+            let (result, requests, logs) = plan_logged(vec![&bad, VALID]).await;
+            let plan = result.expect("the corrected plan is accepted");
+            assert_eq!(plan.summary, "say hi");
+            assert_eq!(plan.provider_used, AiProvider::Zai);
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "exactly one retry");
+            for (_, body) in requests.iter() {
+                assert_eq!(body["response_format"], json!({"type":"json_object"}));
+            }
+            let first = requests[0].1["messages"][0]["content"].as_str().unwrap();
+            let retry = requests[1].1["messages"][0]["content"].as_str().unwrap();
+            let request = first.split("\n\nRespond with only one JSON object").next().unwrap();
+            assert!(retry.starts_with(request), "the retry extends the original prompt");
+            assert!(!first.contains("Your previous answer"));
+            let hint = &retry[request.len()..];
+            let column = serde_json::from_str::<TaskPlan>(&bad).unwrap_err().column();
+            assert!(column > 4900, "{column}");
+            assert!(
+                hint.contains(&format!("Your previous answer was invalid JSON at line 1 column {column}")),
+                "{hint}"
+            );
+            assert!(hint.contains("quoted"), "the hint quotes the offending text: {hint}");
+            assert!(!hint.contains("SECRET0123456789"), "{hint}");
+
+            assert!(logs.contains("WARN"), "{logs}");
+            assert!(logs.contains("conversation_id=conv-ebf497fc-test"), "{logs}");
+            assert!(logs.contains("plan was not valid JSON"), "{logs}");
+            assert!(logs.contains("quoted"), "{logs}");
+            assert!(!logs.contains("FAR_AWAY_START"), "log must be bounded: {logs}");
+            assert!(logs.len() < 1200, "log must be bounded: {} bytes", logs.len());
+            for secret in ["SECRET0123456789", "zai-test-secret-key"] {
+                assert!(!logs.contains(secret), "secret logged: {logs}");
+            }
+        }
+
+        #[tokio::test]
+        async fn malformed_twice_gives_a_clear_error() {
+            let bad = malformed();
+            let (result, requests, logs) = plan_logged(vec![&bad, &bad]).await;
+            let error = result.expect_err("two malformed answers fail").to_string();
+            assert!(error.contains("invalid JSON twice"), "{error}");
+            assert!(error.contains("No commands were executed"), "{error}");
+            let column = serde_json::from_str::<TaskPlan>(&bad).unwrap_err().column();
+            assert!(error.contains(&format!("line 1 column {column}")), "{error}");
+            assert!(!error.contains("SECRET0123456789"), "{error}");
+            assert_eq!(requests.lock().unwrap().len(), 2, "no third attempt");
+            assert_eq!(logs.matches("plan was not valid JSON").count(), 2, "{logs}");
+            assert!(!logs.contains("zai-test-secret-key"));
+        }
+
+        #[tokio::test]
+        async fn a_schema_mismatch_is_retried_like_malformed_json() {
+            let (result, requests, _) =
+                plan_logged(vec![r#"{"targets":[],"phase":"work","subtasks":[]}"#, VALID]).await;
+            assert_eq!(result.unwrap().summary, "say hi");
+            let requests = requests.lock().unwrap();
+            let retry = requests[1].1["messages"][0]["content"].as_str().unwrap();
+            assert!(retry.contains("missing field `summary`"), "{retry}");
+        }
     }
 }

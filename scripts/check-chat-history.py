@@ -232,9 +232,21 @@ with tempfile.TemporaryDirectory(prefix='hive-chat-history-') as tmp:
         interrupted=create();gate.clear()
         c=http.client.HTTPConnection('127.0.0.1',port)
         c.request('POST','/api/chat',json.dumps({'message':'hold fixture','conversation_id':interrupted}),{'Content-Type':'application/json','Cookie':cookie})
-        wait_status(interrupted,'planning');stop();c.close();gate.set();start()
-        assert detail(interrupted)['messages'][-1]['status']=='interrupted'
-        print('PASS: interrupted work stays recorded without automatic execution',flush=True)
+        wait_status(interrupted,'planning');stop();c.close();start()
+        # Still gated: the restarted plan waits in the fake model.
+        restarted=wait_status(interrupted,'planning')['messages'][-1]
+        assert restarted['content']=='Planning was interrupted by a restart and has been restarted.', restarted
+        stop();start()
+        again=detail(interrupted)['messages'][-1]
+        assert again['status']=='interrupted' and 'already been restarted once' in again['content'], again
+        assert 'Some commands may have run' not in again['content'], again
+        gate.set()
+        resumed=create();gate.clear()
+        c=http.client.HTTPConnection('127.0.0.1',port)
+        c.request('POST','/api/chat',json.dumps({'message':'hold fixture','conversation_id':resumed}),{'Content-Type':'application/json','Cookie':cookie})
+        wait_status(resumed,'planning');stop();c.close();gate.set();start()
+        wait_status(resumed,'completed')
+        print('PASS: planning interrupted by a restart is re-run once, and never twice',flush=True)
 
         failed=create()
         c=http.client.HTTPConnection('127.0.0.1',port)

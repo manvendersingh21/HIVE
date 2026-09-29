@@ -66,7 +66,7 @@ pub(crate) async fn process_with_deadline_slots(
     let context_text = context.join("\n");
     let plan = match crate::chat::plan_with_retry_slots(
         slots,
-        || delegation::plan(agent, &turn.user_input, &context_text),
+        || delegation::plan(agent, &turn.user_input, &context_text, Some(&turn.conversation_id)),
         deadline,
     )
     .await
@@ -93,6 +93,12 @@ pub(crate) async fn process_with_deadline_slots(
             return error(e);
         }
     };
+    // Creating containers and runs has effects: a restart from here on must
+    // not plan this turn again.
+    if let Err(e) = history.executing(&turn.id, &format!("delegation:{}", turn.id)) {
+        tracing::warn!(conversation_id = %turn.conversation_id, turn_id = %turn.id, error = %e, "delegation turn could not start executing");
+        return error(e);
+    }
     let reply = match start_plan(agent, &store, &turn.id, &turn.conversation_id, &plan).await {
         Ok(reply) => reply,
         Err(e) => {
