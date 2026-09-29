@@ -359,11 +359,61 @@ pub async fn replace(
 }
 
 pub async fn retry_setup(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
-    match store(&h).and_then(|s| s.retry_setup(&id)) {
-        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"saved":true}))).into_response(),
-        Err(e) => error(e),
+    let store = match store(&h) {
+        Ok(s) => s,
+        Err(e) => return error(e),
+    };
+    let run = match store.get(&id) {
+        Ok(r) => r,
+        Err(e) => return error(e),
+    };
+    if run.state == "launching" {
+        let claimed_at = run
+            .metadata
+            .get("claimed_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let now = chrono::Utc::now().timestamp();
+        let timeout = launch_timeout_secs();
+        if now.saturating_sub(claimed_at) < timeout {
+            return error(anyhow::anyhow!(
+                "Launch is still in progress; wait for timeout before retrying setup"
+            ));
+        }
+        let agent = match h.agent.as_ref() {
+            Some(a) => a,
+            None => return error(anyhow::anyhow!("Delegation unavailable")),
+        };
+        let worker = match delegation::target(agent, &run.assignment.device) {
+            Some(w) => w,
+            None => return error(anyhow::anyhow!("Device removed from configured fleet")),
+        };
+        match session_alive(&worker, &run).await {
+            Some(true) => {
+                return error(anyhow::anyhow!(
+                    "Agent session is still running; retry refused to prevent duplicate launch"
+                ));
+            }
+            Some(false) => {
+                match store.retry_launching(&id, timeout) {
+                    Ok(()) => (StatusCode::ACCEPTED, Json(json!({"saved":true}))).into_response(),
+                    Err(e) => error(e),
+                }
+            }
+            None => {
+                return error(anyhow::anyhow!(
+                    "Could not reach device to verify session absence; retry refused"
+                ));
+            }
+        }
+    } else {
+        match store.retry_setup(&id) {
+            Ok(()) => (StatusCode::ACCEPTED, Json(json!({"saved":true}))).into_response(),
+            Err(e) => error(e),
+        }
     }
 }
+
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -408,9 +458,9 @@ async fn recovery_control(
     anyhow::ensure!(
         matches!(
             run.state.as_str(),
-            "failed" | "disconnected" | "needs-setup"
+            "failed" | "disconnected" | "needs-setup" | "launching"
         ),
-        "Only failed or disconnected native runs can be reconciled"
+        "Only failed, disconnected, needs-setup, or launching native runs can be reconciled"
     );
     let runner = run
         .runner_path
@@ -473,18 +523,23 @@ pub fn start(h: AgentHandle) {
     tokio::spawn(async move {
         loop {
             if let (Some(agent), Ok(store)) = (&reviewer.agent, store(&reviewer)) {
-                if let Ok(runs) = store.list() {
-                    let mut tasks: std::collections::BTreeMap<String, Vec<Run>> =
-                        std::collections::BTreeMap::new();
-                    for run in runs {
-                        if run.state != "superseded" {
-                            tasks.entry(run.task_id.clone()).or_default().push(run);
+                match store.list() {
+                    Ok(runs) => {
+                        let mut tasks: std::collections::BTreeMap<String, Vec<Run>> =
+                            std::collections::BTreeMap::new();
+                        for run in runs {
+                            if run.state != "superseded" {
+                                tasks.entry(run.task_id.clone()).or_default().push(run);
+                            }
+                        }
+                        for runs in tasks.values() {
+                            if let Err(error) = delegation::review::task(agent, &store, runs).await {
+                                tracing::warn!(task_id=%runs[0].task_id,error=%error,"coordinator review incomplete");
+                            }
                         }
                     }
-                    for runs in tasks.values() {
-                        if let Err(error) = delegation::review::task(agent, &store, runs).await {
-                            tracing::warn!(task_id=%runs[0].task_id,error=%error,"coordinator review incomplete");
-                        }
+                    Err(error) => {
+                        tracing::warn!(error=%error, "failed to list delegated runs for review");
                     }
                 }
             }
@@ -498,38 +553,43 @@ pub fn start(h: AgentHandle) {
         let unacknowledged = Unacknowledged::default();
         loop {
             if let Ok(store) = store(&h) {
-                if let Ok(runs) = store.list() {
-                    // A run that no longer exists can never acknowledge anything.
-                    unacknowledged
-                        .lock()
-                        .unwrap()
-                        .retain(|id, _| runs.iter().any(|run| &run.id == id));
-                    for run in &runs {
-                        if active.get(&run.id).is_some_and(|task| !task.is_finished()) {
-                            continue;
+                match store.list() {
+                    Ok(runs) => {
+                        // A run that no longer exists can never acknowledge anything.
+                        unacknowledged
+                            .lock()
+                            .unwrap()
+                            .retain(|id, _| runs.iter().any(|run| &run.id == id));
+                        for run in &runs {
+                            if active.get(&run.id).is_some_and(|task| !task.is_finished()) {
+                                continue;
+                            }
+                            let (h, store, run, runs, unacknowledged) = (
+                                h.clone(),
+                                store.clone(),
+                                run.clone(),
+                                runs.clone(),
+                                unacknowledged.clone(),
+                            );
+                            active.insert(
+                                run.id.clone(),
+                                tokio::spawn(async move {
+                                    if let Err(error) =
+                                        sync_run(&h, &store, &run, &runs, &unacknowledged).await
+                                    {
+                                        let _ =
+                                            store.state(&run.id, "disconnected", &error.to_string());
+                                        // Holding the task open keeps this run out of the
+                                        // loop, so an unreachable or overloaded worker is
+                                        // not hit with a fresh SSH session every 3s.
+                                        tokio::time::sleep(SYNC_RETRY_BACKOFF).await;
+                                    }
+                                }),
+                            );
                         }
-                        let (h, store, run, runs, unacknowledged) = (
-                            h.clone(),
-                            store.clone(),
-                            run.clone(),
-                            runs.clone(),
-                            unacknowledged.clone(),
-                        );
-                        active.insert(
-                            run.id.clone(),
-                            tokio::spawn(async move {
-                                if let Err(error) =
-                                    sync_run(&h, &store, &run, &runs, &unacknowledged).await
-                                {
-                                    let _ =
-                                        store.state(&run.id, "disconnected", &error.to_string());
-                                    // Holding the task open keeps this run out of the
-                                    // loop, so an unreachable or overloaded worker is
-                                    // not hit with a fresh SSH session every 3s.
-                                    tokio::time::sleep(SYNC_RETRY_BACKOFF).await;
-                                }
-                            }),
-                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(error=%error, "failed to list delegated runs for sync");
                     }
                 }
             }
@@ -662,8 +722,15 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
 }
 
 /// States in which a launched run's tmux session must still exist.
-const LIVE_STATES: [&str; 5] =
-    ["working", "awaiting-approval", "waiting-for-peer", "reviewing", "paused-quota"];
+const LIVE_STATES: [&str; 6] =
+    ["working", "awaiting-approval", "waiting-for-peer", "reviewing", "paused-quota", "launching"];
+
+fn launch_timeout_secs() -> i64 {
+    std::env::var("HIVE_LAUNCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
 
 /// Whether the run's tmux session exists. `None` when the device couldn't be
 /// asked: an unreachable machine says nothing about the session.
@@ -710,10 +777,36 @@ async fn sync_run(
     // journal of a runner that no longer exists.
     if run.runner_path.is_some()
         && LIVE_STATES.contains(&run.state.as_str())
-        && session_alive(&worker, run).await == Some(false)
     {
-        store.state(&run.id, "disconnected", SESSION_ENDED)?;
-        return Ok(());
+        if run.state == "launching" {
+            let claimed_at = run
+                .metadata
+                .get("claimed_at")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let now = chrono::Utc::now().timestamp();
+            let timed_out = now.saturating_sub(claimed_at) >= launch_timeout_secs();
+            match session_alive(&worker, run).await {
+                Some(false) if timed_out => {
+                    store.state(
+                        &run.id,
+                        "failed",
+                        "Launch timed out: agent tmux session never appeared",
+                    )?;
+                    return Ok(());
+                }
+                Some(true) => {
+                    // Session is live: left alone by liveness check; ready for snapshot
+                }
+                _ => {
+                    // Within timeout or session unconfirmed: leave alone while launch is pending
+                    return Ok(());
+                }
+            }
+        } else if session_alive(&worker, run).await == Some(false) {
+            store.state(&run.id, "disconnected", SESSION_ENDED)?;
+            return Ok(());
+        }
     }
     if run.state == "queued" {
         match dependency_ready(runs, run, &store.pending_messages(&run.id)?) {
@@ -812,7 +905,7 @@ async fn sync_run(
             .cloned()
             .collect::<Vec<_>>();
         let assignment = delegation::remote_assignment(run, &peers, executable);
-        transport::control(
+        if let Err(error) = transport::control(
             &worker,
             &runner,
             "launch",
@@ -820,14 +913,20 @@ async fn sync_run(
             0,
             Some(&assignment),
         )
-        .await?;
+        .await {
+            store.state(&run.id, "failed", &format!("Launch failed: {error}"))?;
+            return Err(error);
+        }
         return Ok(());
     }
     let Some(runner) = &run.runner_path else {
         return Ok(());
     };
-    let raw =
-        transport::control(&worker, runner, "snapshot", &run.id, run.cursor, None).await?;
+    let raw = match transport::control(&worker, runner, "snapshot", &run.id, run.cursor, None).await {
+        Ok(raw) => raw,
+        Err(_) if run.state == "launching" => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let mut snapshot: Value = serde_json::from_str(&raw)?;
     enrich_approvals(&mut snapshot, &store.recent_events(&run.id, 1000)?);
     let peers = delegation::team_view(run, runs);
@@ -1477,5 +1576,110 @@ mod tests {
         // The original, verified message still reaches its destination.
         let delivery = store.next_delivery(&b.id).unwrap().unwrap();
         assert!(delivery.payload["text"].as_str().unwrap().ends_with("says: original"));
+    }
+
+    struct TestTmuxGuard(String);
+    impl Drop for TestTmuxGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &self.0])
+                .output();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_launching_liveness_check_and_retry_setup_guards() {
+        let h = handle();
+        let store = store(&h).unwrap();
+        let unacknowledged = Unacknowledged::default();
+        let device = h.agent.as_ref().unwrap().master_name().to_string();
+        let plan = serde_json::from_value(json!({"summary":"work","assignments":[
+            {"key":"a","device":device,"agent":"codex","model":null,"workspace":"~/hive-workspaces/test","objective":"implement","dependencies":[],"acceptance_criteria":["verified"]}]})).unwrap();
+
+        // 1. Launching run past timeout with no session becomes failed with clear reason in sync_run
+        let runs = store.create("task-f2-1", "chat", &plan).unwrap();
+        let run_id = runs[0].id.clone();
+        assert!(store.claim(&run_id, "runner.py").unwrap());
+        // Backdate claimed_at past bounded timeout (30s)
+        let past = chrono::Utc::now().timestamp() - 60;
+        h.agent.as_ref().unwrap().memory.graph.shared_conn().lock().unwrap().execute(
+            &format!("UPDATE delegated_runs SET metadata=json_set(metadata,'$.claimed_at',{past}) WHERE id='{run_id}'"),
+            [],
+        ).unwrap();
+        let run = store.get(&run_id).unwrap();
+        let runs_list = store.list().unwrap();
+        sync_run(&h, &store, &run, &runs_list, &unacknowledged).await.unwrap();
+        let failed_run = store.get(&run_id).unwrap();
+        assert_eq!(failed_run.state, "failed");
+        assert_eq!(
+            failed_run.metadata["reason"],
+            "Launch timed out: agent tmux session never appeared"
+        );
+
+        // 2a. Launching run within timeout with no session is left alone in sync_run
+        let runs2 = store.create("task-f2-2", "chat", &plan).unwrap();
+        let run_id2 = runs2[0].id.clone();
+        assert!(store.claim(&run_id2, "runner.py").unwrap());
+        // claimed_at is now, so well within the 30s timeout
+        let run2 = store.get(&run_id2).unwrap();
+        let runs_list2 = store.list().unwrap();
+        sync_run(&h, &store, &run2, &runs_list2, &unacknowledged).await.unwrap();
+        assert_eq!(store.get(&run_id2).unwrap().state, "launching", "run within timeout must be left alone");
+
+        // 2b. Launching run past timeout but with a live session is left alone in sync_run
+        let runs3 = store.create("task-f2-3", "chat", &plan).unwrap();
+        let run_id3 = runs3[0].id.clone();
+        assert!(store.claim(&run_id3, "runner.py").unwrap());
+        h.agent.as_ref().unwrap().memory.graph.shared_conn().lock().unwrap().execute(
+            &format!("UPDATE delegated_runs SET metadata=json_set(metadata,'$.claimed_at',{past}) WHERE id='{run_id3}'"),
+            [],
+        ).unwrap();
+        let run3 = store.get(&run_id3).unwrap();
+        // Create live tmux session for run3
+        let session_created = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &run3.tmux_name, "sleep 30"])
+            .output();
+        if let Ok(output) = session_created {
+            if output.status.success() {
+                let _guard = TestTmuxGuard(run3.tmux_name.clone());
+                let runs_list3 = store.list().unwrap();
+                sync_run(&h, &store, &run3, &runs_list3, &unacknowledged).await.unwrap();
+                assert_eq!(store.get(&run_id3).unwrap().state, "launching", "run with live session must be left alone");
+
+                // 3. retry_setup on a launching run with a live session is refused
+                let resp = retry_setup(State(h.clone()), Path(run_id3.clone())).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let err_msg = String::from_utf8_lossy(&body);
+                assert!(err_msg.contains("Agent session is still running"), "{err_msg}");
+                assert_eq!(store.get(&run_id3).unwrap().state, "launching", "state must remain launching");
+            }
+        }
+
+        // 4. retry_setup on a launching run within timeout is refused
+        let resp2 = retry_setup(State(h.clone()), Path(run_id2.clone())).await;
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let err_msg2 = String::from_utf8_lossy(&body2);
+        assert!(err_msg2.contains("Launch is still in progress"), "{err_msg2}");
+        assert_eq!(store.get(&run_id2).unwrap().state, "launching");
+
+        // 5. retry_setup on a launching run past timeout with no session succeeds
+        let runs5 = store.create("task-f2-5", "chat", &plan).unwrap();
+        let run_id5 = runs5[0].id.clone();
+        assert!(store.claim(&run_id5, "runner.py").unwrap());
+        h.agent.as_ref().unwrap().memory.graph.shared_conn().lock().unwrap().execute(
+            &format!("UPDATE delegated_runs SET metadata=json_set(metadata,'$.claimed_at',{past}) WHERE id='{run_id5}'"),
+            [],
+        ).unwrap();
+        let resp5 = retry_setup(State(h.clone()), Path(run_id5.clone())).await;
+        assert_eq!(resp5.status(), StatusCode::ACCEPTED);
+        let recovered = store.get(&run_id5).unwrap();
+        assert_eq!(recovered.state, "queued");
+        assert!(recovered.runner_path.is_none());
+
+        // 6. retry_setup on a failed run is refused
+        let resp_failed = retry_setup(State(h.clone()), Path(run_id.clone())).await;
+        assert_eq!(resp_failed.status(), StatusCode::BAD_REQUEST);
     }
 }

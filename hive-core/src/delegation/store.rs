@@ -237,11 +237,38 @@ impl RunStore {
         Ok(())
     }
     pub fn retry_setup(&self, id: &str) -> anyhow::Result<()> {
-        let changed=self.0.lock().unwrap().execute("UPDATE delegated_runs SET state='queued' WHERE id=? AND runner_path IS NULL AND state IN ('needs-setup','disconnected')",[id])?;
+        let changed = self.0.lock().unwrap().execute(
+            "UPDATE delegated_runs SET state='queued' WHERE id=? AND runner_path IS NULL AND state IN ('needs-setup','disconnected')",
+            [id],
+        )?;
         anyhow::ensure!(
             changed == 1,
             "Only a run that never launched can retry setup"
         );
+        Ok(())
+    }
+
+    pub fn retry_launching(&self, id: &str, timeout_secs: i64) -> anyhow::Result<()> {
+        let run = self.get(id)?;
+        anyhow::ensure!(
+            run.state == "launching",
+            "Only a launching run can retry setup as launching"
+        );
+        let claimed_at = run
+            .metadata
+            .get("claimed_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let now = chrono::Utc::now().timestamp();
+        anyhow::ensure!(
+            now.saturating_sub(claimed_at) >= timeout_secs,
+            "Launch is still within bounded timeout window; retry refused"
+        );
+        let changed = self.0.lock().unwrap().execute(
+            "UPDATE delegated_runs SET state='queued',runner_path=NULL WHERE id=? AND state='launching'",
+            [id],
+        )?;
+        anyhow::ensure!(changed == 1, "Run is no longer launching");
         Ok(())
     }
     pub fn replace(&self, id: &str, assignment: &Assignment) -> anyhow::Result<Run> {
@@ -281,31 +308,76 @@ impl RunStore {
                 r.get::<_, Option<String>>(9)?,
             ))
         })?;
-        let mut runs: Vec<Run> = rows.map(|row| {
-            let (id, task_id, conversation_id, a, tmux_name, state, m, cursor, runner_path, review) = row?;
-            Ok(Run {
-                identity: relay::identity(&db, &id)?,
-                relay: relay::status(&db, &id)?,
+        let mut runs: Vec<Run> = Vec::new();
+        for row in rows {
+            let (id, task_id, conversation_id, a, tmux_name, state, m, cursor, runner_path, review) = match row {
+                Ok(tuple) => tuple,
+                Err(error) => {
+                    tracing::warn!(error=%error, "skipping unreadable delegated run row");
+                    continue;
+                }
+            };
+            let identity = match relay::identity(&db, &id) {
+                Ok(ident) => ident,
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with invalid relay identity");
+                    continue;
+                }
+            };
+            let relay = match relay::status(&db, &id) {
+                Ok(st) => st,
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with invalid relay status");
+                    continue;
+                }
+            };
+            let assignment: Assignment = match serde_json::from_str(&a) {
+                Ok(asgn) => asgn,
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with corrupted assignment");
+                    continue;
+                }
+            };
+            let metadata: Value = match serde_json::from_str(&m) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with corrupted metadata");
+                    continue;
+                }
+            };
+            let review_val = match review.map(|s| serde_json::from_str::<Value>(&s)).transpose() {
+                Ok(rev) => rev.unwrap_or(Value::Null),
+                Err(error) => {
+                    tracing::warn!(run_id=%id, error=%error, "skipping delegated run with corrupted review");
+                    continue;
+                }
+            };
+            runs.push(Run {
+                identity,
+                relay,
                 id,
                 task_id,
                 conversation_id,
-                assignment: serde_json::from_str(&a)?,
+                assignment,
                 tmux_name,
                 state,
-                metadata: serde_json::from_str(&m)?,
+                metadata,
                 cursor,
                 runner_path,
-                review: review
-                    .map(|s| serde_json::from_str(&s))
-                    .transpose()?
-                    .unwrap_or(Value::Null),
+                review: review_val,
                 contracts: vec![],
-            })
-        })
-        .collect::<anyhow::Result<_>>()?;
+            });
+        }
         drop(stmt);
         drop(db);
-        for run in &mut runs { run.contracts = self.contracts_for(&run.id)?; }
+        for run in &mut runs {
+            match self.contracts_for(&run.id) {
+                Ok(contracts) => run.contracts = contracts,
+                Err(error) => {
+                    tracing::warn!(run_id=%run.id, error=%error, "failed to load contracts for run");
+                }
+            }
+        }
         Ok(runs)
     }
 
@@ -352,7 +424,11 @@ impl RunStore {
         Ok(())
     }
     pub fn claim(&self, id: &str, runner: &str) -> anyhow::Result<bool> {
-        Ok(self.0.lock().unwrap().execute("UPDATE delegated_runs SET state='launching',runner_path=? WHERE id=? AND state='queued'",params![runner,id])? == 1)
+        let now = chrono::Utc::now().timestamp();
+        Ok(self.0.lock().unwrap().execute(
+            "UPDATE delegated_runs SET state='launching',runner_path=?,metadata=json_set(metadata,'$.claimed_at',?) WHERE id=? AND state='queued'",
+            params![runner, now, id],
+        )? == 1)
     }
     pub fn sync(&self, id: &str, snapshot: &Value) -> anyhow::Result<()> {
         let mut db = self.0.lock().unwrap();
