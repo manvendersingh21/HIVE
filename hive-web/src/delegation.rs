@@ -131,6 +131,9 @@ async fn start_plan(
 ) -> anyhow::Result<Value> {
     let created = create_containers(agent, plan).await?;
     let runs = store.create(task_id, conversation_id, plan)?;
+    if !plan.assignments.is_empty() && runs.is_empty() {
+        anyhow::bail!("Plan containing assignments yielded zero runs");
+    }
     Ok(json!({"conversation_id":conversation_id,"delegation":{
         "task_id":task_id,"summary":plan.summary,"runs":runs,"containers_created":created}}))
 }
@@ -195,7 +198,10 @@ pub struct RunQuery {
 }
 pub async fn list(State(h): State<AgentHandle>, Query(q): Query<RunQuery>) -> Response {
     match store(&h).and_then(|s| s.list()) {
-        Ok(runs) => {
+        Ok((runs, errors)) => {
+            if errors > 0 {
+                tracing::warn!(errors, "listing runs encountered unreadable rows");
+            }
             let task = q.task_of.as_ref().map(|id| {
                 runs.iter().find(|r| &r.id == id).map(|r| r.task_id.clone())
             });
@@ -219,7 +225,7 @@ pub async fn list(State(h): State<AgentHandle>, Query(q): Query<RunQuery>) -> Re
 /// Task-scoped public roster; shares the router's API authentication middleware.
 pub async fn team(State(h): State<AgentHandle>, Path(id): Path<String>) -> Response {
     match store(&h).and_then(|s| s.list()) {
-        Ok(runs) => Json(runs.iter().filter(|r| r.task_id == id)
+        Ok((runs, _)) => Json(runs.iter().filter(|r| r.task_id == id)
             .map(delegation::team_profile).collect::<Vec<_>>()).into_response(),
         Err(e) => error(e),
     }
@@ -524,7 +530,10 @@ pub fn start(h: AgentHandle) {
         loop {
             if let (Some(agent), Ok(store)) = (&reviewer.agent, store(&reviewer)) {
                 match store.list() {
-                    Ok(runs) => {
+                    Ok((runs, errors)) => {
+                        if errors > 0 {
+                            tracing::warn!(errors, "listing delegated runs for review encountered unreadable rows");
+                        }
                         let mut tasks: std::collections::BTreeMap<String, Vec<Run>> =
                             std::collections::BTreeMap::new();
                         for run in runs {
@@ -554,7 +563,10 @@ pub fn start(h: AgentHandle) {
         loop {
             if let Ok(store) = store(&h) {
                 match store.list() {
-                    Ok(runs) => {
+                    Ok((runs, errors)) => {
+                        if errors > 0 {
+                            tracing::warn!(errors, "listing delegated runs for sync encountered unreadable rows");
+                        }
                         // A run that no longer exists can never acknowledge anything.
                         unacknowledged
                             .lock()
@@ -683,11 +695,12 @@ fn acknowledge(unacknowledged: &Unacknowledged, run: &str, snapshot: &Value) {
 
 const SESSION_ENDED: &str = "The agent's session has ended, so this run can't continue.";
 
-/// A dependency releases its dependent when it completes or waits for a peer
-/// with a pending message addressed to that dependent. Otherwise an implementer
-/// asking its queued verifier a question could wait forever for its own finish.
-/// Each prerequisite is checked independently; a message cannot bypass another
-/// working or failed prerequisite. `messages` is the dependent's durable inbox.
+/// A dependency releases its dependent when it completes, reaches the terminal
+/// no-agreement outcome, or waits for a peer with a pending message addressed to
+/// that dependent. Otherwise an implementer asking its queued verifier a
+/// question could wait forever for its own finish. Each prerequisite is checked
+/// independently; a message cannot bypass another working or failed
+/// prerequisite. `messages` is the dependent's durable inbox.
 ///
 /// A dependency paused on its provider quota has not failed: it resumes by
 /// itself after the reset, so its dependents stay queued. If it already handed
@@ -702,8 +715,8 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
             r.task_id == run.task_id && &r.assignment.key == key && r.state != "superseded"
         }) {
             let from_dependency = |message: &&Value| message["source"] == dependency.id;
-            completed |= dependency.state == "completed";
-            failed |= dependency.state == "failed" || dependency.state == "no_agreement";
+            completed |= matches!(dependency.state.as_str(), "completed" | "no_agreement");
+            failed |= dependency.state == "failed";
             waiting_for_us |= dependency.state == "waiting-for-peer"
                 && messages.iter().any(|message| from_dependency(&message));
             waiting_for_us |= dependency.state == "paused-quota"
@@ -1328,12 +1341,12 @@ mod tests {
         let err = start_plan(agent, &store, "task", "chat", &plan).await.unwrap_err().to_string();
         assert!(err.starts_with("Could not create container box on "), "{err}");
         assert!(err.ends_with("No agents were started."), "{err}");
-        assert!(store.list().unwrap().is_empty());
+        assert!(store.list().unwrap().0.is_empty());
         // A plan without containers creates its runs as before.
         plan.containers.clear();
         let reply = start_plan(agent, &store, "task", "chat", &plan).await.unwrap();
         assert_eq!(reply["delegation"]["containers_created"], json!([]));
-        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.list().unwrap().0.len(), 1);
     }
 
     #[tokio::test]
@@ -1548,10 +1561,10 @@ mod tests {
         let (a, b) = (&runs[0], &runs[1]);
         // While the dependency works the dependent just waits.
         store.sync(&a.id, &json!({"metadata":{"state":"working"},"events":[],"approvals":[]})).unwrap();
-        assert_eq!(dependency_ready(&store.list().unwrap(), b, &[]), Ok(false));
+        assert_eq!(dependency_ready(&store.list().unwrap().0, b, &[]), Ok(false));
         // A failed dependency (e.g. 'turn produced no actions') never releases it.
         store.sync(&a.id, &json!({"metadata":{"state":"failed"},"events":[],"approvals":[]})).unwrap();
-        let runs = store.list().unwrap();
+        let (runs, _) = store.list().unwrap();
         let b = runs.iter().find(|r| r.id == b.id).unwrap();
         match dependency_ready(&runs, b, &[]) {
             Err(reason) => assert!(reason.contains("dependency a failed"), "{reason}"),
@@ -1559,7 +1572,7 @@ mod tests {
         }
         // Without a peer message, only completion releases the dependent.
         store.state(&a.id, "completed", "").unwrap();
-        let runs = store.list().unwrap();
+        let (runs, _) = store.list().unwrap();
         assert_eq!(dependency_ready(&runs, runs.iter().find(|r| r.id == b.id).unwrap(), &[]), Ok(true));
         // An unknown or superseded dependency keeps waiting, never starts.
         let mut orphan = plan.clone();
@@ -1652,7 +1665,7 @@ mod tests {
             [],
         ).unwrap();
         let run = store.get(&run_id).unwrap();
-        let runs_list = store.list().unwrap();
+        let (runs_list, _) = store.list().unwrap();
         sync_run(&h, &store, &run, &runs_list, &unacknowledged).await.unwrap();
         let failed_run = store.get(&run_id).unwrap();
         assert_eq!(failed_run.state, "failed");
@@ -1667,7 +1680,7 @@ mod tests {
         assert!(store.claim(&run_id2, "runner.py").unwrap());
         // claimed_at is now, so well within the 30s timeout
         let run2 = store.get(&run_id2).unwrap();
-        let runs_list2 = store.list().unwrap();
+        let (runs_list2, _) = store.list().unwrap();
         sync_run(&h, &store, &run2, &runs_list2, &unacknowledged).await.unwrap();
         assert_eq!(store.get(&run_id2).unwrap().state, "launching", "run within timeout must be left alone");
 
@@ -1687,7 +1700,7 @@ mod tests {
         if let Ok(output) = session_created {
             if output.status.success() {
                 let _guard = TestTmuxGuard(run3.tmux_name.clone());
-                let runs_list3 = store.list().unwrap();
+                let (runs_list3, _) = store.list().unwrap();
                 sync_run(&h, &store, &run3, &runs_list3, &unacknowledged).await.unwrap();
                 assert_eq!(store.get(&run_id3).unwrap().state, "launching", "run with live session must be left alone");
 

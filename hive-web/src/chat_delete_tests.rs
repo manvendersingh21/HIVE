@@ -32,6 +32,7 @@ async fn fixture() -> Fixture {
         agent: handle.clone(),
         workers: workers::WorkerIngest::from_env(),
         incidents: incidents::IncidentReview::new(IncidentStore::in_memory().unwrap()),
+        db_ok: true,
     };
     let app = app_router(state, std::env::temp_dir().to_str().unwrap());
     let login = app

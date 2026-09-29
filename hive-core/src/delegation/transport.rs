@@ -245,8 +245,10 @@ mod tests {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let path = std::env::temp_dir().join(format!("hive-team-{}.db", uuid::Uuid::new_v4()));
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE inbox(id TEXT PRIMARY KEY,payload TEXT); INSERT INTO metadata VALUES ('assignment','{\"peers\":[]}');").unwrap();
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE inbox(id TEXT PRIMARY KEY,payload TEXT); INSERT INTO metadata VALUES ('assignment','{\"peers\":[]}');").unwrap();
+        }
         let script = UPDATE_PEERS_SCRIPT.replace(
             "pathlib.Path.home()/'.hive'/'runs'/v['id']/'journal.db'",
             &format!("pathlib.Path({})", serde_json::to_string(&path).unwrap()),
@@ -260,14 +262,21 @@ mod tests {
         let peers = json!([{"id":"peer", "role":"backend", "owned_paths":["src/**"], "status":"working", "dependencies":[]}]);
         update(peers.clone());
         update(peers.clone()); // Lost reply / repeated synchronization.
-        assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
-        let prompt: String = db.query_row("SELECT payload FROM inbox", [], |r| r.get(0)).unwrap();
-        assert!(prompt.contains("backend") && prompt.contains("src/**") && prompt.contains("working"));
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+            let prompt: String = db.query_row("SELECT payload FROM inbox", [], |r| r.get(0)).unwrap();
+            assert!(prompt.contains("backend") && prompt.contains("src/**") && prompt.contains("working"));
+        }
         update(json!([]));
         update(peers); // A -> B -> A is another change, not a duplicate.
-        assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 3);
-        drop(db);
-        std::fs::remove_file(path).unwrap();
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(db.query_row("SELECT count(*) FROM inbox", [], |r| r.get::<_,i64>(0)).unwrap(), 3);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     fn coordinator() -> WorkerInfo {
