@@ -155,6 +155,18 @@ impl RunStore {
             for id in ids { relay::create_identity(&tx, &id)?; }
             tx.commit()?;
         }
+        // Cover every state-writing path atomically, including replacement and
+        // acceptance. Existing terminal runs start a fresh conservative grace
+        // period on upgrade; worker snapshots cannot set this clock.
+        conn.lock().unwrap().execute_batch("CREATE TRIGGER IF NOT EXISTS delegated_gc_transition
+            AFTER UPDATE OF state ON delegated_runs WHEN OLD.state != NEW.state
+            BEGIN
+              UPDATE delegated_runs SET metadata=json_set(json_remove(metadata,'$.workspace_gc'),
+                '$.terminal_since', CASE WHEN NEW.state IN ('completed','failed','superseded')
+                THEN CAST(strftime('%s','now') AS INTEGER) ELSE NULL END) WHERE id=NEW.id;
+            END;
+            UPDATE delegated_runs SET metadata=json_set(metadata,'$.terminal_since',CAST(strftime('%s','now') AS INTEGER))
+            WHERE state IN ('completed','failed','superseded') AND json_extract(metadata,'$.terminal_since') IS NULL;")?;
         Ok(Self(conn, relay::Budget::from_env()?))
     }
     pub fn create(
@@ -490,6 +502,13 @@ impl RunStore {
         )?;
         Ok(())
     }
+    pub fn record_workspace_gc(&self, id: &str, since: i64, result: &Value) -> anyhow::Result<()> {
+        self.0.lock().unwrap().execute(
+            "UPDATE delegated_runs SET metadata=json_set(metadata,'$.workspace_gc',json(?)) WHERE id=? AND state IN ('completed','failed','superseded') AND json_extract(metadata,'$.terminal_since')=?",
+            params![result.to_string(), id, since],
+        )?;
+        Ok(())
+    }
     pub fn claim(&self, id: &str, runner: &str) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
         Ok(self.0.lock().unwrap().execute(
@@ -518,6 +537,11 @@ impl RunStore {
             )?;
         }
         let mut metadata = snapshot["metadata"].clone();
+        let previous: String = tx.query_row("SELECT metadata FROM delegated_runs WHERE id=?", [id], |r| r.get(0))?;
+        let previous: Value = serde_json::from_str(&previous)?;
+        for key in ["terminal_since", "workspace_gc"] {
+            metadata[key] = previous[key].clone();
+        }
         metadata["approvals"] = snapshot["approvals"].clone();
         // Coordinator-observed contact time, never trusted from a worker.
         metadata["last_seen"] = json!(chrono::Utc::now().to_rfc3339());
