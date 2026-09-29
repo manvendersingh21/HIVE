@@ -54,7 +54,7 @@ may still change without a deprecation period.
 
 ### Changed
 
-- HACP is pinned to `e69922c53492fdbbd8f1de0ef79a095bb3e030a5`, with
+- HACP is pinned to `3d008d4719e0dcf0ba4057650831ab4696495923`, with
   guardian-backed secure envelopes enabled in `hive-core`. This pin adopts
   HACP's V3/V4/V7 fixes: bilateral delegation contracts are formed under a
   per-run capability grant (the deployment charters the supervisor, which
