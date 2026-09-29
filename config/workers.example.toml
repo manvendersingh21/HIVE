@@ -16,8 +16,19 @@ workers = []
 #           slurm       batch-scheduled; work belongs in an sbatch job
 #
 #         A machine carrying any of those three refuses assignments that
-#         request `gpu-compute` or `heavy-compute`. Other tags are free-form
-#         and available to the planner as context.
+#         request `gpu-compute` or `heavy-compute`, with two escapes: a
+#         slurm-tagged machine accepts them with the assignment's
+#         `execution = "scheduler"` (the work runs under an sbatch/srun
+#         allocation), and `allow_direct_gpu` below lifts the restriction
+#         outright. Other tags are free-form and available to the planner
+#         as context.
+#
+#   allow_direct_gpu  Optional per-device override (default false). Set it to
+#         true only when the operator has decided direct GPU/heavy work is
+#         acceptable — typically a slurm machine whose scheduler is broken
+#         (DRAIN/DOWN/INVALID nodes) while the machine itself is fine. With
+#         it, direct `gpu-compute`/`heavy-compute` assignments are allowed on
+#         this machine despite its tags.
 #
 # [[workers]]
 # name = "worker-1"
@@ -30,6 +41,17 @@ workers = []
 # host = "gpu-node.example.edu"
 # user = "your-username"
 # tags = ["gpu", "cuda", "shared", "slurm"]
+#
+# [[workers]]
+# name = "cis-a6000"
+# host = "cis-a6000.example.edu"
+# user = "your-username"
+# tags = ["gpu", "cuda", "shared", "slurm"]
+# # This node's Slurm is currently broken (sinfo reports DRAIN+INVALID_REG,
+# # "gres/gpu count reported lower than configured"), so scheduler
+# # allocations are impossible. Uncomment to let the planner place direct
+# # GPU work here anyway:
+# # allow_direct_gpu = true
 #
 # [[workers]]
 # name = "laptop"

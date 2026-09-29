@@ -635,6 +635,29 @@ tags = []
     }
 
     #[test]
+    fn workers_config_parses_the_allow_direct_gpu_override() {
+        let toml_str = r#"
+[[workers]]
+name = "cis-a6000"
+host = "cis-a6000"
+user = "cluster-user"
+tags = ["gpu", "slurm"]
+allow_direct_gpu = true
+
+[[workers]]
+name = "laptop"
+host = "laptop"
+user = "me"
+tags = ["light"]
+"#;
+
+        let config: WorkersConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.workers[0].allow_direct_gpu);
+        // Absent means the default: direct heavy work stays restricted.
+        assert!(!config.workers[1].allow_direct_gpu);
+    }
+
+    #[test]
     fn test_cloud_llm_api_key_from_env() {
         // Set a test env var
         std::env::set_var("TEST_HIVE_API_KEY", "test-key-12345");

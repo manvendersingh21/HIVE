@@ -394,6 +394,12 @@ pub struct WorkerInfo {
     /// Tags for categorization (e.g., ["gpu", "beefy"]).
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Operator override in `workers.toml`: permit direct `gpu-compute` /
+    /// `heavy-compute` work on this device even though its tags (slurm,
+    /// login-node, light) normally restrict it to a scheduler allocation.
+    /// Meant for a scheduler that is broken while the machine itself is fine.
+    #[serde(default)]
+    pub allow_direct_gpu: bool,
     /// The Hive coordinator itself, reached without SSH. Never read from
     /// config or requests, so a configured worker can't opt out of SSH.
     #[serde(skip)]
@@ -695,6 +701,7 @@ mod tests {
             user: "admin".to_string(),
             port: None,
             tags: vec!["gpu".to_string()],
+            allow_direct_gpu: false,
             local: false,
             container: None,
         };

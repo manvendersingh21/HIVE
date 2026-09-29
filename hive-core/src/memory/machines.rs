@@ -58,6 +58,16 @@ pub struct MachineFacts {
     /// back. Recorded so placement can respect that.
     #[serde(default)]
     pub scheduler: Option<String>,
+    /// Scheduler health for a slurm-tagged device, from `sinfo` node states:
+    /// `Some("usable")` when at least one node is schedulable (IDLE, MIXED,
+    /// ALLOCATED, …), `Some("unusable")` when every reported node is DRAIN,
+    /// DOWN or INVALID, and `None` when no node states were reported at all.
+    #[serde(default)]
+    pub scheduler_health: Option<String>,
+    /// Operator override from `workers.toml`: direct gpu-compute/heavy-compute
+    /// work may bypass the scheduler even though the tags restrict it.
+    #[serde(default)]
+    pub allow_direct_gpu: bool,
     /// Tools found on `PATH`, from [`PROBED_TOOLS`].
     pub tools: Vec<String>,
     /// Operator-assigned tags from `workers.toml`.
@@ -122,6 +132,37 @@ fn capabilities_for(tools: &[String]) -> Vec<&'static str> {
     caps
 }
 
+/// Scheduler health from `sinfo` node-state output: one state per node,
+/// possibly compound (`DRAIN+INVALID_REG`), separated by newlines, commas or
+/// spaces. A node cannot accept new jobs while its state names DRAIN (also
+/// DRAINED/DRAINING), DOWN or any INVALID* condition. The scheduler stays
+/// usable while at least one node is schedulable — a large cluster with one
+/// drained node still works — and is unusable when every reported node is
+/// not. No reported states at all means the health is unknown.
+pub fn scheduler_health(states: &str) -> Option<&'static str> {
+    let mut reported = false;
+    let mut usable = false;
+    for token in states.split([',', '\n', '\r', '\t', ' ']) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        reported = true;
+        let healthy = !token.split('+').any(|part| {
+            let part = part
+                .trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_ascii_uppercase();
+            part.starts_with("DRAIN") || part.starts_with("DOWN") || part.starts_with("INVALID")
+        });
+        usable |= healthy;
+    }
+    match (reported, usable) {
+        (false, _) => None,
+        (true, true) => Some("usable"),
+        (true, false) => Some("unusable"),
+    }
+}
+
 /// One portable script, run on Linux and macOS alike, emitting `key=value`.
 ///
 /// It is deliberately tolerant: every lookup falls back to empty rather than
@@ -161,6 +202,9 @@ else
   echo "gpu=$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | sort | uniq -c | sed 's/^ *//;s/$/ each/' | paste -sd'; ' -)"
   echo "gpu_count=$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"
   echo "scheduler=$(command -v sbatch >/dev/null 2>&1 && echo slurm)"
+  # Node states straight from the scheduler, one per line, so Rust — not a
+  # shell one-liner — decides whether the scheduler can accept new jobs.
+  echo "scheduler_state=$(command -v sinfo >/dev/null 2>&1 && sinfo -h -o '%T' 2>/dev/null | paste -sd, -)"
 fi
 {tool_checks}
 # Every probe line is best-effort, and `command -v` for a missing tool exits
@@ -209,6 +253,7 @@ fn parse_probe(name: &str, host: &str, tags: Vec<String>, raw: &str) -> MachineF
             "gpu" => facts.gpu = Some(value.trim().to_string()),
             "gpu_count" => facts.gpu_count = value.parse().unwrap_or(0),
             "scheduler" => facts.scheduler = Some(value.to_string()),
+            "scheduler_state" => facts.scheduler_health = scheduler_health(value).map(str::to_string),
             "tool" => facts.tools.push(value.to_string()),
             _ => {}
         }
@@ -461,13 +506,21 @@ pub async fn probe_local(name: &str) -> MachineFacts {
 
 /// Probe a worker over SSH. An unreachable worker still produces facts — with
 /// `reachable: false` — so it stays in the graph and can be reported as down
-/// rather than silently vanishing.
-pub async fn probe_remote(name: &str, ssh_target: &str, tags: Vec<String>) -> MachineFacts {
+/// rather than silently vanishing. `allow_direct_gpu` is the operator's
+/// workers.toml override for this device, recorded with the facts so
+/// placement validation can honour it.
+pub async fn probe_remote(
+    name: &str,
+    ssh_target: &str,
+    tags: Vec<String>,
+    allow_direct_gpu: bool,
+) -> MachineFacts {
     let unreachable = || MachineFacts {
         name: name.to_string(),
         host: ssh_target.to_string(),
         reachable: false,
         tags: tags.clone(),
+        allow_direct_gpu,
         probed_at: chrono::Utc::now().to_rfc3339(),
         ..Default::default()
     };
@@ -486,7 +539,11 @@ pub async fn probe_remote(name: &str, ssh_target: &str, tags: Vec<String>) -> Ma
     };
 
     match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
-        Ok(Ok(stdout)) => parse_probe(name, ssh_target, tags, &stdout),
+        Ok(Ok(stdout)) => {
+            let mut facts = parse_probe(name, ssh_target, tags, &stdout);
+            facts.allow_direct_gpu = allow_direct_gpu;
+            facts
+        }
         Ok(Err(e)) => {
             warn!(worker = name, error = %e, "probe failed");
             unreachable()
@@ -511,11 +568,16 @@ pub async fn probe_container(worker: &hive_common::protocol::WorkerInfo) -> Mach
     );
     let mut tags = worker.tags.clone();
     tags.push("container".into());
+    let allow_direct_gpu = worker.allow_direct_gpu;
     let script = probe_script();
     let probe =
         crate::delegation::transport::ssh_timeout(worker, &script, None, PROBE_TIMEOUT.as_secs());
     match probe.await {
-        Ok(stdout) => parse_probe(&worker.name, &host, tags, &stdout),
+        Ok(stdout) => {
+            let mut facts = parse_probe(&worker.name, &host, tags, &stdout);
+            facts.allow_direct_gpu = allow_direct_gpu;
+            facts
+        }
         Err(e) => {
             warn!(container = %worker.name, error = %e, "container probe failed");
             MachineFacts {
@@ -584,6 +646,8 @@ pub fn project_into_graph(kg: &KnowledgeGraph, facts: &MachineFacts) -> anyhow::
             "gpu": facts.gpu,
             "gpu_count": facts.gpu_count,
             "scheduler": facts.scheduler,
+            "scheduler_health": facts.scheduler_health,
+            "allow_direct_gpu": facts.allow_direct_gpu,
             "tags": facts.tags,
             "probed_at": facts.probed_at,
         }),
@@ -767,7 +831,7 @@ pub fn describe_for_prompt(kg: &KnowledgeGraph) -> anyhow::Result<String> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         out.push_str(&format!(
-            "- {} ({}): {}, {} cores, {} RAM, {:.0} GB disk free{}. Capabilities: {}. Tools: {}.\n",
+            "- {} ({}): {}, {} cores, {} RAM, {:.0} GB disk free{}{}. Capabilities: {}. Tools: {}.\n",
             m.name,
             if reachable { "online" } else { "OFFLINE" },
             os,
@@ -784,6 +848,22 @@ pub fn describe_for_prompt(kg: &KnowledgeGraph) -> anyhow::Result<String> {
             m.attr_str("gpu")
                 .filter(|g| !g.trim().is_empty())
                 .map(|g| format!(", GPU: {}", g.trim()))
+                .unwrap_or_default(),
+            m.attr_str("scheduler")
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    let health = m
+                        .attr_str("scheduler_health")
+                        .map(str::trim)
+                        .filter(|h| !h.is_empty())
+                        .unwrap_or("unknown");
+                    let health = if health == "unusable" {
+                        "UNUSABLE (every node DRAIN/DOWN/INVALID)".to_string()
+                    } else {
+                        health.to_string()
+                    };
+                    format!(", scheduler {}: {}", s.trim(), health)
+                })
                 .unwrap_or_default(),
             if caps.is_empty() { "none detected".into() } else { caps.join(", ") },
             if tools.is_empty() { "none detected".into() } else { tools.join(", ") },
@@ -846,11 +926,81 @@ mod tests {
 
     #[test]
     fn probe_reads_multiple_gpus_and_a_scheduler() {
-        let raw = "gpu=2x NVIDIA RTX A6000 (49140 MiB each) \ngpu_count=2\nscheduler=slurm\n";
+        let raw = "gpu=2x NVIDIA RTX A6000 (49140 MiB each) \ngpu_count=2\nscheduler=slurm\nscheduler_state=MIXED\n";
         let f = parse_probe("cis-a6000", "cis-a6000", vec![], raw);
         assert_eq!(f.gpu_count, 2);
         assert_eq!(f.scheduler.as_deref(), Some("slurm"));
+        assert_eq!(f.scheduler_health.as_deref(), Some("usable"));
         assert!(f.gpu.unwrap().contains("A6000"));
+    }
+
+    #[test]
+    fn scheduler_health_classifies_sinfo_node_states() {
+        // Healthy states keep the scheduler usable.
+        for states in ["IDLE", "MIXED", "ALLOCATED", "COMPLETING", "IDLE\nMIXED", "IDLE,DRAIN"] {
+            assert_eq!(
+                scheduler_health(states),
+                Some("usable"),
+                "{states} must leave the scheduler usable"
+            );
+        }
+        // DRAIN/DOWN/INVALID on every reported node makes it unusable,
+        // including compound states and Slurm's suffix markers.
+        for states in [
+            "DRAIN",
+            "DOWN",
+            "INVALID",
+            "INVALID_REG",
+            "DRAIN+INVALID_REG",
+            "DRAINED",
+            "DRAINING",
+            "DRAIN#~",
+            "DOWN+DRAIN",
+            "DRAIN\nINVALID_REG",
+        ] {
+            assert_eq!(
+                scheduler_health(states),
+                Some("unusable"),
+                "{states} must mark the scheduler unusable"
+            );
+        }
+        // Nothing reported means the health is unknown, never a guess.
+        assert_eq!(scheduler_health(""), None);
+        assert_eq!(scheduler_health(" \n, "), None);
+    }
+
+    #[test]
+    fn a_broken_scheduler_node_is_recorded_and_shown_to_the_planner() {
+        let kg = KnowledgeGraph::in_memory().unwrap();
+        let mut broken = facts("cis-a6000", &["nvidia-smi", "sbatch"], 251.0, true);
+        broken.tags = vec!["shared".into(), "slurm".into()];
+        broken.scheduler = Some("slurm".into());
+        broken.scheduler_health = scheduler_health("DRAIN+INVALID_REG").map(str::to_string);
+        broken.allow_direct_gpu = true;
+        let mut healthy = facts("cluster", &["sbatch"], 64.0, true);
+        healthy.tags = vec!["slurm".into()];
+        healthy.scheduler = Some("slurm".into());
+        healthy.scheduler_health = scheduler_health("MIXED").map(str::to_string);
+        project_into_graph(&kg, &broken).unwrap();
+        project_into_graph(&kg, &healthy).unwrap();
+
+        let node = kg.entity("machine:cis-a6000").unwrap().unwrap();
+        assert_eq!(node.attr_str("scheduler_health"), Some("unusable"));
+        assert_eq!(node.attrs["allow_direct_gpu"], true);
+        let cluster = kg.entity("machine:cluster").unwrap().unwrap();
+        assert_eq!(cluster.attr_str("scheduler_health"), Some("usable"));
+
+        let fleet = describe_for_prompt(&kg).unwrap();
+        assert!(
+            fleet.contains("scheduler slurm: UNUSABLE (every node DRAIN/DOWN/INVALID)"),
+            "the planner must see the broken scheduler: {fleet}"
+        );
+        assert!(fleet.contains("scheduler slurm: usable"), "{fleet}");
+    }
+
+    #[test]
+    fn the_probe_asks_the_scheduler_for_node_states() {
+        assert!(probe_script().contains("sinfo -h -o '%T'"));
     }
 
     #[test]

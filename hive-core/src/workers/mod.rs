@@ -512,6 +512,7 @@ mod tests {
             user: "someone".into(),
             port: None,
             tags: vec!["gpu".into()],
+            allow_direct_gpu: false,
             local: false,
             container: None,
         })
@@ -529,6 +530,7 @@ mod tests {
                 user: "someone".into(),
                 port: None,
                 tags: vec![],
+                allow_direct_gpu: false,
                 local: false,
                 container: None,
             })
@@ -546,6 +548,7 @@ mod tests {
             user: "u".into(),
             port: None,
             tags: vec![],
+            allow_direct_gpu: false,
             local: false,
             container: None,
         })
@@ -576,6 +579,7 @@ mod tests {
             user: String::new(),
             port: None,
             tags: vec![],
+            allow_direct_gpu: false,
             local: false,
             container: None,
         }])
@@ -627,6 +631,7 @@ mod tests {
             user: "azureuser".to_string(),
             port: None,
             tags: vec![],
+            allow_direct_gpu: false,
             local: false,
             container: None,
         };

@@ -26,6 +26,12 @@ pub struct Assignment {
     /// planner cannot shorten or paraphrase rules the worker must follow.
     #[serde(default)]
     pub user_brief: String,
+    /// How the work may run on its device. `direct` (the default) runs in the
+    /// workspace itself; `scheduler` requires a slurm-tagged device and runs
+    /// every gpu-compute/heavy-compute step under a scheduler allocation
+    /// (sbatch/srun with squeue polling), which Hive appends to the objective.
+    #[serde(default)]
+    pub execution: Execution,
     pub dependencies: Vec<String>,
     /// Peers whose replies or agreements are needed during this assignment.
     /// These are communication requirements, not completion prerequisites.
@@ -42,6 +48,41 @@ pub struct Assignment {
     pub owned_paths: Vec<String>,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+}
+
+/// How an assignment's work may run on its device.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Execution {
+    /// Run directly in the workspace on the device.
+    #[default]
+    Direct,
+    /// Run under the device's batch scheduler. Only slurm-tagged devices
+    /// accept this, and Hive appends the mandatory sbatch/squeue rules to
+    /// the objective so the worker cannot skip the allocation.
+    Scheduler,
+}
+
+/// The mandatory objective addition for `execution = "scheduler"`: heavy
+/// work on a slurm-tagged device must hold a scheduler allocation. Attached
+/// by the coordinator after validation, never left to the planner's prose.
+pub const SCHEDULER_INSTRUCTIONS: &str = "Scheduler allocation (mandatory): this device is \
+    slurm-scheduled, so all gpu-compute/heavy-compute work must run under a Slurm allocation. \
+    Write the workload as an sbatch script (srun wrapping each compute step, output to a file), \
+    submit it with sbatch, poll its progress with squeue (e.g. `squeue -h -j <jobid>` in a loop) \
+    until the job leaves the queue, and read results from the sbatch output file. \
+    Never run sustained GPU or heavy compute outside the scheduler on this device.";
+
+/// Coordinator-owned rules appended to every scheduler-execution objective.
+/// Idempotent, so a re-validated plan never grows two copies.
+fn attach_scheduler_instructions(plan: &mut DelegationPlan) {
+    for a in &mut plan.assignments {
+        if a.execution == Execution::Scheduler
+            && !a.objective.contains("Scheduler allocation (mandatory)")
+        {
+            a.objective = format!("{}\n\n{}", a.objective, SCHEDULER_INSTRUCTIONS);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +180,7 @@ pub fn machine(agent: &MasterAgent, device: &str) -> Option<WorkerInfo> {
         user: std::env::var("USER").unwrap_or_default(),
         port: None,
         tags: vec![],
+        allow_direct_gpu: false,
         local: true,
         container: None,
     })
@@ -376,17 +418,34 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             .as_array()
             .cloned()
             .unwrap_or_default();
-        // Existing placement restrictions stay deterministic. Heavy work cannot
-        // be assigned to laptop/login nodes or bypass a scheduler.
-        if a.required_capabilities
+        let tagged = |tag: &str| tags.iter().any(|t| t.as_str() == Some(tag));
+        let heavy = a
+            .required_capabilities
             .iter()
-            .any(|c| c == "gpu-compute" || c == "heavy-compute")
-        {
+            .any(|c| c == "gpu-compute" || c == "heavy-compute");
+        // Existing placement restrictions stay deterministic. Heavy work
+        // cannot be assigned to laptop/login nodes or bypass a scheduler. The
+        // two escapes are explicit: a scheduler allocation
+        // (execution="scheduler") on a slurm device whose scheduler works,
+        // and the operator's allow_direct_gpu override in workers.toml for a
+        // scheduler that is broken while the machine itself is fine.
+        if a.execution == Execution::Scheduler {
             anyhow::ensure!(
-                !tags.iter().any(|t| ["light", "login-node", "slurm"]
-                    .iter()
-                    .any(|s| t.as_str() == Some(s))),
-                "{} requires light work or a scheduler allocation; direct heavy placement rejected",
+                tagged("slurm"),
+                "{}: execution 'scheduler' requires a slurm-tagged device; use execution 'direct' elsewhere",
+                a.device
+            );
+            if machine.attrs["scheduler_health"].as_str() == Some("unusable") {
+                anyhow::bail!(
+                    "{}: its slurm scheduler is unusable (every node DRAIN/DOWN/INVALID), so no scheduler allocation is possible; use another device, or execution 'direct' when the operator sets allow_direct_gpu = true in workers.toml",
+                    a.device
+                );
+            }
+        } else if heavy {
+            anyhow::ensure!(
+                !(tagged("light") || tagged("login-node") || tagged("slurm"))
+                    || machine.attrs["allow_direct_gpu"] == true,
+                "{} requires light work or a scheduler allocation; use execution='scheduler' on a working slurm device, let the operator set allow_direct_gpu = true in workers.toml, or choose another device. Direct heavy placement rejected",
                 a.device
             );
         }
@@ -752,7 +811,8 @@ pub async fn plan(
         Missing authentication, runtime or software is reported by Hive on that exact device; do not silently substitute explicit choices. \
         An agent inventory record with quota \"quota exhausted until <time>\" has used up its provider quota: plans placing new work on that device and agent are rejected until then, so choose another agent or device. \
         Prefer dedicated devices for ordinary work. Laptops/light hosts and login nodes only receive short light work. \
-        GPU/shared scheduler work requires a scheduler allocation; never launch sustained work directly on login nodes. \
+        Heavy work (gpu-compute/heavy-compute) on a slurm-tagged device needs execution=\"scheduler\": the fleet lists each scheduler's health, and an UNUSABLE scheduler accepts no scheduler allocation at all. \
+        execution=\"direct\" (the default) for heavy work is only legal where the operator set allow_direct_gpu for the device; never launch sustained work directly on login nodes. \
         Ordinary CLI coding tasks need required_capabilities=[]: Claude/Codex provider inference does NOT require local-inference on the worker. \
         Only require GPU or heavy-compute when the user explicitly needs that capability. \
         Every workspace is a fresh unique child of ~/hive-workspaces/. Each assignment has a unique key. \
@@ -793,6 +853,7 @@ async fn plan_from_prompt(
     "required":["key","device","agent","model","workspace","objective","dependencies","peer_dependencies","acceptance_criteria","acceptance_checks","max_rework","owned_paths","required_capabilities"],"properties":{
         "key":{"type":"string"},"device":{"type":"string"},"agent":{"enum":["claude","codex","agy","opencode","cursor"]},
         "model":{"type":["string","null"]},"workspace":{"type":"string"},"objective":{"type":"string"},
+        "execution":{"enum":["direct","scheduler"],"default":"direct"},
         "dependencies":{"type":"array","items":{"type":"string"}},"peer_dependencies":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},
         "owned_paths":{"type":"array","items":{"type":"string"}},
         "max_rework":{"type":"integer","minimum":0,"maximum":10},
@@ -826,6 +887,7 @@ async fn plan_from_prompt(
             repair_workspaces(&mut p);
             repair_models(&mut p, agent)?;
             validate(&p, agent)?;
+            attach_scheduler_instructions(&mut p);
             validate_explicit(request, &p, agent)?;
             validate_coordinator(request, &p, agent)?;
             validate_container_request(request, &p)?;
@@ -991,6 +1053,7 @@ mod tests {
                 user: "test".into(),
                 port: None,
                 tags: vec!["light".into()],
+                allow_direct_gpu: false,
                 local: false,
                 container: None,
             }]),
@@ -1179,6 +1242,187 @@ mod tests {
         p.assignments[0].workspace = "~/hive-workspaces/test".into();
         p.assignments[0].required_capabilities = vec!["heavy-compute".into()];
         assert!(validate(&p, &agent).is_err());
+    }
+
+    /// A fleet agent whose only worker `cis-a6000` is slurm-tagged with GPU
+    /// tools, matching the real broken-scheduler machine that motivated
+    /// scheduler execution. `health` is its recorded scheduler health and
+    /// `allow_direct_gpu` the operator's workers.toml override.
+    fn slurm_agent_with(
+        llm: crate::llm::LlmRouter,
+        health: Option<&str>,
+        allow_direct_gpu: bool,
+    ) -> MasterAgent {
+        let agent = MasterAgent::new(
+            llm,
+            crate::workers::WorkerPool::new(vec![hive_common::protocol::WorkerInfo {
+                name: "cis-a6000".into(),
+                host: "ssh-alias".into(),
+                user: "test".into(),
+                port: None,
+                tags: vec!["slurm".into()],
+                allow_direct_gpu,
+                local: false,
+                container: None,
+            }]),
+            crate::skills::SkillRegistry::new(),
+            crate::memory::MemorySystem::new(),
+        );
+        crate::memory::machines::project_into_graph(
+            &agent.memory.graph,
+            &crate::memory::machines::MachineFacts {
+                name: "cis-a6000".into(),
+                reachable: true,
+                tags: vec!["slurm".into()],
+                scheduler: Some("slurm".into()),
+                scheduler_health: health.map(str::to_string),
+                allow_direct_gpu,
+                tools: vec!["nvidia-smi".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        agent
+    }
+
+    fn slurm_agent(health: Option<&str>, allow_direct_gpu: bool) -> MasterAgent {
+        slurm_agent_with(
+            crate::llm::LlmRouter::new("http://127.0.0.1:1".into(), "test".into()),
+            health,
+            allow_direct_gpu,
+        )
+    }
+
+    #[test]
+    fn scheduler_execution_accepts_heavy_work_on_slurm_devices() {
+        let mut p = plan();
+        p.assignments[0].device = "cis-a6000".into();
+        p.assignments[0].required_capabilities = vec!["gpu-compute".into()];
+        p.assignments[0].execution = Execution::Scheduler;
+        // A working scheduler — and one whose health is not yet probed —
+        // can grant the allocation, so both plans validate.
+        validate(&p, &slurm_agent(Some("usable"), false)).unwrap();
+        validate(&p, &slurm_agent(None, false)).unwrap();
+        // A scheduler whose every node is DRAIN/DOWN/INVALID cannot grant
+        // one, so scheduler execution is rejected with the way out.
+        let err = validate(&p, &slurm_agent(Some("unusable"), false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("slurm scheduler is unusable"), "{err}");
+        assert!(err.contains("allow_direct_gpu"), "{err}");
+        // Scheduler execution is only meaningful on a slurm-tagged device:
+        // the light-tagged `air` of the default agent is rejected.
+        let mut light = plan();
+        light.assignments[0].required_capabilities = vec!["gpu-compute".into()];
+        light.assignments[0].execution = Execution::Scheduler;
+        let err = validate(&light, &agent()).unwrap_err().to_string();
+        assert!(err.contains("requires a slurm-tagged device"), "{err}");
+    }
+
+    #[test]
+    fn direct_heavy_work_is_rejected_without_the_operator_override() {
+        let mut p = plan();
+        p.assignments[0].device = "cis-a6000".into();
+        p.assignments[0].required_capabilities = vec!["gpu-compute".into()];
+        // Direct heavy work on the slurm device is rejected as before, with
+        // the new escape routes named.
+        let err = validate(&p, &slurm_agent(None, false)).unwrap_err().to_string();
+        assert!(err.contains("requires light work or a scheduler allocation"), "{err}");
+        assert!(err.contains("execution='scheduler'"), "{err}");
+        // The operator's allow_direct_gpu override honours direct heavy work,
+        // including when the scheduler itself is broken.
+        validate(&p, &slurm_agent(None, true)).unwrap();
+        validate(&p, &slurm_agent(Some("unusable"), true)).unwrap();
+        // The override changes nothing for scheduler execution: a working
+        // scheduler still validates without it.
+        p.assignments[0].execution = Execution::Scheduler;
+        validate(&p, &slurm_agent(Some("usable"), false)).unwrap();
+    }
+
+    #[test]
+    fn scheduler_execution_objectives_get_the_mandatory_sbatch_block() {
+        let mut p = plan();
+        p.assignments[0].execution = Execution::Scheduler;
+        attach_scheduler_instructions(&mut p);
+        let objective = p.assignments[0].objective.clone();
+        for required in ["sbatch", "srun", "squeue"] {
+            assert!(objective.contains(required), "{required} missing: {objective}");
+        }
+        // The block is mandatory but never duplicated.
+        attach_scheduler_instructions(&mut p);
+        assert_eq!(p.assignments[0].objective, objective);
+        // Direct assignments keep their objective untouched.
+        let mut direct = plan();
+        attach_scheduler_instructions(&mut direct);
+        assert_eq!(direct.assignments[0].objective, plan().assignments[0].objective);
+    }
+
+    #[test]
+    fn execution_defaults_to_direct_and_rejects_unknown_modes() {
+        // The planner's fixture omits execution entirely: plans written
+        // before the field existed keep validating as direct.
+        assert_eq!(plan().assignments[0].execution, Execution::Direct);
+        let mut scheduler = plan();
+        scheduler.assignments[0].execution = Execution::Scheduler;
+        let round: DelegationPlan =
+            serde_json::from_value(serde_json::to_value(&scheduler).unwrap()).unwrap();
+        assert_eq!(round.assignments[0].execution, Execution::Scheduler);
+        // An unknown mode is a hard parse error, never a silent default.
+        let mut unknown = serde_json::to_value(&scheduler).unwrap();
+        unknown["assignments"][0]["execution"] = json!("batch");
+        assert!(serde_json::from_value::<DelegationPlan>(unknown).is_err());
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn scheduler_execution_plans_carry_the_mandatory_block_end_to_end() {
+        let objective = "Fine-tune the model on the GPU corpus and report eval loss.";
+        let request = format!("Plan this: {objective}");
+        let answer = json!({"summary":"train under slurm","containers":[],"assignments":[{
+            "key":"train","device":"cis-a6000","agent":"claude","model":null,
+            "workspace":"~/hive-workspaces/train","objective":objective,
+            "execution":"scheduler",
+            "dependencies":[],"peer_dependencies":[],
+            "acceptance_criteria":["eval loss reported in eval.json"],
+            "acceptance_checks":[{"kind":"file_exists","path":"eval.json"}],
+            "max_rework":2,"owned_paths":["eval.json"],
+            "required_capabilities":["gpu-compute"]
+        }]})
+        .to_string();
+        let (url, _requests, task) = crate::llm::zai::tests::glm_server(vec![answer]).await;
+        let llm = crate::llm::LlmRouter::from_config(&hive_common::config::LlmConfig {
+            single_provider: Some(hive_common::AiProvider::Zai),
+            nvidia: Default::default(),
+            local: hive_common::config::LocalLlmConfig {
+                base_url: "http://127.0.0.1:1".into(),
+                ..Default::default()
+            },
+            gemini: None,
+            claude: None,
+            codex: None,
+            zai: Some(hive_common::config::CloudLlmConfig {
+                model: "glm-test".into(),
+                api_key: Some("zai-test-key".into()),
+                api_key_env: None,
+                base_url: Some(url),
+            }),
+        });
+        let plan = plan_from_prompt(
+            &slurm_agent_with(llm, Some("usable"), false),
+            &request,
+            request.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        task.await.unwrap();
+        let a = &plan.assignments[0];
+        assert_eq!(a.execution, Execution::Scheduler);
+        // The planner's objective survives, with the coordinator-owned
+        // scheduler rules appended after it.
+        assert!(a.objective.starts_with(objective), "{}", a.objective);
+        assert!(a.objective.contains("sbatch"), "{}", a.objective);
+        assert!(a.objective.contains("squeue"), "{}", a.objective);
     }
 
     fn peer_plan() -> DelegationPlan {
