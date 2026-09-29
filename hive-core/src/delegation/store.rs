@@ -238,13 +238,37 @@ impl RunStore {
     }
     pub fn retry_setup(&self, id: &str) -> anyhow::Result<()> {
         let changed = self.0.lock().unwrap().execute(
-            "UPDATE delegated_runs SET state='queued',runner_path=NULL WHERE id=? AND state IN ('needs-setup','disconnected','failed','launching')",
+            "UPDATE delegated_runs SET state='queued' WHERE id=? AND runner_path IS NULL AND state IN ('needs-setup','disconnected')",
             [id],
         )?;
         anyhow::ensure!(
             changed == 1,
             "Only a run that never launched can retry setup"
         );
+        Ok(())
+    }
+
+    pub fn retry_launching(&self, id: &str, timeout_secs: i64) -> anyhow::Result<()> {
+        let run = self.get(id)?;
+        anyhow::ensure!(
+            run.state == "launching",
+            "Only a launching run can retry setup as launching"
+        );
+        let claimed_at = run
+            .metadata
+            .get("claimed_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let now = chrono::Utc::now().timestamp();
+        anyhow::ensure!(
+            now.saturating_sub(claimed_at) >= timeout_secs,
+            "Launch is still within bounded timeout window; retry refused"
+        );
+        let changed = self.0.lock().unwrap().execute(
+            "UPDATE delegated_runs SET state='queued',runner_path=NULL WHERE id=? AND state='launching'",
+            [id],
+        )?;
+        anyhow::ensure!(changed == 1, "Run is no longer launching");
         Ok(())
     }
     pub fn replace(&self, id: &str, assignment: &Assignment) -> anyhow::Result<Run> {

@@ -313,8 +313,12 @@ fn launching_without_session_has_recovery_path() {
     assert!(LIVE_STATES.contains(&"launching"));
     assert!(store.claim(&run.id, "runner.py").unwrap());
     assert_eq!(store.get(&run.id).unwrap().state, "launching");
-    // retry_setup is eligible for launching runs
-    store.retry_setup(&run.id).unwrap();
+    // retry_setup directly on RunStore is refused for launching runs
+    assert!(store.retry_setup(&run.id).is_err());
+    // retry_launching within timeout is refused
+    assert!(store.retry_launching(&run.id, 30).is_err());
+    // Past timeout (tested here with 0 timeout), retry_launching resets state to queued and clears runner_path
+    store.retry_launching(&run.id, 0).unwrap();
     let recovered = store.get(&run.id).unwrap();
     assert_eq!(recovered.state, "queued");
     assert!(recovered.runner_path.is_none());
