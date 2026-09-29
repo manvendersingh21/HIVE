@@ -209,12 +209,14 @@ impl RunStore {
         summary: &str,
         messages: &[(String, Value)],
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!claim_token.trim().is_empty(), "Claim token required");
+        let now = chrono::Utc::now().timestamp();
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         anyhow::ensure!(
             tx.execute(
-                "UPDATE delegated_reviews SET status=?,summary=?,lock_until=0,claim_token='',continue_reviews=CASE WHEN ?='continue' THEN continue_reviews+1 ELSE 0 END WHERE task_id=? AND cursor=? AND claim_token=?",
-                params![status, summary, status, task, cursor, claim_token]
+                "UPDATE delegated_reviews SET status=?,summary=?,lock_until=0,claim_token='',continue_reviews=CASE WHEN ?='continue' THEN continue_reviews+1 ELSE 0 END WHERE task_id=? AND cursor=? AND claim_token=? AND lock_until>=?",
+                params![status, summary, status, task, cursor, claim_token, now]
             )? == 1,
             "Review was superseded"
         );
@@ -772,12 +774,19 @@ mod tests {
         let token1 = s.claim_review("task", "cursor-1").unwrap().expect("first claim must succeed");
         assert_eq!(s.continue_reviews("task").unwrap(), 0);
 
+        // Empty claim token is rejected
+        assert!(s.finish_review("task", "cursor-1", "", "continue", "empty token", &[]).is_err());
+        assert!(s.finish_review("task", "cursor-1", "   ", "continue", "whitespace token", &[]).is_err());
+
         // Simulate lease expiration of the first claim
         g.shared_conn()
             .lock()
             .unwrap()
             .execute("UPDATE delegated_reviews SET lock_until=0 WHERE task_id='task'", [])
             .unwrap();
+
+        // An expired claim cannot finish even before a second claim is granted
+        assert!(s.finish_review("task", "cursor-1", &token1, "continue", "expired lease", &[]).is_err());
 
         // Second claim of the same cursor-1 succeeds with a new token
         let token2 = s.claim_review("task", "cursor-1").unwrap().expect("second claim must succeed");
