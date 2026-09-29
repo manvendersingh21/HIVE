@@ -683,11 +683,12 @@ fn acknowledge(unacknowledged: &Unacknowledged, run: &str, snapshot: &Value) {
 
 const SESSION_ENDED: &str = "The agent's session has ended, so this run can't continue.";
 
-/// A dependency releases its dependent when it completes or waits for a peer
-/// with a pending message addressed to that dependent. Otherwise an implementer
-/// asking its queued verifier a question could wait forever for its own finish.
-/// Each prerequisite is checked independently; a message cannot bypass another
-/// working or failed prerequisite. `messages` is the dependent's durable inbox.
+/// A dependency releases its dependent when it completes, reaches the terminal
+/// no-agreement outcome, or waits for a peer with a pending message addressed to
+/// that dependent. Otherwise an implementer asking its queued verifier a
+/// question could wait forever for its own finish. Each prerequisite is checked
+/// independently; a message cannot bypass another working or failed
+/// prerequisite. `messages` is the dependent's durable inbox.
 ///
 /// A dependency paused on its provider quota has not failed: it resumes by
 /// itself after the reset, so its dependents stay queued. If it already handed
@@ -702,8 +703,8 @@ fn dependency_ready(runs: &[Run], run: &Run, messages: &[Value]) -> Result<bool,
             r.task_id == run.task_id && &r.assignment.key == key && r.state != "superseded"
         }) {
             let from_dependency = |message: &&Value| message["source"] == dependency.id;
-            completed |= dependency.state == "completed";
-            failed |= dependency.state == "failed" || dependency.state == "no_agreement";
+            completed |= matches!(dependency.state.as_str(), "completed" | "no_agreement");
+            failed |= dependency.state == "failed";
             waiting_for_us |= dependency.state == "waiting-for-peer"
                 && messages.iter().any(|message| from_dependency(&message));
             waiting_for_us |= dependency.state == "paused-quota"
