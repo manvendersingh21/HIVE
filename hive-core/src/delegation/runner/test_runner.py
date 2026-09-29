@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import sys
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -469,6 +470,93 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(runner.resume_after_quota(self.j, now=1060))
         self.assertEqual(self.j.db.execute("SELECT count(*) FROM inbox WHERE id LIKE 'quota-resume-%'").fetchone()[0], 1)
         self.assertFalse(runner.resume_after_quota(self.j, now=2000))
+
+    def test_claude_runtime_ready_with_system_python_sdk(self):
+        bin_dir = self.root / 'bin_system_sdk'
+        bin_dir.mkdir(exist_ok=True)
+        fake_claude = bin_dir / 'claude'
+        fake_claude.write_text('#!/bin/sh\ncase "$1" in\n  --version) echo "claude 2.1.0" ;;\n  auth) echo \'{"loggedIn": true}\' ;;\n  *) exit 0 ;;\nesac\n')
+        fake_claude.chmod(0o755)
+
+        fake_tmux = bin_dir / 'tmux'
+        fake_tmux.write_text('#!/bin/sh\nexit 0\n')
+        fake_tmux.chmod(0o755)
+
+        fake_py = bin_dir / 'python3'
+        fake_py.write_text('#!/bin/sh\ncase "$2" in\n  *claude_agent_sdk*) exit 0 ;;\nesac\nexit 1\n')
+        fake_py.chmod(0o755)
+
+        fake_runner = self.root / 'runner_system_sdk'
+        fake_runner.mkdir(exist_ok=True)
+        fake_runner_file = fake_runner / 'runner.py'
+        fake_runner_file.write_text('# fake runner\n')
+
+        with patch.dict(os.environ, {'PATH': str(bin_dir)}), patch.object(runner, '__file__', str(fake_runner_file)):
+            records = runner.probe()
+            claude = next(r for r in records if r['agent'] == 'claude')
+            self.assertTrue(claude['runtime_ready'])
+            self.assertEqual(claude['sdk_python'], str(fake_py))
+            self.assertEqual(runner.find_sdk_python(), str(fake_py))
+
+    def test_claude_runtime_not_ready_without_sdk(self):
+        bin_dir = self.root / 'bin_no_sdk'
+        bin_dir.mkdir(exist_ok=True)
+        fake_claude = bin_dir / 'claude'
+        fake_claude.write_text('#!/bin/sh\ncase "$1" in\n  --version) echo "claude 2.1.0" ;;\n  auth) echo \'{"loggedIn": true}\' ;;\n  *) exit 0 ;;\nesac\n')
+        fake_claude.chmod(0o755)
+
+        fake_tmux = bin_dir / 'tmux'
+        fake_tmux.write_text('#!/bin/sh\nexit 0\n')
+        fake_tmux.chmod(0o755)
+
+        fake_py = bin_dir / 'python3'
+        fake_py.write_text('#!/bin/sh\nexit 1\n')
+        fake_py.chmod(0o755)
+
+        fake_runner = self.root / 'runner_no_sdk'
+        fake_runner.mkdir(exist_ok=True)
+        fake_runner_file = fake_runner / 'runner.py'
+        fake_runner_file.write_text('# fake runner\n')
+
+        with patch.dict(os.environ, {'PATH': str(bin_dir)}), patch.object(runner, '__file__', str(fake_runner_file)):
+            records = runner.probe()
+            claude = next(r for r in records if r['agent'] == 'claude')
+            self.assertFalse(claude['runtime_ready'])
+            self.assertIsNone(claude['sdk_python'])
+            self.assertIsNone(runner.find_sdk_python())
+
+    def test_claude_runtime_ready_with_hashed_dir_sdk(self):
+        bin_dir = self.root / 'bin_hashed'
+        bin_dir.mkdir(exist_ok=True)
+        fake_claude = bin_dir / 'claude'
+        fake_claude.write_text('#!/bin/sh\ncase "$1" in\n  --version) echo "claude 2.1.0" ;;\n  auth) echo \'{"loggedIn": true}\' ;;\n  *) exit 0 ;;\nesac\n')
+        fake_claude.chmod(0o755)
+
+        fake_tmux = bin_dir / 'tmux'
+        fake_tmux.write_text('#!/bin/sh\nexit 0\n')
+        fake_tmux.chmod(0o755)
+
+        fake_py = bin_dir / 'python3'
+        fake_py.write_text('#!/bin/sh\nexit 1\n')
+        fake_py.chmod(0o755)
+
+        fake_runner = self.root / 'runner_hashed'
+        fake_runner.mkdir(exist_ok=True)
+        fake_runner_file = fake_runner / 'runner.py'
+        fake_runner_file.write_text('# fake runner\n')
+
+        sdk_bin = fake_runner / '.sdk' / 'bin'
+        sdk_bin.mkdir(parents=True, exist_ok=True)
+        hashed_sdk_py = sdk_bin / 'python'
+        hashed_sdk_py.write_text('#!/bin/sh\nexit 0\n')
+        hashed_sdk_py.chmod(0o755)
+
+        with patch.dict(os.environ, {'PATH': str(bin_dir)}), patch.object(runner, '__file__', str(fake_runner_file)):
+            records = runner.probe()
+            claude = next(r for r in records if r['agent'] == 'claude')
+            self.assertTrue(claude['runtime_ready'])
+            self.assertEqual(claude['sdk_python'], str(hashed_sdk_py))
+            self.assertEqual(runner.find_sdk_python(), str(hashed_sdk_py))
 
 
 if __name__ == '__main__':
