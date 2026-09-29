@@ -3,7 +3,8 @@
 - The delegation runner now pauses OpenCode quota errors from Z.ai (code 1308,
   "Usage limit reached for 5 hour. Your limit will reset at 2026-09-29
   22:01:59") instead of failing the run. The reset stamp carries no zone, so it
-  is read in Z.ai's China time (UTC+8).
+  is read in Z.ai's China time (UTC+8); an explicit zone on the stamp (Z, UTC
+  or a numeric UTC offset) is honored instead.
 - Compact duration resets such as AGY's "Individual quota reached... Resets in
   2h0m42s" parse again: the unit pattern ended at a word boundary, which
   rejected digits directly after a unit letter. Runs 7593d039, 3adc4b7a and

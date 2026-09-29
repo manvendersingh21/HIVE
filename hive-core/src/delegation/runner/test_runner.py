@@ -393,6 +393,7 @@ class RunnerTests(unittest.TestCase):
         now = datetime.datetime(2026, 9, 28, 14, 0).timestamp()
         at = lambda h, m, days=0: int((datetime.datetime(2026, 9, 28, h, m) + datetime.timedelta(days=days)).timestamp())
         china = datetime.timezone(datetime.timedelta(hours=8))
+        zai_utc = int(datetime.datetime(2026, 9, 29, 22, 1, 59, tzinfo=datetime.timezone.utc).timestamp())
         for message, expected in (
                 ('Claude AI usage limit reached|1790000000', 1790000000),
                 ("You've hit your usage limit. Try again in 2 hours 5 minutes.", int(now)+7500),
@@ -401,6 +402,12 @@ class RunnerTests(unittest.TestCase):
                 ("You've hit your usage limit. Try again at 3:05 PM.", at(15, 5)),
                 ('{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-09-29 22:01:59"}',
                  int(datetime.datetime(2026, 9, 29, 22, 1, 59, tzinfo=china).timestamp())),
+                ('Usage limit reached. Your limit will reset at 2026-09-29 22:01:59Z', zai_utc),
+                ('Usage limit reached. Your limit will reset at 2026-09-29 22:01:59 UTC', zai_utc),
+                ('Usage limit reached. Your limit will reset at 2026-09-29 22:01:59+00:00', zai_utc),
+                ('Usage limit reached. Your limit will reset at 2026-09-29 22:01:59 +02:00', zai_utc-2*3600),
+                ('Usage limit reached. Your limit will reset at 2026-09-29 22:01:59+0530', zai_utc-(5*3600+1800)),
+                ('Usage limit reached. Your limit will reset at 2026-09-29 22:01:59-07:00', zai_utc+7*3600),
                 ('5-hour limit reached ∙ resets 9am', at(9, 0, days=1)),
                 ('Quota exceeded until 16:30', at(16, 30)),
                 ('usage limit reached', None)):
@@ -412,6 +419,7 @@ class RunnerTests(unittest.TestCase):
         now = 1_790_000_000
         china = datetime.timezone(datetime.timedelta(hours=8))
         zai_reset = int(datetime.datetime(2026, 9, 29, 22, 1, 59, tzinfo=china).timestamp())
+        zai_utc = int(datetime.datetime(2026, 9, 29, 22, 1, 59, tzinfo=datetime.timezone.utc).timestamp())
         pause = runner.quota_pause('claude', 'Claude AI usage limit reached|1790003600', None, now)
         self.assertEqual((pause.agent, pause.resets_at), ('claude', 1790003600))
         # The recorded usage supplies the reset when the message has none.
@@ -422,6 +430,13 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((pause.agent, pause.resets_at), ('opencode', zai_reset))
         pause = runner.quota_pause('agy', 'Individual quota reached... Resets in 2h0m42s', None, now)
         self.assertEqual((pause.agent, pause.resets_at), ('agy', now+2*3600+42))
+        # An explicit zone is honored even when it makes the reset future again.
+        pause = runner.quota_pause('opencode', 'Usage limit reached. Your limit will reset at 2026-09-29 22:01:59Z',
+                                   None, 1790704800)
+        self.assertEqual((pause.agent, pause.resets_at), ('opencode', zai_utc))
+        pause = runner.quota_pause('opencode', 'Usage limit reached. Your limit will reset at 2026-09-29 22:01:59+02:00',
+                                   None, 1790704800)
+        self.assertEqual(pause.resets_at, zai_utc-2*3600)
         for message, usage in (('usage limit reached', None), ('usage limit reached', {'resets_at': now-1}),
                                ('Individual quota reached', None),
                                ('Usage limit reached for 5 hour', None),
@@ -478,18 +493,18 @@ class RunnerTests(unittest.TestCase):
     def test_quota_error_messages_pause_their_run_and_never_write_failed(self):
         import datetime
         china = datetime.timezone(datetime.timedelta(hours=8))
-        zai_target = int(time.time()) + 2
+        base = 1_790_000_000
+        zai_target = base + 120
         zai_stamp = datetime.datetime.fromtimestamp(zai_target, china).strftime('%Y-%m-%d %H:%M:%S')
-        codex_target = int(time.time()) + 7200
         classes = dict(opencode='OpenCode', agy='Agy', codex='Codex', claude='Claude')
         scenarios = (
             ('opencode', runner.encode(dict(code='1308', message='Usage limit reached for 5 hour. '
                                             'Your limit will reset at '+zai_stamp)), zai_target, True),
-            ('agy', 'Individual quota reached... Resets in 2h0m42s', 2*3600+42, False),
-            ('codex', 'Codex usage limit reached|'+str(codex_target), codex_target, False),
-            ('claude', "You've hit your usage limit. Try again in 2 hours 5 minutes.", 2*3600+5*60, False),
+            ('agy', 'Individual quota reached... Resets in 2h0m42s', base+2*3600+42, False),
+            ('codex', 'Codex usage limit reached|'+str(base+7200), base+7200, False),
+            ('claude', "You've hit your usage limit. Try again in 2 hours 5 minutes.", base+2*3600+5*60, False),
         )
-        for agent, message, offset, resumes in scenarios:
+        for agent, message, resets_at, resumes in scenarios:
             with self.subTest(agent=agent):
                 journal = runner.Journal(self.root/('run-'+agent))
                 journal.quiet = True
@@ -507,16 +522,27 @@ class RunnerTests(unittest.TestCase):
                                 journal.set('opencode_pending_message', 'msg_quota_errored')
                             raise RuntimeError(message)
 
+                class Clock:
+                    now = base
+
+                    @staticmethod
+                    def time():
+                        return Clock.now
+
                 assignment = dict(id='521e337d-cf82-4df4-b2f4-8641f7c1e533', agent=agent, workspace=str(self.workspace), peers=[])
 
                 async def exercise():
                     task = asyncio.create_task(runner.run(assignment, journal))
                     states = []
-                    deadline = time.monotonic() + (10 if resumes else 5)
+                    deadline = time.monotonic() + 10
                     while time.monotonic() < deadline:
                         state = journal.get('state')
                         if not states or states[-1] != state:
                             states.append(state)
+                        if state == 'paused-quota':
+                            # The clock only moves when the test says so: the
+                            # reset time is reached the moment the pause is seen.
+                            Clock.now = resets_at + 1
                         if state == ('completed' if resumes else 'paused-quota'):
                             break
                         await asyncio.sleep(.02)
@@ -525,10 +551,8 @@ class RunnerTests(unittest.TestCase):
                         await task
                     return states
 
-                before = time.time()
-                with patch.object(runner, classes[agent], Adapter), patch.object(runner, 'QUOTA_GRACE', 0), patch.object(runner, 'QUOTA_POLL', .02):
+                with patch.object(runner, classes[agent], Adapter), patch.object(runner, 'time', Clock), patch.object(runner, 'QUOTA_GRACE', 0), patch.object(runner, 'QUOTA_POLL', .02):
                     states = asyncio.run(exercise())
-                after = time.time()
                 events = journal.snapshot()['events']
                 self.assertIn('paused-quota', states)
                 self.assertNotIn('failed', states)
@@ -536,12 +560,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual([e['kind'] for e in events if e['kind'] == 'error'], [])
                 self.assertNotIn('failed', [e['payload']['state'] for e in events if e['kind'] == 'state'])
                 paused = next(e['payload'] for e in events if e['kind'] == 'quota-paused')
-                self.assertEqual(paused['agent'], agent)
-                if agent in ('opencode', 'codex'):
-                    self.assertEqual(paused['resets_at'], offset)
-                else:
-                    self.assertGreaterEqual(paused['resets_at'], int(before)+offset)
-                    self.assertLessEqual(paused['resets_at'], int(after)+offset)
+                self.assertEqual((paused['agent'], paused['resets_at']), (agent, resets_at))
                 if agent == 'opencode':
                     self.assertIsNone(journal.get('opencode_pending_message'))
                 if resumes:

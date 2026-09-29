@@ -816,14 +816,26 @@ def reset_from_message(text, now=None):
         seconds = sum(int(n)*units[u[0].lower()] for n, u in re.findall(r'(\d+)\s*([A-Za-z]+)', match.group(1)))
         if seconds:
             return int(now + seconds)
-    match = re.search(r'(?i)\b(?:at|resets?(?:\s+at)?|until)\s+(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?', text)
+    match = re.search(r'(?i)\b(?:at|resets?(?:\s+at)?|until)\s+(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*(Z|UTC|[+-]\d{2}(?::?\d{2})?)(?![A-Za-z]))?', text)
     if match:
-        # A full reset datetime with no zone: Z.ai (code 1308) prints China
-        # time (UTC+8), so the naive stamp is read in that fixed zone.
+        # A full reset datetime: an explicit zone (Z, UTC or a numeric offset)
+        # is honored; a naive stamp carries no zone and Z.ai (code 1308) means
+        # China time (UTC+8).
         import datetime
         try:
-            reset = datetime.datetime(*(int(v) for v in match.groups('0')),
-                                       tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+            stated = match.group(7)
+            if stated is None:
+                zone = datetime.timezone(datetime.timedelta(hours=8))
+            elif stated.upper() in ('Z', 'UTC'):
+                zone = datetime.timezone.utc
+            else:
+                digits = stated[1:].replace(':', '')
+                minutes = int(digits[2:]) if len(digits) > 2 else 0
+                if minutes >= 60:
+                    raise ValueError('minutes out of range')
+                delta = datetime.timedelta(hours=int(digits[:2]), minutes=minutes)
+                zone = datetime.timezone(-delta if stated[0] == '-' else delta)
+            reset = datetime.datetime(*(int(v) for v in match.groups('0')[:6]), tzinfo=zone)
             return int(reset.timestamp())
         except ValueError:
             pass
