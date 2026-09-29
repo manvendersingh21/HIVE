@@ -2246,6 +2246,7 @@ mod master_agent_state_tests {
             incidents: crate::incidents::IncidentReview::new(
                 hive_core::watchdog::incidents::IncidentStore::in_memory().unwrap(),
             ),
+            db_ok: true,
         };
         let static_dir =
             std::env::temp_dir().join(format!("hive-web-settings-{}", uuid::Uuid::new_v4()));

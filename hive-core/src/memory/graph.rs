@@ -636,6 +636,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kg.entities_in_project("proj").unwrap().len(), 1);
+        drop(kg);
         std::fs::remove_dir_all(&dir).ok();
     }
 

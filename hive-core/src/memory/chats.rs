@@ -410,7 +410,9 @@ mod tests {
             assert_eq!(store.messages(&chat_id).unwrap().len(), 2);
             assert!(!store.claim_approval("one").unwrap());
         }
-        std::fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]
@@ -529,6 +531,8 @@ mod tests {
             // Reopening is idempotent.
             ChatStore::new(graph.shared_conn()).unwrap();
         }
-        std::fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }
