@@ -24,7 +24,7 @@ jobs:
       - run: python3 scripts/changelog.py check
       - run: git diff --check
   delivery-acknowledgment:
-    name: acceptance: revived runs stay synced
+    name: 'acceptance: revived runs stay synced'
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings
