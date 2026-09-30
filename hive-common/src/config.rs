@@ -318,6 +318,9 @@ pub enum EmbeddingProvider {
 /// Memory / knowledge system settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
+    /// Local-time catch-up ingestion in hive-web, independent of auto_index.
+    #[serde(default)]
+    pub nightly: NightlyMemoryConfig,
     #[serde(default)]
     pub embedding_provider: Option<EmbeddingProvider>,
     /// Whether to auto-index conversations on completion.
@@ -343,6 +346,7 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            nightly: NightlyMemoryConfig::default(),
             auto_index: default_true_bool(),
             embedding_provider: None,
             embedding_model: default_embed_model(),
@@ -351,6 +355,20 @@ impl Default for MemoryConfig {
             max_context_tokens: default_max_context_tokens(),
             knowledge_graph: KnowledgeGraphConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NightlyMemoryConfig {
+    pub enabled: bool,
+    /// Wall-clock time on the host, in HH:MM format.
+    pub time: String,
+}
+
+impl Default for NightlyMemoryConfig {
+    fn default() -> Self {
+        Self { enabled: true, time: "03:00".into() }
     }
 }
 
@@ -589,6 +607,16 @@ mod tests {
             db_config.resolved_path(),
             PathBuf::from("/var/data/hive.db")
         );
+    }
+
+    #[test]
+    fn nightly_memory_defaults_and_overrides() {
+        let defaults: MemoryConfig = toml::from_str("").unwrap();
+        assert!(defaults.nightly.enabled);
+        assert_eq!(defaults.nightly.time, "03:00");
+        let configured: MemoryConfig = toml::from_str("[nightly]\nenabled=false\ntime='23:15'").unwrap();
+        assert!(!configured.nightly.enabled);
+        assert_eq!(configured.nightly.time, "23:15");
     }
 
     #[test]

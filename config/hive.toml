@@ -44,6 +44,12 @@ chunk_size = 512                     # Tokens per RAG chunk
 chunk_overlap = 64                   # Overlap between chunks
 max_context_tokens = 2048            # Max tokens of retrieved context to inject
 
+# Automatic and nightly ingestion always use loopback Ollama, with the chat
+# model from [llm.local] and embedding_model above; no cloud fallback.
+[memory.nightly]
+enabled = true
+time = "03:00"                      # Host local time; catches up after restart
+
 [memory.knowledge_graph]
 max_entities_per_conversation = 20   # Limit extraction to avoid noise
 entity_dedup_threshold = 0.85        # Cosine similarity threshold for merging duplicate entities

@@ -212,6 +212,10 @@ impl ProjectRegistry {
         Ok(out)
     }
 
+    pub fn conversation_project(&self, conversation: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.conn.lock().unwrap().query_row("SELECT project_id FROM conversations WHERE id=?1", [conversation], |r| r.get(0)).optional()?)
+    }
+
     /// The full transcript of one conversation, oldest first.
     pub fn conversation_messages(&self, conversation_id: &str) -> anyhow::Result<Vec<StoredMessage>> {
         let conn = self.conn.lock().unwrap();

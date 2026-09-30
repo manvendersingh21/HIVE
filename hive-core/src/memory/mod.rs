@@ -13,6 +13,7 @@
 pub mod chats;
 pub mod extractor;
 pub mod graph;
+pub mod ingest;
 pub mod machines;
 pub mod projects;
 pub mod rag;
@@ -48,12 +49,11 @@ pub struct MemorySystem {
     pub projects: ProjectRegistry,
     /// Embedded chunk index.
     pub rag: RagIndex,
-    /// The embedding-model client (`memory.embedding_model`). Shared by the
-    /// RAG index and the extractor's dedup pass — one vector space, because
-    /// dedup compares candidate entity embeddings against stored ones.
+    /// Configured embedding client for explicit CLI reindex/search. Automatic
+    /// ingestion and planner recall use the ingestor's local-only client.
     embed_client: Arc<dyn Embedder>,
-    /// Master provider used for low-effort knowledge extraction.
-    extract_llm: Option<Arc<dyn extractor::Completer>>,
+    /// Local-only ingestion, shared by automatic, manual and scheduled runs.
+    pub ingestor: ingest::Ingestor,
     config: hive_common::config::MemoryConfig,
 }
 
@@ -102,30 +102,17 @@ impl MemorySystem {
         let memory_config = config.map(|c| c.memory.clone()).unwrap_or_default();
         let projects = ProjectRegistry::new(conn.clone())
             .unwrap_or_else(|e| panic!("cannot create project tables in {}: {e}", path.display()));
-        let (embed_client, extract_llm): (
-            Arc<dyn Embedder>,
-            Option<Arc<dyn extractor::Completer>>,
-        ) = match config {
-            Some(c) => {
-                let embed: Arc<dyn Embedder> = if c.memory.embedding_provider
-                    == Some(hive_common::config::EmbeddingProvider::Nvidia)
-                {
-                    let mut cfg = c.llm.nvidia.clone();
-                    cfg.model = c.memory.embedding_model.clone();
-                    Arc::new(crate::llm::nvidia::NvidiaClient::for_embeddings(&cfg))
-                } else {
-                    Arc::new(OllamaClient::new(
-                        c.llm.local.base_url.clone(),
-                        c.memory.embedding_model.clone(),
-                    ))
-                };
-                (
-                    embed,
-                    Some(Arc::new(crate::llm::LlmRouter::from_config(&c.llm))),
-                )
+        let embed_client: Arc<dyn Embedder> = match config {
+            Some(c) if c.memory.embedding_provider == Some(hive_common::config::EmbeddingProvider::Nvidia) => {
+                let mut cfg = c.llm.nvidia.clone();
+                cfg.model = c.memory.embedding_model.clone();
+                Arc::new(crate::llm::nvidia::NvidiaClient::for_embeddings(&cfg))
             }
-            None => (Arc::new(rag::HashEmbedder { dim: 128 }), None),
+            Some(c) => Arc::new(OllamaClient::new(c.llm.local.base_url.clone(), c.memory.embedding_model.clone())),
+            None => Arc::new(rag::HashEmbedder { dim: 128 }),
         };
+        let ingestor = ingest::Ingestor::new(graph.clone(), config)
+            .unwrap_or_else(|e| panic!("cannot create ingestion tables in {}: {e}", path.display()));
         let rag = RagIndex::new(
             conn.clone(),
             embed_client.clone(),
@@ -138,7 +125,7 @@ impl MemorySystem {
             projects,
             rag,
             embed_client,
-            extract_llm,
+            ingestor,
             config: memory_config,
         }
     }
@@ -186,54 +173,26 @@ impl MemorySystem {
             tracing::warn!(error = %e, "could not persist the assistant's reply");
             return;
         }
-        if !self.config.auto_index {
-            return;
-        }
-        let Ok(messages) = self.projects.conversation_messages(conversation_id) else {
-            return;
-        };
-        let Some(project_id) = messages.first().map(|m| m.project_id.clone()) else {
-            return;
-        };
-        let transcript: String = messages
-            .iter()
-            .map(|m| format!("{}: {}", m.role, m.content))
-            .collect::<Vec<_>>()
-            .join("\n");
+        self.index_saved_conversation(conversation_id).await;
+    }
 
-        match self
-            .rag
-            .index_conversation(&project_id, conversation_id, &transcript)
-            .await
-        {
-            Ok(n) => tracing::debug!(chunks = n, "conversation indexed into rag"),
-            Err(e) => tracing::warn!(error = %e, "rag indexing skipped"),
+    /// Index an already-saved reply without appending it again. The web store
+    /// replaces an assistant slot in place, unlike the CLI complete_turn path.
+    pub async fn index_saved_conversation(&self, conversation_id: &str) {
+        if !self.ingestor.auto_index() { return; }
+        if let Err(error) = self.ingestor.conversation(conversation_id).await {
+            tracing::warn!(%error, "automatic memory ingestion failed; source remains pending");
         }
+    }
 
-        let Some(llm) = self.extract_llm.clone() else {
-            return;
-        };
-        let outcome = extractor::extract_and_store(
-            &self.graph,
-            &self.graph.shared_conn(),
-            self.embed_client.as_ref(),
-            llm.as_ref(),
-            self.config.knowledge_graph.max_entities_per_conversation as usize,
-            self.config.knowledge_graph.entity_dedup_threshold,
-            &project_id,
-            &transcript,
-        )
-        .await;
-        match outcome {
-            Ok(o) if o.entities_created > 0 || o.relations_added > 0 => tracing::info!(
-                created = o.entities_created,
-                merged = o.entities_merged,
-                relations = o.relations_added,
-                "knowledge extracted into graph"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "knowledge extraction failed"),
-        }
+    pub fn planner_lessons(&self) -> Vec<String> {
+        self.graph.recent_lessons(3).unwrap_or_default().iter()
+            .map(|e| ellipsize(e.attr_str("description").unwrap_or(&e.name), 1600)).collect()
+    }
+
+    pub async fn conversation_context(&self, conversation: &str, query: &str) -> RetrievedContext {
+        let project = self.projects.conversation_project(conversation).ok().flatten();
+        self.retrieve_context(project.as_deref().unwrap_or(""), query).await
     }
 
     /// Retrieve relevant context for a user message within a project:
@@ -243,7 +202,7 @@ impl MemorySystem {
     pub async fn retrieve_context(&self, project_id: &str, user_input: &str) -> RetrievedContext {
         let mut out = RetrievedContext {
             rag_chunks: vec![],
-            kg_entities: vec![],
+            kg_entities: self.planner_lessons(),
             recent_messages: vec![],
         };
         if self.projects.project(project_id).ok().flatten().is_none() {
@@ -273,7 +232,7 @@ impl MemorySystem {
             .collect();
         let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
         if let Ok(entities) = self.graph.search_entities(project_id, &term_refs, 8) {
-            out.kg_entities = entities
+            out.kg_entities.extend(entities
                 .iter()
                 .map(|e| {
                     let desc = e.attr_str("description").unwrap_or("");
@@ -283,12 +242,12 @@ impl MemorySystem {
                         format!("{} ({}): {}", e.name, e.kind, desc)
                     }
                 })
-                .collect();
+                .collect::<Vec<_>>());
         }
 
         // RAG: cosine over the embedded chunks.
         if !user_input.trim().is_empty() {
-            match self.rag.search(Some(project_id), user_input, 3).await {
+            match self.ingestor.search(project_id, user_input, 3).await {
                 Ok(hits) => {
                     out.rag_chunks = hits
                         .into_iter()
@@ -315,7 +274,8 @@ impl MemorySystem {
             Ok(hits) => (hits, None),
             Err(e) => (vec![], Some(format!("Semantic retrieval unavailable: {e}; history and keyword search remain available"))),
         };
-        let mut entities = Vec::new();
+        let mut entities = self.graph.recent_lessons(30).unwrap_or_default().into_iter()
+            .filter(|e| e.attrs.to_string().to_lowercase().contains(&query.to_lowercase())).collect::<Vec<_>>();
         let projects: Vec<String> = match project_id {
             Some(p) => vec![p.to_string()],
             None => self

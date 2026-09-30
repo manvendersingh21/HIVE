@@ -1,0 +1,19 @@
+[
+  {
+    "assignment": {"key":"compile","device":"fixture-builder","agent":"codex","model":null,"workspace":"fixture-workspace","objective":"Compile the project","dependencies":[],"acceptance_criteria":["Build passes"]},
+    "metadata":{"state":"failed","reason":"Compiler could not resolve a dependency","attempts":2},
+    "events":[
+      {"id":"e1","seq":1,"kind":"error","payload":{"message":"Compiler could not resolve a dependency"}},
+      {"id":"e2","seq":2,"kind":"retry","payload":{"attempt":2,"reason":"Retried after refreshing the dependency cache"}},
+      {"id":"e3","seq":3,"kind":"native","payload":{"text":"Build still failed; dependency is unavailable"}}
+    ]
+  },
+  {
+    "assignment": {"key":"review","device":"fixture-reviewer","agent":"cursor","model":null,"workspace":"fixture-workspace","objective":"Review the project","dependencies":[],"acceptance_criteria":["Review completed"]},
+    "metadata":{"state":"completed","reason":"Review completed after an interrupted session"},
+    "events":[
+      {"id":"e1","seq":1,"kind":"resume-consumed","payload":{"reason":"Recovered the existing conversation"}},
+      {"id":"e2","seq":2,"kind":"native","payload":{"text":"Reviewed the dependency failure and requested a fix"}}
+    ]
+  }
+]

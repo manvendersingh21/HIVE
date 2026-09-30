@@ -342,11 +342,8 @@ impl MasterAgent {
         history: Vec<String>,
         conversation_id: &str,
     ) -> anyhow::Result<PlannedRun> {
-        let context = crate::memory::RetrievedContext {
-            recent_messages: history,
-            rag_chunks: vec![],
-            kg_entities: vec![],
-        };
+        let mut context = self.memory.conversation_context(conversation_id, user_input).await;
+        context.recent_messages = history;
         self.plan_with_context(user_input, Some(context.render()), None, Some(conversation_id))
             .await
     }

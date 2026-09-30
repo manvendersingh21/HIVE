@@ -162,54 +162,32 @@ impl KnowledgeGraph {
     /// its id. Everything `machines.rs` writes goes through here and must keep
     /// landing in the global scope.
     pub fn upsert_entity(&self, entity: &Entity) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        Self::upsert_on(&self.conn.lock().unwrap(), None, entity)
+    }
+
+    /// Insert or refresh a project-scoped entity.
+    pub fn upsert_entity_scoped(&self, project_id: &str, entity: &Entity) -> anyhow::Result<()> {
+        Self::upsert_on(&self.conn.lock().unwrap(), Some(project_id), entity)
+    }
+
+    /// Shared by ingestion so graph, vectors and watermarks commit atomically.
+    pub(crate) fn upsert_on(conn: &Connection, project: Option<&str>, entity: &Entity) -> anyhow::Result<()> {
         conn.execute(
-            "INSERT INTO entities (id, kind, name, attrs, updated_at, project_id)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), NULL)
-             ON CONFLICT(id) DO UPDATE SET
-                 kind = excluded.kind,
-                 name = excluded.name,
-                 attrs = excluded.attrs,
-                 updated_at = excluded.updated_at,
-                 project_id = NULL",
-            params![
-                entity.id,
-                entity.kind,
-                entity.name,
-                entity.attrs.to_string()
-            ],
+            "INSERT INTO entities (id,kind,name,attrs,updated_at,project_id)
+             VALUES (?1,?2,?3,?4,datetime('now'),?5)
+             ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,name=excluded.name,
+                 attrs=excluded.attrs,updated_at=excluded.updated_at,project_id=excluded.project_id",
+            params![entity.id, entity.kind, entity.name, entity.attrs.to_string(), project],
         )?;
         Ok(())
     }
 
-    /// Insert or replace a **project-scoped** entity. The caller is expected
-    /// to have built the id with [`scoped_entity_id`] — the graph does not
-    /// force it, but an un-namespaced id here would silently collide with the
-    /// fleet namespace.
-    pub fn upsert_entity_scoped(
-        &self,
-        project_id: &str,
-        entity: &Entity,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO entities (id, kind, name, attrs, updated_at, project_id)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)
-             ON CONFLICT(id) DO UPDATE SET
-                 kind = excluded.kind,
-                 name = excluded.name,
-                 attrs = excluded.attrs,
-                 updated_at = excluded.updated_at,
-                 project_id = excluded.project_id",
-            params![
-                entity.id,
-                entity.kind,
-                entity.name,
-                entity.attrs.to_string(),
-                project_id
-            ],
-        )?;
-        Ok(())
+    /// Daily lessons are shared by planners, outside the fleet inventory scope.
+    pub fn recent_lessons(&self, limit: usize) -> anyhow::Result<Vec<Entity>> {
+        let db = self.conn.lock().unwrap();
+        let mut stmt = db.prepare("SELECT id,kind,name,attrs FROM entities WHERE kind='lessons_learned' AND project_id='memory-lessons' ORDER BY name DESC LIMIT ?1")?;
+        let rows = stmt.query_map([limit as i64], row_to_entity)?.collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Add an edge. Both endpoints must already exist.
