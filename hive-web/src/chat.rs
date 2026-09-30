@@ -1482,6 +1482,7 @@ pub async fn add_fleet_worker(
         user,
         port: req.port,
         tags: req.tags,
+        allow_direct_gpu: false,
         local: false,
         container: None,
     };

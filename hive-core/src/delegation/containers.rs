@@ -312,6 +312,7 @@ mod tests {
             user: std::env::var("USER").unwrap_or_default(),
             port: None,
             tags: vec![],
+            allow_direct_gpu: false,
             local: true,
             container: None,
         };

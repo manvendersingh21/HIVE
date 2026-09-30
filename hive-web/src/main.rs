@@ -381,6 +381,7 @@ mod router_tests {
                 user: "test".into(),
                 port: None,
                 tags: vec![],
+                allow_direct_gpu: false,
                 local: false,
                 container: None,
             }]),

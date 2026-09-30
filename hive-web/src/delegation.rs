@@ -1418,6 +1418,7 @@ mod tests {
             user: "u".into(),
             port: None,
             tags: vec![],
+            allow_direct_gpu: false,
             local: true,
             container: Some(format!("hive-test-missing-{}", uuid::Uuid::new_v4().simple())),
         };

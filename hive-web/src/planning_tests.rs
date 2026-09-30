@@ -67,6 +67,7 @@ fn handle_for(url: String) -> AgentHandle {
             tags: vec![],
             local: false,
             container: None,
+            allow_direct_gpu: false,
         }]),
         hive_core::skills::SkillRegistry::new(),
         hive_core::memory::MemorySystem::new(),
