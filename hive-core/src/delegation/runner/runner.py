@@ -58,6 +58,113 @@ def capture(args, timeout=8, include_stderr=False):
         return -1, ''
 
 
+def can_import_claude_sdk(python_bin):
+    """Check if python_bin is Python >=3.10 and can import claude_agent_sdk."""
+    code, _ = capture([str(python_bin), '-c', 'import sys; assert sys.version_info >= (3, 10); import claude_agent_sdk'], timeout=5)
+    return code == 0
+
+
+def candidate_pythons():
+    """Find candidate python executables on PATH."""
+    seen = set()
+    candidates = []
+
+    w = shutil.which('python3')
+    if w:
+        try:
+            real = str(Path(w).resolve())
+            if real not in seen:
+                seen.add(real)
+                candidates.append(w)
+        except OSError:
+            pass
+
+    path_env = os.environ.get('PATH', '')
+    for d in path_env.split(os.pathsep):
+        if not d:
+            continue
+        p = Path(d)
+        if not p.is_dir():
+            continue
+        try:
+            items = sorted(p.iterdir(), key=lambda x: (x.name != 'python3', not bool(re.match(r'^python3\.\d+$', x.name)), x.name))
+            for item in items:
+                if item.name == 'python3' or re.match(r'^python3\.\d+$', item.name) or item.name == 'python':
+                    try:
+                        if item.is_file() and os.access(item, os.X_OK):
+                            real = str(item.resolve())
+                            if real not in seen:
+                                seen.add(real)
+                                candidates.append(str(item))
+                    except (OSError, PermissionError):
+                        pass
+        except (OSError, PermissionError):
+            pass
+
+    return candidates
+
+
+def find_sdk_python(runner_dir=None):
+    """Find a python interpreter with claude_agent_sdk.
+
+    Checks:
+    1. <runner dir>/.sdk/bin/python (hashed-runner-dir)
+    2. Shared venv at ~/.hive/sdk-venv/bin/python
+    3. Any python3 >=3.10 on PATH that can import claude_agent_sdk
+    """
+    if runner_dir is None:
+        runner_dir = Path(__file__).parent
+    else:
+        runner_dir = Path(runner_dir)
+
+    # 1. Existing hashed-runner-dir .sdk path
+    local_sdk = runner_dir / '.sdk' / 'bin' / 'python'
+    if local_sdk.exists():
+        return str(local_sdk)
+
+    # 2. Shared venv per device at ~/.hive/sdk-venv
+    shared_sdk = Path.home() / '.hive' / 'sdk-venv' / 'bin' / 'python'
+    if shared_sdk.exists() and can_import_claude_sdk(shared_sdk):
+        return str(shared_sdk)
+
+    # 3. Any python3 >=3.10 found on PATH that can import claude_agent_sdk
+    for cand in candidate_pythons():
+        if can_import_claude_sdk(cand):
+            return cand
+
+    return None
+
+
+def provision_sdk_venv(dest=None, python_bin=None):
+    """Optionally provision one shared venv per device at ~/.hive/sdk-venv reused across runner versions."""
+    if dest is None:
+        dest = Path.home() / '.hive' / 'sdk-venv'
+    else:
+        dest = Path(dest)
+    dest_python = dest / 'bin' / 'python'
+    if dest_python.exists() and can_import_claude_sdk(dest_python):
+        return str(dest_python)
+    if python_bin is None:
+        for cand in candidate_pythons():
+            code, _ = capture([str(cand), '-c', 'import sys; assert sys.version_info >= (3, 10)'], timeout=5)
+            if code == 0:
+                python_bin = cand
+                break
+    if not python_bin:
+        return None
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        code, _ = capture([str(python_bin), '-m', 'venv', str(dest)], timeout=60)
+        if code != 0:
+            return None
+        code, _ = capture([str(dest_python), '-m', 'pip', 'install', '--timeout', '15', '--retries', '1', '--disable-pip-version-check', 'claude-agent-sdk'], timeout=120)
+        if code == 0 and can_import_claude_sdk(dest_python):
+            return str(dest_python)
+    except Exception:
+        pass
+    return None
+
+
 def probe():
     records = []
     for name in AGENTS:
@@ -83,12 +190,13 @@ def probe():
                         pass
             if name == 'claude':
                 record['runtime_requirements'] += ['Python >=3.10 + claude-agent-sdk OR Node.js + @anthropic-ai/claude-agent-sdk']
-                record['runtime_ready'] = bool(executable('node') and (Path(__file__).parent/'node_modules/@anthropic-ai/claude-agent-sdk').is_dir())
-                sdk_python = Path(__file__).parent/'.sdk/bin/python'
-                record['runtime_ready'] = record['runtime_ready'] or sdk_python.exists()
+                sdk_python = find_sdk_python()
+                node_ready = bool(executable('node') and (Path(__file__).parent/'node_modules/@anthropic-ai/claude-agent-sdk').is_dir())
+                record['runtime_ready'] = bool(node_ready or sdk_python)
+                record['sdk_python'] = str(sdk_python) if sdk_python else None
                 record['controls'] = ['pre-tool-hook', 'permission-callback', 'persistent-stream']
                 if record['runtime_ready']:
-                    code, models = capture(([str(sdk_python), str(Path(__file__).with_name('claude_python.py'))] if sdk_python.exists() else [executable('node'), str(Path(__file__).with_name('claude.mjs'))])+['--models',path], timeout=15)
+                    code, models = capture(([str(sdk_python), str(Path(__file__).with_name('claude_python.py'))] if sdk_python else [executable('node'), str(Path(__file__).with_name('claude.mjs'))])+['--models',path], timeout=15)
                     if code == 0:
                         try:
                             record['models'] = json.loads(models)
@@ -810,11 +918,35 @@ def reset_from_message(text, now=None):
     if match:
         return int(match.group(1))
     units = dict(d=86400, h=3600, m=60, s=1)
-    match = re.search(r'(?i)\b(?:in|after)\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b[\s,]*(?:and\s+)?)+)', text)
+    # A unit ends at a digit too ("2h0m42s"), not only at a word boundary.
+    match = re.search(r'(?i)\b(?:in|after)\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![A-Za-z])[\s,]*(?:and\s+)?)+)', text)
     if match:
         seconds = sum(int(n)*units[u[0].lower()] for n, u in re.findall(r'(\d+)\s*([A-Za-z]+)', match.group(1)))
         if seconds:
             return int(now + seconds)
+    match = re.search(r'(?i)\b(?:at|resets?(?:\s+at)?|until)\s+(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*(Z|UTC|[+-]\d{2}(?::?\d{2})?)(?![A-Za-z]))?', text)
+    if match:
+        # A full reset datetime: an explicit zone (Z, UTC or a numeric offset)
+        # is honored; a naive stamp carries no zone and Z.ai (code 1308) means
+        # China time (UTC+8).
+        import datetime
+        try:
+            stated = match.group(7)
+            if stated is None:
+                zone = datetime.timezone(datetime.timedelta(hours=8))
+            elif stated.upper() in ('Z', 'UTC'):
+                zone = datetime.timezone.utc
+            else:
+                digits = stated[1:].replace(':', '')
+                minutes = int(digits[2:]) if len(digits) > 2 else 0
+                if minutes >= 60:
+                    raise ValueError('minutes out of range')
+                delta = datetime.timedelta(hours=int(digits[:2]), minutes=minutes)
+                zone = datetime.timezone(-delta if stated[0] == '-' else delta)
+            reset = datetime.datetime(*(int(v) for v in match.groups('0')[:6]), tzinfo=zone)
+            return int(reset.timestamp())
+        except ValueError:
+            pass
     match = re.search(r'(?i)\b(?:at|resets?(?:\s+at)?|until)\s+(\d{1,2})(?::(\d{2}))?\s*([ap])?\.?m?\.?(?=[\s,.;)]|$)', text)
     if match and (match.group(2) or match.group(3)):
         import datetime
@@ -855,6 +987,10 @@ def pause_for_quota(journal, message_id, pause):
     with journal.db:
         journal.db.execute("UPDATE inbox SET state='acknowledged' WHERE id=?", (message_id,))
     journal.emit('acknowledgment', dict(message_id=message_id))
+    # An OpenCode prompt that ended on the quota error is resolved, never
+    # resubmitted: the resume turn submits its own new message id.
+    if journal.get('opencode_pending_message'):
+        journal.set('opencode_pending_message', None)
     journal.set('usage', dict(journal.get('usage') or {}, agent=pause.agent, used_percent=100,
                               resets_at=pause.resets_at, exhausted=True, observed_at=int(time.time())))
     quota = dict(agent=pause.agent, resets_at=pause.resets_at, message=pause.message[:2000],
@@ -1137,8 +1273,8 @@ class Codex(JsonProcess):
 class Claude(JsonProcess):
     async def connect(self, assignment, journal):
         self.a, self.j = assignment, journal
-        sdk_python=Path(__file__).parent/'.sdk/bin/python'
-        command=[str(sdk_python), str(Path(__file__).with_name('claude_python.py'))] if sdk_python.exists() else [executable('node'), str(Path(__file__).with_name('claude.mjs'))]
+        sdk_python = find_sdk_python()
+        command = [str(sdk_python), str(Path(__file__).with_name('claude_python.py'))] if sdk_python else [executable('node'), str(Path(__file__).with_name('claude.mjs'))]
         await self.start(command, assignment['workspace'])
         await self.send(dict(type='configure', assignment=assignment, resume=journal.get('native_conversation_id')))
 

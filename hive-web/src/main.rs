@@ -96,6 +96,8 @@ async fn build_agent(master_name: &str) -> (chat::AgentHandle, bool) {
         }
     };
 
+    delegation::configure(&config.delegation);
+
     let db_path = config.database.resolved_path();
     let db_ok = if db_path.exists() {
         match hive_core::rusqlite::Connection::open(&db_path) {
