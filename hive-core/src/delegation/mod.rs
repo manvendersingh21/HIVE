@@ -3,6 +3,8 @@
 pub mod containers;
 pub mod coordination;
 pub mod inventory;
+pub mod workspace_gc;
+pub mod placement;
 pub mod review;
 pub mod relay;
 pub mod store;
@@ -561,6 +563,7 @@ pub fn validate(plan: &DelegationPlan, agent: &MasterAgent) -> anyhow::Result<()
             !a.objective.trim().is_empty() && !a.acceptance_criteria.is_empty(),
             "Objective and acceptance criteria required"
         );
+        placement::validate_disk(a, &agent.memory.graph)?;
         coordination::validate_checks(&a.acceptance_checks)?;
         anyhow::ensure!(a.max_rework <= 10, "At most 10 acceptance rework rounds");
         if new_container {
@@ -973,6 +976,7 @@ pub async fn plan(
         Only name a model listed for that device and agent in the inventory (its models or invocation); an unlisted model is replaced with the agent's default. \
         Missing authentication, runtime or software is reported by Hive on that exact device; do not silently substitute explicit choices. \
         An agent inventory record with quota \"quota exhausted until <time>\" has used up its provider quota: plans placing new work on that device and agent are rejected until then, so choose another agent or device. \
+        Rust and frontend build assignments require at least 10 GiB free disk on the selected device; check disk free in the fleet before placement. \
         Prefer dedicated devices for ordinary work. Laptops/light hosts and login nodes only receive short light work. \
         GPU/shared scheduler work requires a scheduler allocation; never launch sustained work directly on login nodes. \
         Ordinary CLI coding tasks need required_capabilities=[]: Claude/Codex provider inference does NOT require local-inference on the worker. \
