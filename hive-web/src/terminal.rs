@@ -211,6 +211,7 @@ mod tests {
             user: "alice".into(),
             port: Some(2222),
             tags: vec![],
+            allow_direct_gpu: false,
             local: false,
             container: None,
         };
@@ -241,6 +242,7 @@ mod tests {
             user: "alice".into(),
             port: None,
             tags: vec![],
+            allow_direct_gpu: false,
             local: false,
             container: Some("box".into()),
         };

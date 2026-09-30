@@ -54,6 +54,9 @@ time = "03:00"                      # Host local time; catches up after restart
 max_entities_per_conversation = 20   # Limit extraction to avoid noise
 entity_dedup_threshold = 0.85        # Cosine similarity threshold for merging duplicate entities
 
+[delegation]
+planning_deadline_secs = 240         # Budget for one delegation planning attempt; retried once on timeout
+
 [watchdog]
 enabled = true
 poll_interval_secs = 5

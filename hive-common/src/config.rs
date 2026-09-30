@@ -35,6 +35,26 @@ pub struct HiveConfig {
     /// Safety watchdog settings.
     #[serde(default)]
     pub watchdog: WatchdogConfig,
+    /// Fleet delegation settings.
+    #[serde(default)]
+    pub delegation: DelegationConfig,
+}
+
+/// Fleet delegation settings (`[delegation]` in `hive.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DelegationConfig {
+    /// Budget in seconds for one delegation planning attempt. A deadline
+    /// failure is retried once, so a request can take up to twice this.
+    pub planning_deadline_secs: u64,
+}
+
+impl Default for DelegationConfig {
+    fn default() -> Self {
+        Self {
+            planning_deadline_secs: 240,
+        }
+    }
 }
 
 impl HiveConfig {
@@ -557,6 +577,17 @@ mod tests {
     }
 
     #[test]
+    fn delegation_planning_deadline_defaults_and_is_configurable() {
+        assert_eq!(DelegationConfig::default().planning_deadline_secs, 240);
+        let empty: DelegationConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.planning_deadline_secs, 240);
+        let set: DelegationConfig = toml::from_str("planning_deadline_secs = 420").unwrap();
+        assert_eq!(set.planning_deadline_secs, 420);
+        let shipped: HiveConfig = toml::from_str(include_str!("../../config/hive.toml")).unwrap();
+        assert_eq!(shipped.delegation.planning_deadline_secs, 240);
+    }
+
+    #[test]
     fn test_default_db_path_expansion() {
         let db_config = DatabaseConfig {
             path: "~/.hive/hive.db".to_string(),
@@ -660,6 +691,29 @@ tags = []
         assert_eq!(config.workers[0].host, "192.168.1.101");
         assert_eq!(config.workers[0].tags, vec!["gpu"]);
         assert_eq!(config.workers[1].name, "worker-2");
+    }
+
+    #[test]
+    fn workers_config_parses_the_allow_direct_gpu_override() {
+        let toml_str = r#"
+[[workers]]
+name = "cis-a6000"
+host = "cis-a6000"
+user = "cluster-user"
+tags = ["gpu", "slurm"]
+allow_direct_gpu = true
+
+[[workers]]
+name = "laptop"
+host = "laptop"
+user = "me"
+tags = ["light"]
+"#;
+
+        let config: WorkersConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.workers[0].allow_direct_gpu);
+        // Absent means the default: direct heavy work stays restricted.
+        assert!(!config.workers[1].allow_direct_gpu);
     }
 
     #[test]

@@ -31,14 +31,30 @@ fn error(e: anyhow::Error) -> Response {
     (StatusCode::BAD_REQUEST, e.to_string()).into_response()
 }
 
-/// Overall deadline for one delegation planning attempt. A deadline failure
-/// is retried once by [`crate::chat::plan_with_retry`]. The planner-slot
-/// wait is bounded by the whole-request budget (PLANNING_DEADLINE + retry),
-/// and NVIDIA's own overall deadline (120s by default) fits inside this budget.
-const PLANNING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
+/// Overall deadline in seconds for one delegation planning attempt,
+/// `[delegation] planning_deadline_secs` in hive.toml (240 by default). A
+/// deadline failure is retried once by [`crate::chat::plan_with_retry`]. The
+/// planner-slot wait is bounded by the whole-request budget (deadline +
+/// retry), and NVIDIA's own overall deadline (120s by default) fits inside it.
+static PLANNING_DEADLINE_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(240);
+
+/// Apply the hive.toml delegation settings. A zero deadline could never plan
+/// anything, so it keeps the current value.
+pub fn configure(config: &hive_common::config::DelegationConfig) {
+    if config.planning_deadline_secs == 0 {
+        tracing::warn!("ignoring [delegation] planning_deadline_secs = 0; keeping {}s", planning_deadline().as_secs());
+        return;
+    }
+    PLANNING_DEADLINE_SECS.store(config.planning_deadline_secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn planning_deadline() -> std::time::Duration {
+    std::time::Duration::from_secs(PLANNING_DEADLINE_SECS.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 pub async fn process(h: AgentHandle, turn: SavedTurn) -> Response {
-    process_with_deadline_slots(h, turn, PLANNING_DEADLINE, &crate::chat::PLANNER_SLOTS).await
+    process_with_deadline_slots(h, turn, planning_deadline(), &crate::chat::PLANNER_SLOTS).await
 }
 
 pub(crate) async fn process_with_deadline_slots(
@@ -47,6 +63,30 @@ pub(crate) async fn process_with_deadline_slots(
     deadline: std::time::Duration,
     slots: &tokio::sync::Semaphore,
 ) -> Response {
+    let Some(agent) = h.agent.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "No agent configured").into_response();
+    };
+    let (request, conversation_id) = (turn.user_input.clone(), turn.conversation_id.clone());
+    let planner = move |context: String, feedback: delegation::PlanFeedback| {
+        let (agent, request, conversation_id) = (agent.clone(), request.clone(), conversation_id.clone());
+        async move { delegation::plan(&agent, &request, &context, Some(&conversation_id), &feedback).await }
+    };
+    process_with_planner(h, turn, deadline, slots, planner).await
+}
+
+/// Plans `turn` with `planner`, given the conversation context and the
+/// feedback shared by every attempt of this request, then starts the plan.
+pub(crate) async fn process_with_planner<P, Fut>(
+    h: AgentHandle,
+    turn: SavedTurn,
+    deadline: std::time::Duration,
+    slots: &tokio::sync::Semaphore,
+    planner: P,
+) -> Response
+where
+    P: Fn(String, delegation::PlanFeedback) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<delegation::DelegationPlan>>,
+{
     let agent = match h.agent.as_ref() {
         Some(a) => a,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "No agent configured").into_response(),
@@ -64,10 +104,12 @@ pub(crate) async fn process_with_deadline_slots(
         }
     };
     let context_text = context.join("\n");
-    let plan = match crate::chat::plan_with_retry_slots(
+    let feedback = delegation::PlanFeedback::default();
+    let plan = match crate::chat::plan_with_retry_explained(
         slots,
-        || delegation::plan(agent, &turn.user_input, &context_text, Some(&turn.conversation_id)),
+        || planner(context_text.clone(), feedback.clone()),
         deadline,
+        || feedback.last().map(|invalid| crate::chat::invalid_plan_response(&invalid, true)),
     )
     .await
     {
@@ -525,6 +567,17 @@ pub fn start(h: AgentHandle) {
         Ok(false) => tracing::error!("relay audit chain failed full verification"),
         Err(error) => tracing::warn!(error=%error, "relay audit verification unavailable"),
     }
+    let collector = h.clone();
+    tokio::spawn(async move {
+        loop {
+            if let (Some(agent), Ok(store)) = (&collector.agent, store(&collector)) {
+                if let Err(error) = delegation::workspace_gc::collect(agent, &store).await {
+                    tracing::warn!(%error, "workspace GC incomplete");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        }
+    });
     let reviewer = h.clone();
     tokio::spawn(async move {
         loop {
@@ -1177,6 +1230,10 @@ fn enrich_approvals(snapshot: &mut Value, stored: &[Value]) {
 mod peer_tests;
 
 #[cfg(test)]
+#[path = "planning_tests.rs"]
+mod planning_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1361,6 +1418,7 @@ mod tests {
             user: "u".into(),
             port: None,
             tags: vec![],
+            allow_direct_gpu: false,
             local: true,
             container: Some(format!("hive-test-missing-{}", uuid::Uuid::new_v4().simple())),
         };

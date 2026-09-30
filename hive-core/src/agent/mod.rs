@@ -876,7 +876,8 @@ impl MasterAgent {
             let name = w.info.name.clone();
             let target = w.info.ssh_target();
             let tags = w.info.tags.clone();
-            async move { machines::probe_remote(&name, &target, tags).await }
+            let allow_direct_gpu = w.info.allow_direct_gpu;
+            async move { machines::probe_remote(&name, &target, tags, allow_direct_gpu).await }
         });
 
         // Containers sit on a machine above, so they're probed the same round.
@@ -972,6 +973,7 @@ mod placement_tests {
                     user: "test".into(),
                     port: None,
                     tags: vec![],
+                    allow_direct_gpu: false,
                     local: false,
                     container: None,
                 })
