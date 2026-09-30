@@ -82,11 +82,34 @@ impl IntoResponse for PlanFailure {
                 "Planning timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
             )
                 .into_response(),
-            PlanFailure::Failed(e) => {
-                (StatusCode::BAD_GATEWAY, format!("planning failed: {e}")).into_response()
-            }
+            PlanFailure::Failed(e) => match e.downcast_ref::<hive_core::delegation::InvalidPlan>() {
+                Some(invalid) => invalid_plan_response(invalid, false),
+                None => (StatusCode::BAD_GATEWAY, format!("planning failed: {e}")).into_response(),
+            },
         }
     }
+}
+
+/// The model's plan was unusable. Names the error class and parser position
+/// rather than blaming the clock, even when the deadline ended the corrected
+/// attempt.
+pub(crate) fn invalid_plan_response(
+    invalid: &hive_core::delegation::InvalidPlan,
+    deadline_expired: bool,
+) -> Response {
+    let outcome = if deadline_expired {
+        "The planner was re-prompted with this error but returned no corrected plan within the planning deadline."
+    } else {
+        "The planner was re-prompted once with this error and its corrected answer was still invalid."
+    };
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "Invalid plan: {}. {outcome} No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message to try again.",
+            invalid.describe()
+        ),
+    )
+        .into_response()
 }
 
 async fn try_bounded_plan<T>(
@@ -140,17 +163,33 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
+    plan_with_retry_explained(slots, make_plan, deadline, || None).await
+}
+
+/// Like [`plan_with_retry_slots`], but when the retry's deadline also fires,
+/// `explain` may name the real cause (e.g. the last rejected plan) in place
+/// of the generic timeout message.
+pub(crate) async fn plan_with_retry_explained<T, F, Fut>(
+    slots: &tokio::sync::Semaphore,
+    make_plan: F,
+    deadline: std::time::Duration,
+    explain: impl Fn() -> Option<Response>,
+) -> Result<T, Response>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
     match try_bounded_plan(slots, make_plan(), deadline).await {
         Ok(plan) => Ok(plan),
         Err(PlanFailure::Deadline) => {
             warn!("planning deadline exceeded; retrying the whole plan once");
             match try_bounded_plan(slots, make_plan(), deadline).await {
                 Ok(plan) => Ok(plan),
-                Err(PlanFailure::Deadline) => Err((
+                Err(PlanFailure::Deadline) => Err(explain().unwrap_or_else(|| (
                     StatusCode::GATEWAY_TIMEOUT,
                     "Planning timed out and one automatic retry also timed out. No commands were executed from this planning round. Earlier results, if any, remain saved. Please resend your message in a moment, and if it keeps timing out, try a shorter or simpler request.",
                 )
-                    .into_response()),
+                    .into_response())),
                 Err(failure) => Err(failure.into_response()),
             }
         }

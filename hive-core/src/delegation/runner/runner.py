@@ -918,11 +918,35 @@ def reset_from_message(text, now=None):
     if match:
         return int(match.group(1))
     units = dict(d=86400, h=3600, m=60, s=1)
-    match = re.search(r'(?i)\b(?:in|after)\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b[\s,]*(?:and\s+)?)+)', text)
+    # A unit ends at a digit too ("2h0m42s"), not only at a word boundary.
+    match = re.search(r'(?i)\b(?:in|after)\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![A-Za-z])[\s,]*(?:and\s+)?)+)', text)
     if match:
         seconds = sum(int(n)*units[u[0].lower()] for n, u in re.findall(r'(\d+)\s*([A-Za-z]+)', match.group(1)))
         if seconds:
             return int(now + seconds)
+    match = re.search(r'(?i)\b(?:at|resets?(?:\s+at)?|until)\s+(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*(Z|UTC|[+-]\d{2}(?::?\d{2})?)(?![A-Za-z]))?', text)
+    if match:
+        # A full reset datetime: an explicit zone (Z, UTC or a numeric offset)
+        # is honored; a naive stamp carries no zone and Z.ai (code 1308) means
+        # China time (UTC+8).
+        import datetime
+        try:
+            stated = match.group(7)
+            if stated is None:
+                zone = datetime.timezone(datetime.timedelta(hours=8))
+            elif stated.upper() in ('Z', 'UTC'):
+                zone = datetime.timezone.utc
+            else:
+                digits = stated[1:].replace(':', '')
+                minutes = int(digits[2:]) if len(digits) > 2 else 0
+                if minutes >= 60:
+                    raise ValueError('minutes out of range')
+                delta = datetime.timedelta(hours=int(digits[:2]), minutes=minutes)
+                zone = datetime.timezone(-delta if stated[0] == '-' else delta)
+            reset = datetime.datetime(*(int(v) for v in match.groups('0')[:6]), tzinfo=zone)
+            return int(reset.timestamp())
+        except ValueError:
+            pass
     match = re.search(r'(?i)\b(?:at|resets?(?:\s+at)?|until)\s+(\d{1,2})(?::(\d{2}))?\s*([ap])?\.?m?\.?(?=[\s,.;)]|$)', text)
     if match and (match.group(2) or match.group(3)):
         import datetime
@@ -963,6 +987,10 @@ def pause_for_quota(journal, message_id, pause):
     with journal.db:
         journal.db.execute("UPDATE inbox SET state='acknowledged' WHERE id=?", (message_id,))
     journal.emit('acknowledgment', dict(message_id=message_id))
+    # An OpenCode prompt that ended on the quota error is resolved, never
+    # resubmitted: the resume turn submits its own new message id.
+    if journal.get('opencode_pending_message'):
+        journal.set('opencode_pending_message', None)
     journal.set('usage', dict(journal.get('usage') or {}, agent=pause.agent, used_percent=100,
                               resets_at=pause.resets_at, exhausted=True, observed_at=int(time.time())))
     quota = dict(agent=pause.agent, resets_at=pause.resets_at, message=pause.message[:2000],

@@ -767,7 +767,7 @@ pub fn describe_for_prompt(kg: &KnowledgeGraph) -> anyhow::Result<String> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         out.push_str(&format!(
-            "- {} ({}): {}, {} cores, {} RAM, {:.0} GB disk free{}. Capabilities: {}. Tools: {}.\n",
+            "- {} ({}): {}, {} cores, {} RAM, DISK FREE: {:.1} GiB{}. Capabilities: {}. Tools: {}.\n",
             m.name,
             if reachable { "online" } else { "OFFLINE" },
             os,
