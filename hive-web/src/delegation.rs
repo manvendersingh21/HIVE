@@ -525,6 +525,17 @@ pub fn start(h: AgentHandle) {
         Ok(false) => tracing::error!("relay audit chain failed full verification"),
         Err(error) => tracing::warn!(error=%error, "relay audit verification unavailable"),
     }
+    let collector = h.clone();
+    tokio::spawn(async move {
+        loop {
+            if let (Some(agent), Ok(store)) = (&collector.agent, store(&collector)) {
+                if let Err(error) = delegation::workspace_gc::collect(agent, &store).await {
+                    tracing::warn!(%error, "workspace GC incomplete");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        }
+    });
     let reviewer = h.clone();
     tokio::spawn(async move {
         loop {
