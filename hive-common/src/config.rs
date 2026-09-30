@@ -35,6 +35,26 @@ pub struct HiveConfig {
     /// Safety watchdog settings.
     #[serde(default)]
     pub watchdog: WatchdogConfig,
+    /// Fleet delegation settings.
+    #[serde(default)]
+    pub delegation: DelegationConfig,
+}
+
+/// Fleet delegation settings (`[delegation]` in `hive.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DelegationConfig {
+    /// Budget in seconds for one delegation planning attempt. A deadline
+    /// failure is retried once, so a request can take up to twice this.
+    pub planning_deadline_secs: u64,
+}
+
+impl Default for DelegationConfig {
+    fn default() -> Self {
+        Self {
+            planning_deadline_secs: 240,
+        }
+    }
 }
 
 impl HiveConfig {
@@ -536,6 +556,17 @@ mod tests {
         let memory: MemoryConfig = toml::from_str("embedding_provider = 'nvidia'").unwrap();
         assert_eq!(memory.embedding_provider, Some(EmbeddingProvider::Nvidia));
         assert!(toml::from_str::<MemoryConfig>("embedding_provider = 'claude'").is_err());
+    }
+
+    #[test]
+    fn delegation_planning_deadline_defaults_and_is_configurable() {
+        assert_eq!(DelegationConfig::default().planning_deadline_secs, 240);
+        let empty: DelegationConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.planning_deadline_secs, 240);
+        let set: DelegationConfig = toml::from_str("planning_deadline_secs = 420").unwrap();
+        assert_eq!(set.planning_deadline_secs, 420);
+        let shipped: HiveConfig = toml::from_str(include_str!("../../config/hive.toml")).unwrap();
+        assert_eq!(shipped.delegation.planning_deadline_secs, 240);
     }
 
     #[test]
